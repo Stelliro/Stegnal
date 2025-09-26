@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -56,6 +58,28 @@ def command_evaluate(args: argparse.Namespace) -> None:
     print(f"  SSIM: {metrics.ssim:.3f}")
 
 
+def command_ui(args: argparse.Namespace) -> None:
+    script_path = Path(__file__).resolve().parent / "ui.py"
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(script_path),
+        "--server.port",
+        str(args.port),
+    ]
+    if args.headless:
+        cmd.extend(["--server.headless", "true"])
+
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as exc:  # pragma: no cover - defensive
+        raise SystemExit("Streamlit is not installed. Reinstall with UI dependencies.") from exc
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - streamlit error passthrough
+        raise SystemExit(exc.returncode) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Project Umbra toy pipeline CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -97,6 +121,20 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--reference", required=True, help="Reference image path")
     evaluate_parser.add_argument("--candidate", required=True, help="Candidate image path")
     evaluate_parser.set_defaults(func=command_evaluate)
+
+    ui_parser = subparsers.add_parser("ui", help="Launch the interactive visual explorer")
+    ui_parser.add_argument(
+        "--port",
+        type=int,
+        default=8501,
+        help="Port to serve the Streamlit dashboard on",
+    )
+    ui_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the Streamlit server in headless mode (no browser auto-launch)",
+    )
+    ui_parser.set_defaults(func=command_ui)
 
     return parser
 

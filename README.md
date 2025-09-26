@@ -9,7 +9,8 @@ The implementation is intentionally lightweight and self-contained so that the t
 - **Noise-stream encoder** that permutes image pixels based on a shared seed and injects Gaussian noise to mimic a noisy channel.
 - **Correlation-based decoder** that reverses the permutation, applies a denoising filter, and clips the results into image space.
 - **Quality metrics** (PSNR and SSIM) that provide an approximate measure of reconstruction fidelity.
-- **Command-line interface** that provides `encode`, `decode`, `pipeline`, and `evaluate` commands.
+- **Command-line interface** that provides `encode`, `decode`, `pipeline`, `evaluate`, and `ui` commands.
+- **Interactive visual explorer** that compares the original signal, encoded packet, reconstruction, and multiplicative overlap score side-by-side.
 - **Automated test** verifying that the toy pipeline can recover a synthetic image with reasonable fidelity.
 
 ## Getting Started
@@ -45,6 +46,14 @@ Evaluate two images:
 ```bash
 umbra evaluate --reference path/to/input.png --candidate recon.png
 ```
+
+Launch the visual explorer UI (uses [Streamlit](https://streamlit.io/)):
+
+```bash
+umbra ui --port 8501
+```
+
+The command spawns a local Streamlit server that renders the original image, the encoded noise packet, the decoder's reconstruction, and a multiplicative overlap map that highlights shared signal energy. Use the sidebar controls to adjust the encoder/decoder hyperparameters and experiment with either uploaded images or bundled grayscale samples.
 
 ## Next Steps
 
