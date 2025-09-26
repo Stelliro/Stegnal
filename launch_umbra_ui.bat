@@ -24,5 +24,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem Launch the Streamlit UI
-%PY_CMD% -m streamlit run -m umbra.ui %*
+rem Launch the Project Umbra UI via the CLI wrapper
+%PY_CMD% -m umbra ui %*

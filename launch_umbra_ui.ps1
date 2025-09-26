@@ -29,5 +29,5 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# Launch the Streamlit UI
-& $pythonPath -m streamlit run -m umbra.ui @Args
+# Launch the Project Umbra UI via the CLI wrapper
+& $pythonPath -m umbra ui @Args
