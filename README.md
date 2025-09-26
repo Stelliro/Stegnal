@@ -11,6 +11,7 @@ The implementation is intentionally lightweight and self-contained so that the t
 - **Quality metrics** (PSNR and SSIM) that provide an approximate measure of reconstruction fidelity.
 - **Command-line interface** that provides `encode`, `decode`, `pipeline`, `evaluate`, and `ui` commands.
 - **Interactive visual explorer** that compares the original signal, encoded packet, reconstruction, and multiplicative overlap score side-by-side.
+- **Generational evolution playground** with configurable AI attempt counts, infinite/finite runs, and autosave/load support for overnight experiments.
 - **Automated test** verifying that the toy pipeline can recover a synthetic image with reasonable fidelity.
 
 ## Getting Started
@@ -54,6 +55,27 @@ umbra ui --port 8501
 ```
 
 The command spawns a local Streamlit server that renders the original image, the encoded noise packet, the decoder's reconstruction, and a multiplicative overlap map that highlights shared signal energy. Use the sidebar controls to adjust the encoder/decoder hyperparameters and experiment with either uploaded images or bundled grayscale samples.
+
+The visual explorer now includes an **evolution playground** that lets you:
+
+- Pick how many AI attempts run each generation and how many generations execute before stopping.
+- Toggle an infinite mode that keeps evolving until you hit **Stop evolution**.
+- Inspect every generation's reconstructions, pick individual candidates for overlap analysis, and review per-candidate metrics.
+- Automatically save checkpoints to `~/.umbra_autosave/evolution_state.pkl` (or a custom directory) and resume from the latest snapshot on launch.
+
+On Windows you can launch the UI directly with the provided helper scripts:
+
+```powershell
+./launch_umbra_ui.ps1
+```
+
+or
+
+```bat
+launch_umbra_ui.bat
+```
+
+Both scripts forward additional arguments to `streamlit run`, so you can override ports or Streamlit options if needed.
 
 ## Next Steps
 

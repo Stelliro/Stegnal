@@ -45,6 +45,17 @@ class NoiseStreamEncoder:
     def __init__(self, sigma: float = 0.2) -> None:
         self.sigma = sigma
 
+    def to_config(self) -> dict[str, float]:
+        """Return a serializable configuration for persistence."""
+
+        return {"sigma": float(self.sigma)}
+
+    @classmethod
+    def from_config(cls, config: dict[str, float]) -> "NoiseStreamEncoder":
+        """Instantiate the encoder from :meth:`to_config` output."""
+
+        return cls(sigma=float(config.get("sigma", 0.2)))
+
     def load_image(self, path: str | Path) -> np.ndarray:
         """Load an image as a float32 array in [0, 1]."""
         image = Image.open(path).convert("L")

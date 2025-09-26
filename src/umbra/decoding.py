@@ -17,6 +17,17 @@ class NoiseStreamDecoder:
     def __init__(self, denoise_sigma: float | None = 1.0) -> None:
         self.denoise_sigma = denoise_sigma
 
+    def to_config(self) -> dict[str, float | None]:
+        """Return a serializable configuration for persistence."""
+
+        return {"denoise_sigma": None if self.denoise_sigma is None else float(self.denoise_sigma)}
+
+    @classmethod
+    def from_config(cls, config: dict[str, float | None]) -> "NoiseStreamDecoder":
+        """Instantiate the decoder from :meth:`to_config` output."""
+
+        return cls(denoise_sigma=config.get("denoise_sigma"))
+
     def decode(self, packet: NoisePacket, seed: int) -> np.ndarray:
         """Decode the provided packet using the shared seed."""
         if seed != packet.permutation_seed:
