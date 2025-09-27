@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "project-umbra"
+version = "0.1.0"
+description = "Toy encoder/decoder pipeline for Project Umbra"
+readme = "README.md"
+authors = [{ name = "Umbra Team" }]
+license = { text = "Proprietary" }
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "scikit-image>=0.22",
+    "streamlit>=1.31",
+]
+
+[project.scripts]
+umbra = "umbra.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/umbra"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/umbra", "README.md", "pyproject.toml"]
