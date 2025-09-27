@@ -7,15 +7,21 @@ from pathlib import Path
 from typing import Callable, Dict, Tuple
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 from PIL import Image
 from skimage import data
 
 from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
+from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, compute_image_signature
 from umbra.metrics import compute_metrics
-from umbra.visualization import multiplicative_overlap, normalize_for_display, to_uint8_image
+from umbra.visualization import (
+    colorize_comparison,
+    multiplicative_overlap,
+    normalize_for_display,
+    to_uint8_image,
+)
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,17 @@ def _trigger_rerun() -> None:
     rerun()
 
 
+def _predict_noise_map(image: np.ndarray, packet: NoisePacket) -> np.ndarray:
+    """Recover the exact noise contribution used during encoding."""
+
+    flat_image = np.asarray(image, dtype=np.float32).flatten()
+    rng = np.random.default_rng(packet.permutation_seed)
+    permutation = rng.permutation(flat_image.size)
+    permuted = flat_image[permutation]
+    noise = packet.encoded - permuted
+    return noise.reshape(packet.image_shape).astype(np.float32)
+
+
 def run() -> None:
     """Entry-point for the Streamlit application."""
     st.set_page_config(page_title="Project Umbra Visual Explorer", layout="wide")
@@ -241,40 +258,68 @@ def run() -> None:
     packet = encoder.encode(original, int(seed))
     reconstructed = decoder.decode(packet, int(seed))
 
-    noise_map = packet.encoded.reshape(original.shape)
+    noise_map = _predict_noise_map(original, packet)
     noise_display = normalize_for_display(noise_map)
+    packet_display = normalize_for_display(packet.encoded.reshape(original.shape))
+
+    sound_packet = NoisePacket(
+        encoded=np.asarray(noise_map.flatten(), dtype=np.float32),
+        image_shape=packet.image_shape,
+        permutation_seed=packet.permutation_seed,
+        sigma=packet.sigma,
+    )
+    sound_reconstruction = decoder.decode(sound_packet, int(seed))
+
     overlap_map, overlap_score = multiplicative_overlap(original, reconstructed)
+    colorized_overlap = colorize_comparison(original, reconstructed)
+    _, sound_overlap_score = multiplicative_overlap(original, sound_reconstruction)
+    sound_colorized = colorize_comparison(original, sound_reconstruction)
+    sound_comparison = colorize_comparison(reconstructed, sound_reconstruction)
 
     metrics = compute_metrics(original, reconstructed)
+    sound_metrics = compute_metrics(original, sound_reconstruction)
+    ai_sound_alignment = compute_metrics(reconstructed, sound_reconstruction)
 
     st.subheader("Reconstruction quality")
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("PSNR", f"{metrics.psnr:.2f} dB")
-    metric_cols[1].metric("SSIM", f"{metrics.ssim:.3f}")
-    metric_cols[2].metric("Multiplicative overlap", f"{overlap_score:.1f}%")
+    ai_metrics_cols = st.columns(3)
+    ai_metrics_cols[0].metric("AI PSNR", f"{metrics.psnr:.2f} dB")
+    ai_metrics_cols[1].metric("AI SSIM", f"{metrics.ssim:.3f}")
+    ai_metrics_cols[2].metric("AI overlap", f"{overlap_score:.1f}%")
+
+    sound_metrics_cols = st.columns(3)
+    sound_metrics_cols[0].metric("Sound PSNR", f"{sound_metrics.psnr:.2f} dB")
+    sound_metrics_cols[1].metric("Sound SSIM", f"{sound_metrics.ssim:.3f}")
+    sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
+
+    st.metric("AI ↔ Sound SSIM", f"{ai_sound_alignment.ssim:.3f}")
 
     st.write(
-        "The overlap score multiplies the normalized original and reconstructed pixels,"
+        "The overlap score multiplies the normalized original and reconstructed pixels," \
         " providing a quick proxy for how much of the signal is mutually present."
     )
 
     st.subheader("Visual comparisons")
-    captions = [
-        f"Original ({source_label})",
-        "Encoded packet (normalized noise)",
-        "AI reconstruction",
-        "Multiplicative overlap",
+    overview_row = [
+        (to_uint8_image(original), f"Original ({source_label})"),
+        (to_uint8_image(packet_display), "Encoded packet (noise + signal)"),
+        (to_uint8_image(reconstructed), "AI reconstruction"),
+        (to_uint8_image(sound_reconstruction), "Sound-only reconstruction"),
     ]
-    images = [
-        to_uint8_image(original),
-        to_uint8_image(noise_display),
-        to_uint8_image(reconstructed),
-        to_uint8_image(overlap_map),
+    overlay_row = [
+        (to_uint8_image(noise_display), "Predicted noise contribution"),
+        (to_uint8_image(colorized_overlap), "Colour overlap: AI vs original"),
+        (to_uint8_image(sound_colorized), "Colour overlap: Sound vs original"),
+        (to_uint8_image(sound_comparison), "Colour overlap: AI vs sound"),
     ]
 
-    img_cols = st.columns(4)
-    for col, caption, image in zip(img_cols, captions, images):
-        col.image(image, caption=caption, width="stretch", clamp=True)
+    for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
+        for col, (image, caption) in zip(columns, content):
+            col.image(image, caption=caption, width="stretch", clamp=True)
+
+    st.caption(
+        "Red highlights information present only in the generated candidate, blue marks"
+        " reference-only structure, and neutral grayscale indicates shared content."
+    )
 
     st.sidebar.subheader("Evolution settings")
     population_size = int(
@@ -373,6 +418,23 @@ def run() -> None:
 
     if manager.generations:
         st.header("Evolution progress")
+        progress_rows = []
+        for record in manager.generations:
+            best = record.best_candidate
+            progress_rows.append(
+                {
+                    "Generation": record.index,
+                    "Best SSIM": best.metrics.ssim,
+                    "Best PSNR": best.metrics.psnr,
+                    "Best overlap": best.overlap_score,
+                }
+            )
+
+        if progress_rows:
+            progress_df = pd.DataFrame(progress_rows).set_index("Generation")
+            st.subheader("Best-of-generation trend")
+            st.line_chart(progress_df)
+
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
         selected_generation = st.select_slider(
@@ -426,8 +488,9 @@ def run() -> None:
         )
         inspected = generation.candidates[selected_index]
         overlap_map, overlap_score = multiplicative_overlap(manager.original, inspected.reconstruction)
+        inspected_color = colorize_comparison(manager.original, inspected.reconstruction)
 
-        inspect_cols = st.columns(3)
+        inspect_cols = st.columns(4)
         inspect_cols[0].image(
             to_uint8_image(manager.original), caption="Evolution reference", width="stretch"
         )
@@ -439,6 +502,11 @@ def run() -> None:
         inspect_cols[2].image(
             to_uint8_image(overlap_map),
             caption=f"Overlap map ({overlap_score:.1f}%)",
+            width="stretch",
+        )
+        inspect_cols[3].image(
+            to_uint8_image(inspected_color),
+            caption="Colour overlap vs reference",
             width="stretch",
         )
 
