@@ -15,7 +15,7 @@ class NoisePacket:
     """Container for an encoded image represented as noise."""
 
     encoded: np.ndarray
-    image_shape: Tuple[int, int]
+    image_shape: Tuple[int, ...]
     permutation_seed: int
     sigma: float
 
@@ -33,10 +33,10 @@ class NoisePacket:
     def from_file(cls, path: str | Path) -> "NoisePacket":
         with np.load(path) as data:
             encoded = data["encoded"].astype(np.float32)
-            height, width = data["image_shape"].astype(int)
+            shape = tuple(int(v) for v in data["image_shape"].astype(int))
             seed = int(data["permutation_seed"][0])
             sigma = float(data["sigma"][0])
-        return cls(encoded=encoded, image_shape=(height, width), permutation_seed=seed, sigma=sigma)
+        return cls(encoded=encoded, image_shape=shape, permutation_seed=seed, sigma=sigma)
 
 
 class NoiseStreamEncoder:
@@ -64,16 +64,16 @@ class NoiseStreamEncoder:
 
     def encode(self, image: np.ndarray, seed: int) -> NoisePacket:
         """Encode the image using a permutation driven by ``seed``."""
-        if image.ndim != 2:
-            raise ValueError("Expected grayscale image array with shape (H, W)")
-        height, width = image.shape
+        if image.ndim not in (2, 3):
+            raise ValueError("Expected image array with shape (H, W) or (H, W, C)")
+        image_shape: Tuple[int, ...] = tuple(int(dim) for dim in image.shape)
         rng = np.random.default_rng(seed)
-        flat = image.flatten()
+        flat = np.asarray(image, dtype=np.float32).reshape(-1)
         permutation = rng.permutation(flat.size)
         permuted = flat[permutation]
         noise = rng.normal(0.0, self.sigma, size=permuted.shape)
         encoded = permuted + noise
-        return NoisePacket(encoded=encoded, image_shape=(height, width), permutation_seed=seed, sigma=self.sigma)
+        return NoisePacket(encoded=encoded, image_shape=image_shape, permutation_seed=seed, sigma=self.sigma)
 
     def encode_from_path(self, path: str | Path, seed: int) -> NoisePacket:
         image = self.load_image(path)
