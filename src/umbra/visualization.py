@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 
+try:  # pragma: no cover - optional acceleration
+    import cupy as cp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cp = None
+
 
 def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
     """Average pixels within ``block_size`` square regions.
@@ -63,8 +68,15 @@ def multiplicative_overlap(
     if original.shape != reconstructed.shape:
         raise ValueError("Images must share the same shape to compute overlap")
 
-    overlap = np.clip(np.asarray(original) * np.asarray(reconstructed), 0.0, 1.0)
-    score = float(overlap.mean() * 100.0)
+    if cp is not None and original.size >= 65_536:  # pragma: no branch - runtime check
+        orig_gpu = cp.asarray(original, dtype=cp.float32)
+        recon_gpu = cp.asarray(reconstructed, dtype=cp.float32)
+        overlap_gpu = cp.clip(orig_gpu * recon_gpu, 0.0, 1.0)
+        score = float(cp.mean(overlap_gpu).get() * 100.0)
+        overlap = cp.asnumpy(overlap_gpu)
+    else:
+        overlap = np.clip(np.asarray(original) * np.asarray(reconstructed), 0.0, 1.0)
+        score = float(overlap.mean() * 100.0)
     return overlap.astype(np.float32), score
 
 
