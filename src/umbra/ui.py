@@ -985,30 +985,38 @@ def run() -> None:
             progress_df = (
                 pd.DataFrame(generation_progress_rows)
                 .replace([np.inf, -np.inf], np.nan)
-                .dropna(how="all")
+                .dropna()
             )
+            st.subheader("Best-of-generation trend")
             if not progress_df.empty:
                 progress_df = progress_df.set_index("Generation")
-            st.subheader("Best-of-generation trend")
-            if len(progress_df.index) > 1 and any(
-                progress_df[col].nunique() > 1 for col in progress_df.columns
-            ):
-                st.line_chart(progress_df, width="stretch")
+                if progress_df.index.size > 1 and any(
+                    progress_df[col].nunique() > 1 for col in progress_df.columns
+                ):
+                    st.line_chart(progress_df, width="stretch")
+                else:
+                    st.caption(
+                        "Trend chart will appear once multiple non-identical generations are"
+                        " available."
+                    )
             else:
                 st.caption(
-                    "Trend chart will appear once multiple non-identical generations are"
-                    " available."
+                    "Trend chart will appear once generations contain finite metric values."
                 )
 
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
-        selected_generation = st.select_slider(
-            "Select generation",
-            options=gen_indices,
-            value=default_gen,
-            key="selected_generation",
-            format_func=lambda idx: f"Generation {idx}",
-        )
+        if len(gen_indices) > 1:
+            selected_generation = st.select_slider(
+                "Select generation",
+                options=gen_indices,
+                value=default_gen,
+                key="selected_generation",
+                format_func=lambda idx: f"Generation {idx}",
+            )
+        else:
+            selected_generation = default_gen
+            st.caption("Only one generation so far; displaying the latest results.")
         generation = manager.generations[selected_generation]
         best_candidate = generation.best_candidate
 
