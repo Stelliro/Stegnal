@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import html
 import json
 from io import BytesIO
 from pathlib import Path
@@ -11,6 +13,7 @@ import zipfile
 import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
@@ -135,6 +138,51 @@ def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.nda
     gray = np.clip(np.asarray(grayscale, dtype=np.float32), 0.0, 1.0)
     tinted = gray[..., None] * template
     return np.clip(tinted, 0.0, 1.0).astype(np.float32)
+
+
+def _image_to_png_bytes(image: np.ndarray) -> bytes:
+    """Encode an image array as PNG bytes for inline display."""
+
+    array = np.asarray(image)
+    if array.dtype != np.uint8 or array.ndim not in (2, 3):
+        array = to_uint8_image(array)
+    if array.ndim == 2:
+        pil_image = Image.fromarray(array, mode="L")
+    elif array.shape[2] == 3:
+        pil_image = Image.fromarray(array, mode="RGB")
+    elif array.shape[2] == 4:
+        pil_image = Image.fromarray(array, mode="RGBA")
+    else:  # pragma: no cover - defensive guard for unexpected channel counts
+        raise ValueError("Expected 1, 3, or 4 channel image for PNG conversion")
+
+    buffer = BytesIO()
+    pil_image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _image_to_data_url(image: np.ndarray) -> str:
+    """Convert an image into a ``data:`` URL for stable inline rendering."""
+
+    png_bytes = _image_to_png_bytes(image)
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _render_image(column: st.delta_generator.DeltaGenerator, image: np.ndarray, caption: str) -> None:
+    """Render ``image`` inside ``column`` with a semantic caption."""
+
+    data_url = _image_to_data_url(image)
+    alt_text = html.escape(caption)
+    caption_html = html.escape(caption).replace("\n", "<br />")
+    column.markdown(
+        """
+        <figure style="margin:0;text-align:center;">
+          <img src="{src}" alt="{alt}" style="width:100%;height:auto;border-radius:4px;" />
+          <figcaption style="font-size:0.8rem;color:var(--text-color,#666);">{caption}</figcaption>
+        </figure>
+        """.format(src=data_url, alt=alt_text, caption=caption_html),
+        unsafe_allow_html=True,
+    )
 
 
 def _reset_widget_key(state: st.session_state, key: str) -> None:
@@ -869,27 +917,21 @@ def run() -> None:
 
     st.subheader("Visual comparisons")
     overview_row = [
-        (to_uint8_image(colored_original), f"Sound-derived image ({source_label})"),
-        (to_uint8_image(packet_display), "Encoded packet (noise + signal)"),
-        (to_uint8_image(ai_colored), "AI reconstruction (colourised)"),
-        (to_uint8_image(sound_colored), "Sound-only reconstruction (colourised)"),
+        (colored_original, f"Sound-derived image ({source_label})"),
+        (packet_display, "Encoded packet (noise + signal)"),
+        (ai_colored, "AI reconstruction (colourised)"),
+        (sound_colored, "Sound-only reconstruction (colourised)"),
     ]
     overlay_row = [
-        (to_uint8_image(noise_display), "Predicted noise contribution"),
-        (to_uint8_image(ai_overlap_color), "Colour overlap: AI vs original"),
-        (to_uint8_image(sound_overlap_color), "Colour overlap: Sound vs original"),
-        (to_uint8_image(cross_overlap_color), "Colour overlap: AI vs sound"),
+        (noise_display, "Predicted noise contribution"),
+        (ai_overlap_color, "Colour overlap: AI vs original"),
+        (sound_overlap_color, "Colour overlap: Sound vs original"),
+        (cross_overlap_color, "Colour overlap: AI vs sound"),
     ]
 
     for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
         for col, (image, caption) in zip(columns, content):
-            col.image(
-                image,
-                caption=caption,
-                width="stretch",
-                clamp=True,
-                output_format="PNG",
-            )
+            _render_image(col, image, caption)
 
     st.caption(
         "Red highlights information present only in the generated candidate, blue marks"
@@ -1098,15 +1140,8 @@ def run() -> None:
                 caption = (
                     f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
                 )
-                col.image(
-                    to_uint8_image(
-                        _apply_color_template(candidate.reconstruction, color_template)
-                    ),
-                    caption=caption,
-                    width="stretch",
-                    clamp=True,
-                    output_format="PNG",
-                )
+                candidate_image = _apply_color_template(candidate.reconstruction, color_template)
+                _render_image(col, candidate_image, caption)
 
         st.subheader("Candidate inspector")
         option_labels = [
@@ -1132,29 +1167,22 @@ def run() -> None:
         inspected_color = colorize_comparison(manager.original, inspected.reconstruction)
 
         inspect_cols = st.columns(4)
-        inspect_cols[0].image(
-            to_uint8_image(colored_original),
-            caption="Evolution reference",
-            width="stretch",
-            output_format="PNG",
+        _render_image(inspect_cols[0], colored_original, "Evolution reference")
+        inspected_reconstruction = _apply_color_template(inspected.reconstruction, color_template)
+        _render_image(
+            inspect_cols[1],
+            inspected_reconstruction,
+            f"Candidate seed {inspected.seed}",
         )
-        inspect_cols[1].image(
-            to_uint8_image(_apply_color_template(inspected.reconstruction, color_template)),
-            caption=f"Candidate seed {inspected.seed}",
-            width="stretch",
-            output_format="PNG",
+        _render_image(
+            inspect_cols[2],
+            inspect_overlap_map,
+            f"Overlap map ({inspect_overlap_score:.1f}%)",
         )
-        inspect_cols[2].image(
-            to_uint8_image(inspect_overlap_map),
-            caption=f"Overlap map ({inspect_overlap_score:.1f}%)",
-            width="stretch",
-            output_format="PNG",
-        )
-        inspect_cols[3].image(
-            to_uint8_image(inspected_color),
-            caption="Colour overlap vs reference",
-            width="stretch",
-            output_format="PNG",
+        _render_image(
+            inspect_cols[3],
+            inspected_color,
+            "Colour overlap vs reference",
         )
 
         st.subheader("Generation summary")
