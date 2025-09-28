@@ -356,7 +356,7 @@ def run() -> None:
 
     for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
         for col, (image, caption) in zip(columns, content):
-            col.image(image, caption=caption, width="stretch", clamp=True)
+            col.image(image, caption=caption, use_column_width=True, clamp=True)
 
     st.caption(
         "Red highlights information present only in the generated candidate, blue marks"
@@ -507,7 +507,7 @@ def run() -> None:
                 col.image(
                     to_uint8_image(_apply_color_template(candidate.reconstruction, color_template)),
                     caption=caption,
-                    width="stretch",
+                    use_column_width=True,
                     clamp=True,
                 )
 
@@ -534,22 +534,22 @@ def run() -> None:
 
         inspect_cols = st.columns(4)
         inspect_cols[0].image(
-            to_uint8_image(colored_original), caption="Evolution reference", width="stretch"
+            to_uint8_image(colored_original), caption="Evolution reference", use_column_width=True
         )
         inspect_cols[1].image(
             to_uint8_image(_apply_color_template(inspected.reconstruction, color_template)),
             caption=f"Candidate seed {inspected.seed}",
-            width="stretch",
+            use_column_width=True,
         )
         inspect_cols[2].image(
             to_uint8_image(overlap_map),
             caption=f"Overlap map ({overlap_score:.1f}%)",
-            width="stretch",
+            use_column_width=True,
         )
         inspect_cols[3].image(
             to_uint8_image(inspected_color),
             caption="Colour overlap vs reference",
-            width="stretch",
+            use_column_width=True,
         )
 
         st.subheader("Generation summary")

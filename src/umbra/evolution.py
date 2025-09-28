@@ -120,7 +120,7 @@ class EvolutionManager:
             _, overlap_score = multiplicative_overlap(self.original, reconstruction)
             candidate = CandidateResult(
                 seed=int(seed),
-                reconstruction=np.asarray(reconstruction, dtype=np.float32),
+                reconstruction=np.asarray(reconstruction, dtype=np.float16),
                 metrics=metrics,
                 overlap_score=float(overlap_score),
             )
@@ -132,15 +132,29 @@ class EvolutionManager:
     def to_session(self) -> EvolutionSession:
         """Create a serializable snapshot of the manager."""
 
+        compact_generations: list[GenerationRecord] = []
+        for record in self.generations:
+            compact_candidates: list[CandidateResult] = []
+            for candidate in record.candidates:
+                compact_candidates.append(
+                    CandidateResult(
+                        seed=candidate.seed,
+                        reconstruction=np.asarray(candidate.reconstruction, dtype=np.float16),
+                        metrics=candidate.metrics,
+                        overlap_score=candidate.overlap_score,
+                    )
+                )
+            compact_generations.append(GenerationRecord(index=record.index, candidates=compact_candidates))
+
         return EvolutionSession(
             image_signature=self.image_signature,
-            original=self.original,
+            original=np.asarray(self.original, dtype=np.float16),
             encoder_config=self.encoder.to_config(),
             decoder_config=self.decoder.to_config(),
             population_size=self.population_size,
             base_seed=self.base_seed,
             autosave_interval=self.autosave_interval,
-            generations=self.generations,
+            generations=compact_generations,
             rng_state=self.rng.bit_generator.state,
         )
 
@@ -151,7 +165,7 @@ class EvolutionManager:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "evolution_state.pkl"
         with path.open("wb") as handle:
-            pickle.dump(self.to_session(), handle)
+            pickle.dump(self.to_session(), handle, protocol=pickle.HIGHEST_PROTOCOL)
         return path
 
     @classmethod
@@ -170,15 +184,31 @@ class EvolutionManager:
 
         encoder = NoiseStreamEncoder.from_config(session.encoder_config)
         decoder = NoiseStreamDecoder.from_config(session.decoder_config)
+        original = np.asarray(session.original, dtype=np.float32)
+
+        restored_generations: list[GenerationRecord] = []
+        for record in session.generations:
+            restored_candidates: list[CandidateResult] = []
+            for candidate in record.candidates:
+                restored_candidates.append(
+                    CandidateResult(
+                        seed=candidate.seed,
+                        reconstruction=np.asarray(candidate.reconstruction, dtype=np.float32),
+                        metrics=candidate.metrics,
+                        overlap_score=candidate.overlap_score,
+                    )
+                )
+            restored_generations.append(GenerationRecord(index=record.index, candidates=restored_candidates))
+
         manager = cls(
-            original=session.original,
+            original=original,
             encoder=encoder,
             decoder=decoder,
             population_size=session.population_size,
             base_seed=session.base_seed,
             autosave_interval=session.autosave_interval,
         )
-        manager.generations = session.generations
+        manager.generations = restored_generations
         manager.rng.bit_generator.state = session.rng_state
         return manager
 
