@@ -336,7 +336,7 @@ def _refresh_sound_scene(
     new_sound_seed = int(rng.integers(0, np.iinfo(np.int32).max))
     new_shared_seed = int(rng.integers(0, np.iinfo(np.int32).max))
 
-    state["sound_seed"] = new_sound_seed
+    state["active_sound_seed"] = new_sound_seed
     state["current_sound_sample_rate"] = int(sample_rate)
     state["current_sound_resolution"] = int(resolution)
     state["sound_sample_rate_bounds"] = (int(sample_bounds[0]), int(sample_bounds[1]))
@@ -396,8 +396,14 @@ def run() -> None:
         state["shared_seed"] = int(np.random.default_rng().integers(0, np.iinfo(np.int32).max))
     state.setdefault("encoder_sigma_base", 0.2)
     state.setdefault("decoder_sigma_base", 1.0)
-    if "sound_seed" not in state:
-        state["sound_seed"] = int(np.random.default_rng().integers(0, np.iinfo(np.int32).max))
+    legacy_sound_seed = state.pop("sound_seed", None)
+    if "active_sound_seed" not in state:
+        if legacy_sound_seed is not None:
+            state["active_sound_seed"] = int(legacy_sound_seed)
+        else:
+            state["active_sound_seed"] = int(
+                np.random.default_rng().integers(0, np.iinfo(np.int32).max)
+            )
     state.setdefault("sound_target_dwell", 10)
     state.setdefault("last_sound_target_dwell", int(state["sound_target_dwell"]))
     state.setdefault("sound_generations_left", int(state["sound_target_dwell"]))
@@ -468,7 +474,7 @@ def run() -> None:
         )
 
     seed = int(state.get("shared_seed", 0))
-    sound_seed = int(state.get("sound_seed", seed))
+    sound_seed = int(state.get("active_sound_seed", seed))
     sample_rate_range = tuple(
         int(v) for v in state.get("sound_sample_rate_bounds", (24_000, 48_000))
     )
@@ -662,7 +668,7 @@ def run() -> None:
 
     for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
         for col, (image, caption) in zip(columns, content):
-            col.image(image, caption=caption, use_container_width=True, clamp=True)
+            col.image(image, caption=caption, width="stretch", clamp=True)
 
     st.caption(
         "Red highlights information present only in the generated candidate, blue marks"
@@ -769,7 +775,7 @@ def run() -> None:
                 target_dwell,
             )
             seed = int(state.get("shared_seed", seed))
-            sound_seed = int(state.get("sound_seed", new_seed))
+            sound_seed = int(state.get("active_sound_seed", new_seed))
             current_sample_rate = next_rate
             current_resolution = next_resolution
             remaining_after = target_dwell
@@ -810,7 +816,7 @@ def run() -> None:
         if generation_progress_rows:
             progress_df = pd.DataFrame(generation_progress_rows).set_index("Generation")
             st.subheader("Best-of-generation trend")
-            st.line_chart(progress_df, use_container_width=True)
+            st.line_chart(progress_df, width="stretch")
 
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
@@ -850,7 +856,7 @@ def run() -> None:
                 col.image(
                     to_uint8_image(_apply_color_template(candidate.reconstruction, color_template)),
                     caption=caption,
-                    use_container_width=True,
+                    width="stretch",
                     clamp=True,
                 )
 
@@ -879,22 +885,22 @@ def run() -> None:
 
         inspect_cols = st.columns(4)
         inspect_cols[0].image(
-            to_uint8_image(colored_original), caption="Evolution reference", use_container_width=True
+            to_uint8_image(colored_original), caption="Evolution reference", width="stretch"
         )
         inspect_cols[1].image(
             to_uint8_image(_apply_color_template(inspected.reconstruction, color_template)),
             caption=f"Candidate seed {inspected.seed}",
-            use_container_width=True,
+            width="stretch",
         )
         inspect_cols[2].image(
             to_uint8_image(inspect_overlap_map),
             caption=f"Overlap map ({inspect_overlap_score:.1f}%)",
-            use_container_width=True,
+            width="stretch",
         )
         inspect_cols[3].image(
             to_uint8_image(inspected_color),
             caption="Colour overlap vs reference",
-            use_container_width=True,
+            width="stretch",
         )
 
         st.subheader("Generation summary")
