@@ -137,10 +137,31 @@ def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.nda
     return np.clip(tinted, 0.0, 1.0).astype(np.float32)
 
 
+def _reset_widget_key(state: st.session_state, key: str) -> None:
+    """Safely clear a widget-managed session key if it exists."""
+
+    reset = getattr(state, "reset_state_value", None)
+    if callable(reset):  # pragma: no branch - Streamlit >= 1.32
+        try:
+            reset(key, None)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    if key in state:
+        try:
+            del state[key]
+        except Exception:  # pragma: no cover - defensive guard
+            try:
+                state.pop(key, None)
+            except Exception:
+                pass
+
+
 def _migrate_legacy_state(state: st.session_state) -> None:
     """Remove legacy widget-driven keys that conflict with automated controls."""
 
-    legacy_seed = state.pop("sound_seed", None)
+    legacy_seed = state.get("sound_seed")
+    _reset_widget_key(state, "sound_seed")
     if legacy_seed is not None and "active_sound_seed" not in state:
         try:
             state["active_sound_seed"] = int(legacy_seed)
@@ -153,10 +174,10 @@ def _migrate_legacy_state(state: st.session_state) -> None:
         "encoder_noise",
         "decoder_noise",
     ):
-        state.pop(noisy_key, None)
+        _reset_widget_key(state, noisy_key)
 
-    bounds_low = state.pop("sound_sample_rate_min", None)
-    bounds_high = state.pop("sound_sample_rate_max", None)
+    bounds_low = state.get("sound_sample_rate_min")
+    bounds_high = state.get("sound_sample_rate_max")
     if (
         bounds_low is not None
         and bounds_high is not None
@@ -166,17 +187,21 @@ def _migrate_legacy_state(state: st.session_state) -> None:
             state["sound_sample_rate_bounds"] = (int(bounds_low), int(bounds_high))
         except (TypeError, ValueError):  # pragma: no cover - defensive
             pass
+    _reset_widget_key(state, "sound_sample_rate_min")
+    _reset_widget_key(state, "sound_sample_rate_max")
 
-    res_low = state.pop("sound_resolution_min", None)
-    res_high = state.pop("sound_resolution_max", None)
+    res_low = state.get("sound_resolution_min")
+    res_high = state.get("sound_resolution_max")
     if res_low is not None and res_high is not None and "sound_resolution_bounds" not in state:
         try:
             state["sound_resolution_bounds"] = (int(res_low), int(res_high))
         except (TypeError, ValueError):  # pragma: no cover - defensive
             pass
+    _reset_widget_key(state, "sound_resolution_min")
+    _reset_widget_key(state, "sound_resolution_max")
 
 
-_SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (128, 192, 256)
+_SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (96, 128, 160, 192, 224, 256)
 _PERFORMANCE_HISTORY = 60
 _RECENT_PERFORMANCE = 8
 
@@ -467,6 +492,7 @@ def _refresh_sound_scene(
     new_sound_seed = int(rng.integers(0, np.iinfo(np.int32).max))
     new_shared_seed = int(rng.integers(0, np.iinfo(np.int32).max))
 
+    _reset_widget_key(state, "sound_seed")
     state["active_sound_seed"] = new_sound_seed
     state["current_sound_sample_rate"] = int(sample_rate)
     state["current_sound_resolution"] = int(resolution)
