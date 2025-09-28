@@ -161,6 +161,10 @@ def run() -> None:
     state.setdefault("sound_seed", 4321)
     state.setdefault("sound_sample_rate", 48_000)
     state.setdefault("sound_resolution", 192)
+    state.setdefault("sound_target_dwell", 10)
+    state.setdefault("last_sound_target_dwell", int(state["sound_target_dwell"]))
+    state.setdefault("sound_generations_left", int(state["sound_target_dwell"]))
+    state.setdefault("last_sound_seed", int(state.get("sound_seed", 4321)))
 
     st.sidebar.header("Input & Parameters")
     autosave_input = st.sidebar.text_input(
@@ -241,6 +245,33 @@ def run() -> None:
             key="sound_resolution",
         )
     )
+    target_dwell = int(
+        st.sidebar.number_input(
+            "Generations per sound target",
+            min_value=1,
+            max_value=500,
+            value=int(state.get("sound_target_dwell", 10)),
+            step=1,
+            key="sound_target_dwell",
+            help=(
+                "Number of evolution steps to spend matching the current sound-derived "
+                "image before refreshing it with a new randomised scene."
+            ),
+        )
+    )
+
+    if state.get("last_sound_target_dwell") != target_dwell:
+        state["last_sound_target_dwell"] = target_dwell
+        state["sound_generations_left"] = target_dwell
+
+    if state.get("last_sound_seed") != sound_seed:
+        state["last_sound_seed"] = sound_seed
+        state["sound_generations_left"] = target_dwell
+
+    state["sound_generations_left"] = int(
+        max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
+    )
+    remaining_before = int(state.get("sound_generations_left", target_dwell))
 
     original_color, original, sound_clip, shape_specs = generate_sound_art(
         seed=sound_seed,
@@ -326,6 +357,9 @@ def run() -> None:
                 "Colour": spec.color.title(),
                 "Target shape": spec.shape.title(),
                 "Target volume": f"{spec.volume:.2f}",
+                "Target size (px)": f"{spec.size}",
+                "Target rotation (°)": f"{spec.rotation:.1f}",
+                "Target centre (y, x)": f"({spec.center[0]}, {spec.center[1]})",
                 "AI guess": ai_guess.guess.title() if ai_guess else "None",
                 "AI confidence": f"{ai_guess.confidence:.2f}" if ai_guess else "0.00",
                 "AI match": "✅" if ai_guess and ai_guess.guess == spec.shape else "❌",
@@ -356,7 +390,7 @@ def run() -> None:
 
     for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
         for col, (image, caption) in zip(columns, content):
-            col.image(image, caption=caption, use_column_width=True, clamp=True)
+            col.image(image, caption=caption, use_container_width=True, clamp=True)
 
     st.caption(
         "Red highlights information present only in the generated candidate, blue marks"
@@ -452,11 +486,36 @@ def run() -> None:
 
     trigger_rerun = False
     if generations_ran:
+        remaining_after = max(remaining_before - 1, 0)
+        state["sound_generations_left"] = remaining_after
+        reseeded = False
+
+        if remaining_after == 0:
+            rng = np.random.default_rng()
+            new_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            if new_seed == sound_seed:
+                new_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            state["sound_seed"] = new_seed
+            state["last_sound_seed"] = new_seed
+            state["sound_generations_left"] = target_dwell
+            remaining_after = target_dwell
+            reseeded = True
+            st.sidebar.info(
+                f"Auto-randomised sound seed to {new_seed} after {target_dwell} generations."
+            )
+
         if len(manager.generations) % manager.autosave_interval == 0:
             save_path = manager.save(autosave_dir)
             st.sidebar.success(f"Autosaved evolution session to {save_path}")
-        if state.get("pending_generations", 0) > 0 or state.get("run_infinite", False):
+        if reseeded or state.get("pending_generations", 0) > 0 or state.get("run_infinite", False):
             trigger_rerun = True
+    else:
+        state["sound_generations_left"] = remaining_before
+
+    st.sidebar.metric(
+        "Generations remaining on sound target",
+        int(state.get("sound_generations_left", target_dwell)),
+    )
 
     if manager.generations:
         st.header("Evolution progress")
@@ -475,7 +534,7 @@ def run() -> None:
         if progress_rows:
             progress_df = pd.DataFrame(progress_rows).set_index("Generation")
             st.subheader("Best-of-generation trend")
-            st.line_chart(progress_df)
+            st.line_chart(progress_df, use_container_width=True)
 
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
@@ -507,7 +566,7 @@ def run() -> None:
                 col.image(
                     to_uint8_image(_apply_color_template(candidate.reconstruction, color_template)),
                     caption=caption,
-                    use_column_width=True,
+                    use_container_width=True,
                     clamp=True,
                 )
 
@@ -534,22 +593,22 @@ def run() -> None:
 
         inspect_cols = st.columns(4)
         inspect_cols[0].image(
-            to_uint8_image(colored_original), caption="Evolution reference", use_column_width=True
+            to_uint8_image(colored_original), caption="Evolution reference", use_container_width=True
         )
         inspect_cols[1].image(
             to_uint8_image(_apply_color_template(inspected.reconstruction, color_template)),
             caption=f"Candidate seed {inspected.seed}",
-            use_column_width=True,
+            use_container_width=True,
         )
         inspect_cols[2].image(
             to_uint8_image(overlap_map),
             caption=f"Overlap map ({overlap_score:.1f}%)",
-            use_column_width=True,
+            use_container_width=True,
         )
         inspect_cols[3].image(
             to_uint8_image(inspected_color),
             caption="Colour overlap vs reference",
-            use_column_width=True,
+            use_container_width=True,
         )
 
         st.subheader("Generation summary")

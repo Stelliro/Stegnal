@@ -25,6 +25,9 @@ class ShapeSpec:
     color: str
     shape: str
     volume: float
+    center: Tuple[int, int]
+    rotation: float
+    size: int
 
 
 @dataclass(frozen=True)
@@ -71,47 +74,62 @@ def _draw_circle(canvas: np.ndarray, center: Tuple[int, int], radius: int, chann
     canvas[..., channel][mask] = np.maximum(canvas[..., channel][mask], intensity)
 
 
-def _draw_square(canvas: np.ndarray, center: Tuple[int, int], size: int, channel: int, intensity: float) -> None:
-    rows, cols = canvas.shape[:2]
-    half = size // 2
-    top = max(center[0] - half, 0)
-    bottom = min(center[0] + half, rows)
-    left = max(center[1] - half, 0)
-    right = min(center[1] + half, cols)
-    canvas[top:bottom, left:right, channel] = np.maximum(
-        canvas[top:bottom, left:right, channel], intensity
+def _rotate_offsets(points: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate ``points`` (x, y) offsets by ``angle`` radians."""
+
+    rotation = np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+        dtype=np.float32,
     )
+    return points @ rotation.T
 
 
-def _triangle_mask(rows: int, cols: int, vertices: Sequence[Tuple[int, int]]) -> np.ndarray:
-    y, x = np.meshgrid(np.arange(rows), np.arange(cols), indexing="ij")
-    (y0, x0), (y1, x1), (y2, x2) = vertices
-    denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
-    if denom == 0:
-        return np.zeros((rows, cols), dtype=bool)
-    a = ((y1 - y2) * (x - x2) + (x2 - x1) * (y - y2)) / denom
-    b = ((y2 - y0) * (x - x2) + (x0 - x2) * (y - y2)) / denom
-    c = 1.0 - a - b
-    return (a >= 0) & (b >= 0) & (c >= 0)
-
-
-def _draw_triangle(
+def _draw_polygon(
     canvas: np.ndarray,
-    center: Tuple[int, int],
-    size: int,
+    vertices: Sequence[Tuple[float, float]],
     channel: int,
     intensity: float,
 ) -> None:
-    rows, cols = canvas.shape[:2]
-    cy, cx = center
-    top = max(cy - size, 0)
-    bottom = min(cy + size, rows - 1)
-    left = max(cx - size, 0)
-    right = min(cx + size, cols - 1)
+    """Rasterise a filled polygon defined by ``vertices`` onto ``canvas``."""
 
-    vertices = ((top, cx), (bottom, left), (bottom, right))
-    mask = _triangle_mask(rows, cols, vertices)
-    canvas[..., channel][mask] = np.maximum(canvas[..., channel][mask], intensity)
+    rows, cols = canvas.shape[:2]
+    poly = np.asarray(vertices, dtype=np.float32)
+    if poly.size == 0:
+        return
+
+    min_y = max(int(np.floor(poly[:, 0].min())), 0)
+    max_y = min(int(np.ceil(poly[:, 0].max())), rows - 1)
+    min_x = max(int(np.floor(poly[:, 1].min())), 0)
+    max_x = min(int(np.ceil(poly[:, 1].max())), cols - 1)
+
+    if min_y > max_y or min_x > max_x:
+        return
+
+    y_coords = np.arange(min_y, max_y + 1)
+    x_coords = np.arange(min_x, max_x + 1)
+    yy = y_coords[:, None].astype(np.float32) + 0.5
+    xx = x_coords[None, :].astype(np.float32) + 0.5
+
+    inside = np.zeros((y_coords.size, x_coords.size), dtype=bool)
+    y_vertices = poly[:, 0]
+    x_vertices = poly[:, 1]
+    count = len(poly)
+
+    for idx in range(count):
+        nxt = (idx + 1) % count
+        y0, y1 = y_vertices[idx], y_vertices[nxt]
+        x0, x1 = x_vertices[idx], x_vertices[nxt]
+
+        if np.isclose(y0, y1):
+            continue
+
+        intersects = (y0 > yy) != (y1 > yy)
+        x_intersect = (x1 - x0) * (yy - y0) / (y1 - y0) + x0
+        inside ^= intersects & (xx < x_intersect)
+
+    subregion = canvas[min_y : max_y + 1, min_x : max_x + 1, channel]
+    subregion[inside] = np.maximum(subregion[inside], intensity)
+    canvas[min_y : max_y + 1, min_x : max_x + 1, channel] = subregion
 
 
 def generate_sound_art(
@@ -129,8 +147,9 @@ def generate_sound_art(
 
     color_canvas = np.zeros((*image_size, 3), dtype=np.float32)
     rows, cols = image_size
-    min_extent = max(min(rows, cols) // 6, 12)
-    max_extent = max(min(rows, cols) // 3, min_extent + 4)
+    min_extent = max(min(rows, cols) // 5, 18)
+    max_extent = max(min(rows, cols) // 4, min_extent + 6)
+    padding = int(np.ceil(max_extent * 1.25))
 
     shapes: List[ShapeSpec] = []
     shape_types = ("circle", "square", "triangle")
@@ -139,20 +158,53 @@ def generate_sound_art(
     for color_name in ("red", "green", "blue"):
         channel = channels[color_name]
         extent = int(rng.integers(min_extent, max_extent + 1))
-        cy = int(rng.integers(extent, rows - extent)) if rows > 2 * extent else rows // 2
-        cx = int(rng.integers(extent, cols - extent)) if cols > 2 * extent else cols // 2
+        cy = int(rng.integers(padding, rows - padding)) if rows > 2 * padding else rows // 2
+        cx = int(rng.integers(padding, cols - padding)) if cols > 2 * padding else cols // 2
         center = (cy, cx)
         shape = rng.choice(shape_types)
+        rotation = float(rng.uniform(0, 2 * np.pi)) if shape != "circle" else 0.0
         intensity = float(np.clip(volumes[color_name], 0.05, 1.0))
 
         if shape == "circle":
             _draw_circle(color_canvas, center, extent, channel, intensity)
-        elif shape == "square":
-            _draw_square(color_canvas, center, extent * 2, channel, intensity)
         else:
-            _draw_triangle(color_canvas, center, extent, channel, intensity)
+            if shape == "square":
+                half = float(extent)
+                base = np.array(
+                    [
+                        [-half, -half],
+                        [half, -half],
+                        [half, half],
+                        [-half, half],
+                    ],
+                    dtype=np.float32,
+                )
+            else:
+                height = float(extent)
+                width = float(extent)
+                base = np.array(
+                    [
+                        [0.0, -height],
+                        [width, height],
+                        [-width, height],
+                    ],
+                    dtype=np.float32,
+                )
 
-        shapes.append(ShapeSpec(color=color_name, shape=shape, volume=intensity))
+            rotated = _rotate_offsets(base, rotation)
+            vertices = [(center[0] + pt[1], center[1] + pt[0]) for pt in rotated]
+            _draw_polygon(color_canvas, vertices, channel, intensity)
+
+        shapes.append(
+            ShapeSpec(
+                color=color_name,
+                shape=shape,
+                volume=intensity,
+                center=center,
+                rotation=np.degrees(rotation),
+                size=extent,
+            )
+        )
 
     color_canvas = np.clip(color_canvas, 0.0, 1.0)
     grayscale = np.clip(
