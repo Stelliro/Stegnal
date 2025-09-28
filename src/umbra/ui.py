@@ -147,6 +147,17 @@ def _reset_widget_key(state: st.session_state, key: str) -> None:
         except Exception:  # pragma: no cover - defensive guard
             pass
 
+    setter = getattr(state, "_set_widget_state", None)
+    if callable(setter):  # pragma: no branch - private Streamlit helper
+        try:
+            setter(key, None)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    widget_state = getattr(state, "_new_widget_state", None)
+    if isinstance(widget_state, dict):  # pragma: no branch - legacy internals
+        widget_state.pop(key, None)
+
     if key in state:
         try:
             del state[key]
@@ -162,6 +173,7 @@ def _migrate_legacy_state(state: st.session_state) -> None:
 
     legacy_seed = state.get("sound_seed")
     _reset_widget_key(state, "sound_seed")
+    state.pop("sound_seed", None)
     if legacy_seed is not None and "active_sound_seed" not in state:
         try:
             state["active_sound_seed"] = int(legacy_seed)
@@ -493,6 +505,7 @@ def _refresh_sound_scene(
     new_shared_seed = int(rng.integers(0, np.iinfo(np.int32).max))
 
     _reset_widget_key(state, "sound_seed")
+    state.pop("sound_seed", None)
     state["active_sound_seed"] = new_sound_seed
     state["current_sound_sample_rate"] = int(sample_rate)
     state["current_sound_resolution"] = int(resolution)
