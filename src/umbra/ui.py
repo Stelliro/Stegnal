@@ -494,8 +494,13 @@ def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, 
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("session_summary.json", json.dumps(payload, indent=2))
         if progress_rows:
-            export_df = pd.DataFrame(progress_rows)
-            archive.writestr("generation_progress.csv", export_df.to_csv(index=False))
+            export_df = (
+                pd.DataFrame(progress_rows)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna(how="all")
+            )
+            if not export_df.empty:
+                archive.writestr("generation_progress.csv", export_df.to_csv(index=False))
     buffer.seek(0)
     return buffer
 
@@ -528,14 +533,10 @@ def run() -> None:
         state["shared_seed"] = int(np.random.default_rng().integers(0, np.iinfo(np.int32).max))
     state.setdefault("encoder_sigma_base", 0.2)
     state.setdefault("decoder_sigma_base", 1.0)
-    legacy_sound_seed = state.pop("sound_seed", None)
     if "active_sound_seed" not in state:
-        if legacy_sound_seed is not None:
-            state["active_sound_seed"] = int(legacy_sound_seed)
-        else:
-            state["active_sound_seed"] = int(
-                np.random.default_rng().integers(0, np.iinfo(np.int32).max)
-            )
+        state["active_sound_seed"] = int(
+            np.random.default_rng().integers(0, np.iinfo(np.int32).max)
+        )
     state.setdefault("sound_target_dwell", 10)
     state.setdefault("last_sound_target_dwell", int(state["sound_target_dwell"]))
     state.setdefault("sound_generations_left", int(state["sound_target_dwell"]))
@@ -981,9 +982,23 @@ def run() -> None:
         ]
 
         if generation_progress_rows:
-            progress_df = pd.DataFrame(generation_progress_rows).set_index("Generation")
+            progress_df = (
+                pd.DataFrame(generation_progress_rows)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna(how="all")
+            )
+            if not progress_df.empty:
+                progress_df = progress_df.set_index("Generation")
             st.subheader("Best-of-generation trend")
-            st.line_chart(progress_df, width="stretch")
+            if len(progress_df.index) > 1 and any(
+                progress_df[col].nunique() > 1 for col in progress_df.columns
+            ):
+                st.line_chart(progress_df, width="stretch")
+            else:
+                st.caption(
+                    "Trend chart will appear once multiple non-identical generations are"
+                    " available."
+                )
 
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
