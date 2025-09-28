@@ -146,14 +146,14 @@ def _image_to_png_bytes(image: np.ndarray) -> bytes:
     array = np.asarray(image)
     if array.dtype != np.uint8 or array.ndim not in (2, 3):
         array = to_uint8_image(array)
-    if array.ndim == 2:
-        pil_image = Image.fromarray(array, mode="L")
-    elif array.shape[2] == 3:
-        pil_image = Image.fromarray(array, mode="RGB")
-    elif array.shape[2] == 4:
-        pil_image = Image.fromarray(array, mode="RGBA")
-    else:  # pragma: no cover - defensive guard for unexpected channel counts
-        raise ValueError("Expected 1, 3, or 4 channel image for PNG conversion")
+
+    if array.ndim == 3:
+        if array.shape[2] == 1:
+            array = array[:, :, 0]
+        elif array.shape[2] not in (3, 4):  # pragma: no cover - defensive
+            raise ValueError("Expected 1, 3, or 4 channel image for PNG conversion")
+
+    pil_image = Image.fromarray(array)
 
     buffer = BytesIO()
     pil_image.save(buffer, format="PNG")
