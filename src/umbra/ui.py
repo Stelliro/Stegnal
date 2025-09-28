@@ -171,9 +171,16 @@ def _reset_widget_key(state: st.session_state, key: str) -> None:
 def _migrate_legacy_state(state: st.session_state) -> None:
     """Remove legacy widget-driven keys that conflict with automated controls."""
 
-    legacy_seed = state.get("sound_seed")
-    _reset_widget_key(state, "sound_seed")
-    state.pop("sound_seed", None)
+    try:
+        legacy_seed = state.get("sound_seed")
+    except Exception:  # pragma: no cover - defensive guard
+        legacy_seed = None
+
+    try:
+        _reset_widget_key(state, "sound_seed")
+        state.pop("sound_seed", None)
+    except Exception:  # pragma: no cover - defensive guard
+        pass
     if legacy_seed is not None and "active_sound_seed" not in state:
         try:
             state["active_sound_seed"] = int(legacy_seed)
@@ -504,8 +511,11 @@ def _refresh_sound_scene(
     new_sound_seed = int(rng.integers(0, np.iinfo(np.int32).max))
     new_shared_seed = int(rng.integers(0, np.iinfo(np.int32).max))
 
-    _reset_widget_key(state, "sound_seed")
-    state.pop("sound_seed", None)
+    try:
+        _reset_widget_key(state, "sound_seed")
+        state.pop("sound_seed", None)
+    except Exception:  # pragma: no cover - defensive guard
+        pass
     state["active_sound_seed"] = new_sound_seed
     state["current_sound_sample_rate"] = int(sample_rate)
     state["current_sound_resolution"] = int(resolution)
@@ -873,7 +883,13 @@ def run() -> None:
 
     for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
         for col, (image, caption) in zip(columns, content):
-            col.image(image, caption=caption, width="stretch", clamp=True)
+            col.image(
+                image,
+                caption=caption,
+                width="stretch",
+                clamp=True,
+                output_format="PNG",
+            )
 
     st.caption(
         "Red highlights information present only in the generated candidate, blue marks"
@@ -1083,10 +1099,13 @@ def run() -> None:
                     f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
                 )
                 col.image(
-                    to_uint8_image(_apply_color_template(candidate.reconstruction, color_template)),
+                    to_uint8_image(
+                        _apply_color_template(candidate.reconstruction, color_template)
+                    ),
                     caption=caption,
                     width="stretch",
                     clamp=True,
+                    output_format="PNG",
                 )
 
         st.subheader("Candidate inspector")
@@ -1114,22 +1133,28 @@ def run() -> None:
 
         inspect_cols = st.columns(4)
         inspect_cols[0].image(
-            to_uint8_image(colored_original), caption="Evolution reference", width="stretch"
+            to_uint8_image(colored_original),
+            caption="Evolution reference",
+            width="stretch",
+            output_format="PNG",
         )
         inspect_cols[1].image(
             to_uint8_image(_apply_color_template(inspected.reconstruction, color_template)),
             caption=f"Candidate seed {inspected.seed}",
             width="stretch",
+            output_format="PNG",
         )
         inspect_cols[2].image(
             to_uint8_image(inspect_overlap_map),
             caption=f"Overlap map ({inspect_overlap_score:.1f}%)",
             width="stretch",
+            output_format="PNG",
         )
         inspect_cols[3].image(
             to_uint8_image(inspected_color),
             caption="Colour overlap vs reference",
             width="stretch",
+            output_format="PNG",
         )
 
         st.subheader("Generation summary")
