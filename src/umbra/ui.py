@@ -137,6 +137,45 @@ def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.nda
     return np.clip(tinted, 0.0, 1.0).astype(np.float32)
 
 
+def _migrate_legacy_state(state: st.session_state) -> None:
+    """Remove legacy widget-driven keys that conflict with automated controls."""
+
+    legacy_seed = state.pop("sound_seed", None)
+    if legacy_seed is not None and "active_sound_seed" not in state:
+        try:
+            state["active_sound_seed"] = int(legacy_seed)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+
+    for noisy_key in (
+        "encoder_sigma",
+        "decoder_sigma",
+        "encoder_noise",
+        "decoder_noise",
+    ):
+        state.pop(noisy_key, None)
+
+    bounds_low = state.pop("sound_sample_rate_min", None)
+    bounds_high = state.pop("sound_sample_rate_max", None)
+    if (
+        bounds_low is not None
+        and bounds_high is not None
+        and "sound_sample_rate_bounds" not in state
+    ):
+        try:
+            state["sound_sample_rate_bounds"] = (int(bounds_low), int(bounds_high))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+
+    res_low = state.pop("sound_resolution_min", None)
+    res_high = state.pop("sound_resolution_max", None)
+    if res_low is not None and res_high is not None and "sound_resolution_bounds" not in state:
+        try:
+            state["sound_resolution_bounds"] = (int(res_low), int(res_high))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+
+
 _SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (128, 192, 256)
 _PERFORMANCE_HISTORY = 60
 _RECENT_PERFORMANCE = 8
@@ -475,6 +514,7 @@ def run() -> None:
     )
 
     state = st.session_state
+    _migrate_legacy_state(state)
     state.setdefault("pending_generations", 0)
     state.setdefault("run_infinite", False)
     state.setdefault("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))
