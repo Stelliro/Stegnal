@@ -5,6 +5,32 @@ from __future__ import annotations
 import numpy as np
 
 
+def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
+    """Average pixels within ``block_size`` square regions.
+
+    The function makes the visual overlays easier to inspect by expanding fine
+    details into larger, more uniform shapes. Any trailing pixels that do not
+    perfectly fit the block grid are handled by averaging over their partial
+    blocks as well.
+    """
+
+    if block_size <= 1:
+        return np.asarray(channel, dtype=np.float32)
+
+    arr = np.asarray(channel, dtype=np.float32)
+    height, width = arr.shape
+    averaged = np.empty_like(arr)
+
+    for row in range(0, height, block_size):
+        row_end = min(row + block_size, height)
+        for col in range(0, width, block_size):
+            col_end = min(col + block_size, width)
+            block = arr[row:row_end, col:col_end]
+            averaged[row:row_end, col:col_end] = float(block.mean())
+
+    return averaged
+
+
 def normalize_for_display(array: np.ndarray) -> np.ndarray:
     """Normalize an arbitrary float array to the [0, 1] range for visualization."""
     arr = np.asarray(array, dtype=np.float32)
@@ -45,7 +71,58 @@ def multiplicative_overlap(
 def to_uint8_image(array: np.ndarray) -> np.ndarray:
     """Convert a normalized float image to uint8 grayscale."""
     arr = np.clip(np.asarray(array, dtype=np.float32), 0.0, 1.0)
-    return (arr * 255.0).round().astype(np.uint8)
+    if arr.ndim == 2:
+        return (arr * 255.0).round().astype(np.uint8)
+    if arr.ndim == 3 and arr.shape[2] in (3, 4):
+        return (arr * 255.0).round().astype(np.uint8)
+    raise ValueError("Expected 2D grayscale or 3-channel color array for conversion")
 
 
-__all__ = ["normalize_for_display", "multiplicative_overlap", "to_uint8_image"]
+def colorize_comparison(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    block_size: int = 8,
+) -> np.ndarray:
+    """Create a color overlay highlighting agreement and disagreement.
+
+    The resulting RGB image uses the following colour coding:
+
+    * Overlapping signal (agreement) – rendered using the grayscale intensity
+      from ``reference`` to preserve the look of the predicted image.
+    * Candidate-only signal – highlighted in red.
+    * Reference-only signal – highlighted in blue.
+
+    The ``block_size`` parameter controls how aggressively pixels are averaged
+    into larger shapes, making subtle differences easier to spot.
+    """
+
+    ref = np.clip(np.asarray(reference, dtype=np.float32), 0.0, 1.0)
+    cand = np.clip(np.asarray(candidate, dtype=np.float32), 0.0, 1.0)
+
+    if ref.shape != cand.shape:
+        raise ValueError("Reference and candidate images must share the same shape")
+
+    overlap = np.minimum(ref, cand)
+    ref_only = np.clip(ref - overlap, 0.0, 1.0)
+    cand_only = np.clip(cand - overlap, 0.0, 1.0)
+
+    color = np.zeros((*ref.shape, 3), dtype=np.float32)
+    color[..., :] = overlap[..., None]
+    color[..., 0] += cand_only  # red channel emphasises candidate-only content
+    color[..., 2] += ref_only   # blue channel emphasises reference-only content
+    color = np.clip(color, 0.0, 1.0)
+
+    if block_size > 1:
+        for channel in range(3):
+            color[..., channel] = _block_average(color[..., channel], block_size)
+
+    return color.astype(np.float32)
+
+
+__all__ = [
+    "colorize_comparison",
+    "normalize_for_display",
+    "multiplicative_overlap",
+    "to_uint8_image",
+]

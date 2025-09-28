@@ -33,26 +33,37 @@ class NoiseStreamDecoder:
         if seed != packet.permutation_seed:
             raise ValueError("Seed mismatch: cannot decode without the original seed")
 
-        height, width = packet.image_shape
         rng = np.random.default_rng(seed)
-        flat_size = height * width
+        flat_size = int(np.prod(packet.image_shape))
         permutation = rng.permutation(flat_size)
         inverse = np.empty_like(permutation)
         inverse[permutation] = np.arange(flat_size)
 
         permuted = packet.encoded
         recovered = permuted[inverse]
-        recovered = recovered.reshape(height, width)
+        recovered = recovered.reshape(packet.image_shape)
 
         if self.denoise_sigma and self.denoise_sigma > 0:
-            recovered = filters.gaussian(recovered, sigma=self.denoise_sigma, preserve_range=True)
+            recovered = filters.gaussian(
+                recovered,
+                sigma=self.denoise_sigma,
+                preserve_range=True,
+                channel_axis=-1 if recovered.ndim == 3 else None,
+            )
 
         recovered = np.clip(recovered, 0.0, 1.0)
         return recovered.astype(np.float32)
 
     def decode_to_image(self, packet: NoisePacket, seed: int, path: str | Path) -> None:
         array = self.decode(packet, seed)
-        image = Image.fromarray((array * 255.0).astype(np.uint8), mode="L")
+        data = (array * 255.0).astype(np.uint8)
+        if array.ndim == 2:
+            image = Image.fromarray(data, mode="L")
+        elif array.ndim == 3 and array.shape[2] in (3, 4):
+            mode = "RGB" if array.shape[2] == 3 else "RGBA"
+            image = Image.fromarray(data, mode=mode)
+        else:
+            raise ValueError("Unsupported array shape for image export")
         image.save(path)
 
 

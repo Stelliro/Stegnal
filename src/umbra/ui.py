@@ -2,66 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Tuple
+from typing import Dict
 
 import numpy as np
+import pandas as pd
 import streamlit as st
-from PIL import Image
-from skimage import data
 
 from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
+from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, compute_image_signature
 from umbra.metrics import compute_metrics
-from umbra.visualization import multiplicative_overlap, normalize_for_display, to_uint8_image
-
-
-@dataclass(frozen=True)
-class SampleImage:
-    name: str
-    description: str
-    loader: Callable[[], np.ndarray]
-
-    def load(self) -> np.ndarray:
-        array = np.asarray(self.loader(), dtype=np.float32)
-        if array.ndim == 3:
-            array = array.mean(axis=2)
-        max_val = float(array.max())
-        if max_val == 0:
-            return np.zeros_like(array)
-        if max_val > 1.0:
-            array /= 255.0
-        return np.clip(array, 0.0, 1.0)
-
-
-SAMPLES: Dict[str, SampleImage] = {
-    "Camera": SampleImage(
-        name="Camera",
-        description="Classic cameraman grayscale test image",
-        loader=lambda: data.camera(),
-    ),
-    "Checkerboard": SampleImage(
-        name="Checkerboard",
-        description="High-frequency checkerboard for stress testing",
-        loader=lambda: data.checkerboard(),
-    ),
-    "Coins": SampleImage(
-        name="Coins",
-        description="Coins with varied textures",
-        loader=lambda: data.coins(),
-    ),
-}
+from umbra.sound import ShapeGuess, generate_sound_art, guess_shapes
+from umbra.visualization import (
+    colorize_comparison,
+    multiplicative_overlap,
+    normalize_for_display,
+    to_uint8_image,
+)
 
 
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
-
-
-def _load_uploaded_image(uploaded_file) -> Tuple[np.ndarray, str]:
-    image = Image.open(uploaded_file).convert("L")
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    return array, getattr(uploaded_file, "name", "Uploaded image")
 
 
 def _autosave_path(directory: Path) -> Path:
@@ -141,6 +102,36 @@ def _trigger_rerun() -> None:
     rerun()
 
 
+def _predict_noise_map(image: np.ndarray, packet: NoisePacket) -> np.ndarray:
+    """Recover the exact noise contribution used during encoding."""
+
+    flat_image = np.asarray(image, dtype=np.float32).reshape(-1)
+    rng = np.random.default_rng(packet.permutation_seed)
+    permutation = rng.permutation(flat_image.size)
+    permuted = flat_image[permutation]
+    noise = packet.encoded - permuted
+    return noise.reshape(packet.image_shape).astype(np.float32)
+
+
+def _build_color_template(color: np.ndarray, grayscale: np.ndarray) -> np.ndarray:
+    """Create a colour template that re-applies the original hues to reconstructions."""
+
+    rgb = np.clip(np.asarray(color, dtype=np.float32), 0.0, 1.0)
+    gray = np.clip(np.asarray(grayscale, dtype=np.float32), 0.0, 1.0)
+    template = np.zeros_like(rgb)
+    denom = np.where(gray[..., None] > 1e-6, gray[..., None], 1.0)
+    template = np.where(gray[..., None] > 1e-6, rgb / denom, rgb)
+    return template.astype(np.float32)
+
+
+def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.ndarray:
+    """Colourize ``grayscale`` using the ratios captured in ``template``."""
+
+    gray = np.clip(np.asarray(grayscale, dtype=np.float32), 0.0, 1.0)
+    tinted = gray[..., None] * template
+    return np.clip(tinted, 0.0, 1.0).astype(np.float32)
+
+
 def run() -> None:
     """Entry-point for the Streamlit application."""
     st.set_page_config(page_title="Project Umbra Visual Explorer", layout="wide")
@@ -167,6 +158,13 @@ def run() -> None:
     state.setdefault("shared_seed", 1234)
     state.setdefault("encoder_sigma", 0.2)
     state.setdefault("decoder_sigma", 1.0)
+    state.setdefault("sound_seed", 4321)
+    state.setdefault("sound_sample_rate", 48_000)
+    state.setdefault("sound_resolution", 192)
+    state.setdefault("sound_target_dwell", 10)
+    state.setdefault("last_sound_target_dwell", int(state["sound_target_dwell"]))
+    state.setdefault("sound_generations_left", int(state["sound_target_dwell"]))
+    state.setdefault("last_sound_seed", int(state.get("sound_seed", 4321)))
 
     st.sidebar.header("Input & Parameters")
     autosave_input = st.sidebar.text_input(
@@ -218,22 +216,70 @@ def run() -> None:
         )
     )
 
-    st.sidebar.subheader("Source image")
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload a grayscale-friendly image", type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
+    st.sidebar.subheader("Sound synthesis")
+    sound_seed = int(
+        st.sidebar.number_input(
+            "Sound seed",
+            min_value=0,
+            value=int(state.get("sound_seed", seed)),
+            step=1,
+            key="sound_seed",
+        )
+    )
+    sample_rate = int(
+        st.sidebar.slider(
+            "Sound sample rate",
+            min_value=8_000,
+            max_value=96_000,
+            value=int(state.get("sound_sample_rate", 48_000)),
+            step=1_000,
+            help="Controls the number of random samples driving the colour volumes.",
+            key="sound_sample_rate",
+        )
+    )
+    resolution = int(
+        st.sidebar.select_slider(
+            "Generated image resolution",
+            options=[128, 192, 256],
+            value=int(state.get("sound_resolution", 192)),
+            key="sound_resolution",
+        )
+    )
+    target_dwell = int(
+        st.sidebar.number_input(
+            "Generations per sound target",
+            min_value=1,
+            max_value=500,
+            value=int(state.get("sound_target_dwell", 10)),
+            step=1,
+            key="sound_target_dwell",
+            help=(
+                "Number of evolution steps to spend matching the current sound-derived "
+                "image before refreshing it with a new randomised scene."
+            ),
+        )
     )
 
-    if uploaded_file is not None:
-        original, uploaded_label = _load_uploaded_image(uploaded_file)
-        source_label = f"Uploaded: {uploaded_label}"
-    else:
-        sample_name = st.sidebar.selectbox(
-            "Choose a built-in sample",
-            options=list(SAMPLES.keys()),
-            format_func=lambda key: f"{SAMPLES[key].name} — {SAMPLES[key].description}",
-        )
-        original = SAMPLES[sample_name].load()
-        source_label = f"Sample: {SAMPLES[sample_name].name}"
+    if state.get("last_sound_target_dwell") != target_dwell:
+        state["last_sound_target_dwell"] = target_dwell
+        state["sound_generations_left"] = target_dwell
+
+    if state.get("last_sound_seed") != sound_seed:
+        state["last_sound_seed"] = sound_seed
+        state["sound_generations_left"] = target_dwell
+
+    state["sound_generations_left"] = int(
+        max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
+    )
+    remaining_before = int(state.get("sound_generations_left", target_dwell))
+
+    original_color, original, sound_clip, shape_specs = generate_sound_art(
+        seed=sound_seed,
+        image_size=(resolution, resolution),
+        sample_rate=sample_rate,
+    )
+    source_label = f"Sound seed {sound_seed}"
+    color_template = _build_color_template(original_color, original)
 
     encoder = NoiseStreamEncoder(sigma=sigma)
     decoder = NoiseStreamDecoder(denoise_sigma=denoise_sigma if denoise_sigma > 0 else None)
@@ -241,40 +287,115 @@ def run() -> None:
     packet = encoder.encode(original, int(seed))
     reconstructed = decoder.decode(packet, int(seed))
 
-    noise_map = packet.encoded.reshape(original.shape)
+    noise_map = _predict_noise_map(original, packet)
     noise_display = normalize_for_display(noise_map)
-    overlap_map, overlap_score = multiplicative_overlap(original, reconstructed)
+    packet_display = normalize_for_display(packet.encoded.reshape(original.shape))
 
-    metrics = compute_metrics(original, reconstructed)
+    sound_packet = NoisePacket(
+        encoded=np.asarray(noise_map.reshape(-1), dtype=np.float32),
+        image_shape=packet.image_shape,
+        permutation_seed=packet.permutation_seed,
+        sigma=packet.sigma,
+    )
+    sound_reconstruction = decoder.decode(sound_packet, int(seed))
+
+    colored_original = np.clip(original_color, 0.0, 1.0).astype(np.float32)
+    ai_colored = _apply_color_template(reconstructed, color_template)
+    sound_colored = _apply_color_template(sound_reconstruction, color_template)
+
+    overlap_map, overlap_score = multiplicative_overlap(original, reconstructed)
+    ai_overlap_color = colorize_comparison(original, reconstructed)
+    _, sound_overlap_score = multiplicative_overlap(original, sound_reconstruction)
+    sound_overlap_color = colorize_comparison(original, sound_reconstruction)
+    cross_overlap_color = colorize_comparison(reconstructed, sound_reconstruction)
+
+    metrics = compute_metrics(colored_original, ai_colored)
+    sound_metrics = compute_metrics(colored_original, sound_colored)
+    ai_sound_alignment = compute_metrics(ai_colored, sound_colored)
+
+    st.subheader("Sound profile")
+    volume_cols = st.columns(3)
+    for idx, color in enumerate(("red", "green", "blue")):
+        volume_cols[idx].metric(
+            f"{color.title()} volume",
+            f"{sound_clip.band_volumes[color]:.2f}",
+            help="Relative energy detected in the sound clip for this colour band.",
+        )
+    st.caption(
+        f"Waveform length: {sound_clip.samples.size} samples @ {sound_clip.sample_rate} Hz."
+    )
 
     st.subheader("Reconstruction quality")
-    metric_cols = st.columns(3)
-    metric_cols[0].metric("PSNR", f"{metrics.psnr:.2f} dB")
-    metric_cols[1].metric("SSIM", f"{metrics.ssim:.3f}")
-    metric_cols[2].metric("Multiplicative overlap", f"{overlap_score:.1f}%")
+    ai_metrics_cols = st.columns(3)
+    ai_metrics_cols[0].metric("AI colour PSNR", f"{metrics.psnr:.2f} dB")
+    ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
+    ai_metrics_cols[2].metric("AI overlap", f"{overlap_score:.1f}%")
+
+    sound_metrics_cols = st.columns(3)
+    sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
+    sound_metrics_cols[1].metric("Sound colour SSIM", f"{sound_metrics.ssim:.3f}")
+    sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
+
+    st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
 
     st.write(
-        "The overlap score multiplies the normalized original and reconstructed pixels,"
+        "The overlap score multiplies the normalized original and reconstructed pixels," \
         " providing a quick proxy for how much of the signal is mutually present."
     )
 
+    st.subheader("Shape guessing AI")
+    ai_guess_map: Dict[str, ShapeGuess] = {guess.color: guess for guess in guess_shapes(ai_colored)}
+    sound_guess_map: Dict[str, ShapeGuess] = {
+        guess.color: guess for guess in guess_shapes(sound_colored)
+    }
+    guess_rows = []
+    for spec in shape_specs:
+        ai_guess = ai_guess_map.get(spec.color)
+        sound_guess = sound_guess_map.get(spec.color)
+        guess_rows.append(
+            {
+                "Colour": spec.color.title(),
+                "Target shape": spec.shape.title(),
+                "Target volume": f"{spec.volume:.2f}",
+                "Target size (px)": f"{spec.size}",
+                "Target rotation (°)": f"{spec.rotation:.1f}",
+                "Target centre (y, x)": f"({spec.center[0]}, {spec.center[1]})",
+                "AI guess": ai_guess.guess.title() if ai_guess else "None",
+                "AI confidence": f"{ai_guess.confidence:.2f}" if ai_guess else "0.00",
+                "AI match": "✅" if ai_guess and ai_guess.guess == spec.shape else "❌",
+                "Sound guess": sound_guess.guess.title() if sound_guess else "None",
+                "Sound confidence": f"{sound_guess.confidence:.2f}" if sound_guess else "0.00",
+                "Sound match": "✅" if sound_guess and sound_guess.guess == spec.shape else "❌",
+            }
+        )
+    st.table(guess_rows)
+    st.caption(
+        "Both AIs operate on the colourised reconstructions. Matching guesses indicate that "
+        "the generated patterns retained the intended geometric cues."
+    )
+
     st.subheader("Visual comparisons")
-    captions = [
-        f"Original ({source_label})",
-        "Encoded packet (normalized noise)",
-        "AI reconstruction",
-        "Multiplicative overlap",
+    overview_row = [
+        (to_uint8_image(colored_original), f"Sound-derived image ({source_label})"),
+        (to_uint8_image(packet_display), "Encoded packet (noise + signal)"),
+        (to_uint8_image(ai_colored), "AI reconstruction (colourised)"),
+        (to_uint8_image(sound_colored), "Sound-only reconstruction (colourised)"),
     ]
-    images = [
-        to_uint8_image(original),
-        to_uint8_image(noise_display),
-        to_uint8_image(reconstructed),
-        to_uint8_image(overlap_map),
+    overlay_row = [
+        (to_uint8_image(noise_display), "Predicted noise contribution"),
+        (to_uint8_image(ai_overlap_color), "Colour overlap: AI vs original"),
+        (to_uint8_image(sound_overlap_color), "Colour overlap: Sound vs original"),
+        (to_uint8_image(cross_overlap_color), "Colour overlap: AI vs sound"),
     ]
 
-    img_cols = st.columns(4)
-    for col, caption, image in zip(img_cols, captions, images):
-        col.image(image, caption=caption, width="stretch", clamp=True)
+    for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
+        for col, (image, caption) in zip(columns, content):
+            col.image(image, caption=caption, use_container_width=True, clamp=True)
+
+    st.caption(
+        "Red highlights information present only in the generated candidate, blue marks"
+        " reference-only structure, and neutral grayscale indicates shared content."
+    )
 
     st.sidebar.subheader("Evolution settings")
     population_size = int(
@@ -365,14 +486,56 @@ def run() -> None:
 
     trigger_rerun = False
     if generations_ran:
+        remaining_after = max(remaining_before - 1, 0)
+        state["sound_generations_left"] = remaining_after
+        reseeded = False
+
+        if remaining_after == 0:
+            rng = np.random.default_rng()
+            new_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            if new_seed == sound_seed:
+                new_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            state["sound_seed"] = new_seed
+            state["last_sound_seed"] = new_seed
+            state["sound_generations_left"] = target_dwell
+            remaining_after = target_dwell
+            reseeded = True
+            st.sidebar.info(
+                f"Auto-randomised sound seed to {new_seed} after {target_dwell} generations."
+            )
+
         if len(manager.generations) % manager.autosave_interval == 0:
             save_path = manager.save(autosave_dir)
             st.sidebar.success(f"Autosaved evolution session to {save_path}")
-        if state.get("pending_generations", 0) > 0 or state.get("run_infinite", False):
+        if reseeded or state.get("pending_generations", 0) > 0 or state.get("run_infinite", False):
             trigger_rerun = True
+    else:
+        state["sound_generations_left"] = remaining_before
+
+    st.sidebar.metric(
+        "Generations remaining on sound target",
+        int(state.get("sound_generations_left", target_dwell)),
+    )
 
     if manager.generations:
         st.header("Evolution progress")
+        progress_rows = []
+        for record in manager.generations:
+            best = record.best_candidate
+            progress_rows.append(
+                {
+                    "Generation": record.index,
+                    "Best SSIM": best.metrics.ssim,
+                    "Best PSNR": best.metrics.psnr,
+                    "Best overlap": best.overlap_score,
+                }
+            )
+
+        if progress_rows:
+            progress_df = pd.DataFrame(progress_rows).set_index("Generation")
+            st.subheader("Best-of-generation trend")
+            st.line_chart(progress_df, use_container_width=True)
+
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
         selected_generation = st.select_slider(
@@ -401,9 +564,9 @@ def run() -> None:
                     f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
                 )
                 col.image(
-                    to_uint8_image(candidate.reconstruction),
+                    to_uint8_image(_apply_color_template(candidate.reconstruction, color_template)),
                     caption=caption,
-                    width="stretch",
+                    use_container_width=True,
                     clamp=True,
                 )
 
@@ -426,20 +589,26 @@ def run() -> None:
         )
         inspected = generation.candidates[selected_index]
         overlap_map, overlap_score = multiplicative_overlap(manager.original, inspected.reconstruction)
+        inspected_color = colorize_comparison(manager.original, inspected.reconstruction)
 
-        inspect_cols = st.columns(3)
+        inspect_cols = st.columns(4)
         inspect_cols[0].image(
-            to_uint8_image(manager.original), caption="Evolution reference", width="stretch"
+            to_uint8_image(colored_original), caption="Evolution reference", use_container_width=True
         )
         inspect_cols[1].image(
-            to_uint8_image(inspected.reconstruction),
+            to_uint8_image(_apply_color_template(inspected.reconstruction, color_template)),
             caption=f"Candidate seed {inspected.seed}",
-            width="stretch",
+            use_container_width=True,
         )
         inspect_cols[2].image(
             to_uint8_image(overlap_map),
             caption=f"Overlap map ({overlap_score:.1f}%)",
-            width="stretch",
+            use_container_width=True,
+        )
+        inspect_cols[3].image(
+            to_uint8_image(inspected_color),
+            caption="Colour overlap vs reference",
+            use_container_width=True,
         )
 
         st.subheader("Generation summary")

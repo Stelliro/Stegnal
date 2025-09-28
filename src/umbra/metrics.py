@@ -23,8 +23,16 @@ def compute_metrics(reference: np.ndarray, candidate: np.ndarray) -> Reconstruct
     if reference.shape != candidate.shape:
         raise ValueError("Input images must share the same shape")
 
+    channel_axis = -1 if reference.ndim == 3 else None
     psnr = float(peak_signal_noise_ratio(reference, candidate, data_range=1.0))
-    ssim = float(structural_similarity(reference, candidate, data_range=1.0))
+    ssim = float(
+        structural_similarity(
+            reference,
+            candidate,
+            data_range=1.0,
+            channel_axis=channel_axis,
+        )
+    )
     return ReconstructionMetrics(psnr=psnr, ssim=ssim)
 
 
