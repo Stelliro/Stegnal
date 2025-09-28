@@ -47,8 +47,10 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         int(manager.base_seed),
     )
     state["shared_seed"] = manager.base_seed
-    state["encoder_sigma"] = float(manager.encoder.sigma)
-    state["decoder_sigma"] = float(manager.decoder.denoise_sigma or 0.0)
+    state["encoder_sigma_base"] = float(manager.encoder.sigma)
+    state["decoder_sigma_base"] = float(manager.decoder.denoise_sigma or 0.0)
+    state["active_encoder_sigma"] = float(manager.encoder.sigma)
+    state["active_decoder_sigma"] = float(manager.decoder.denoise_sigma or 0.0)
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
     st.sidebar.success("Loaded autosaved evolution session.")
@@ -132,6 +134,73 @@ def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.nda
     return np.clip(tinted, 0.0, 1.0).astype(np.float32)
 
 
+_SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (128, 192, 256)
+
+
+def _random_sample_rate(
+    rng: np.random.Generator, bounds: tuple[int, int], difficulty: float
+) -> int:
+    """Sample a sound rate biased by ``difficulty`` towards the upper bound."""
+
+    low, high = bounds
+    if low >= high:
+        return int(low)
+
+    span = max(high - low, 1)
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    exponent = max(0.3, 2.5 - 2.0 * difficulty)
+    sample = rng.random() ** exponent
+    value = low + sample * span
+    value = int(1_000 * round(value / 1_000))
+    return int(np.clip(value, low, high))
+
+
+def _random_resolution(
+    rng: np.random.Generator, bounds: tuple[int, int], difficulty: float
+) -> int:
+    """Choose a resolution that unlocks larger sizes as ``difficulty`` increases."""
+
+    minimum, maximum = bounds
+    available = [
+        res for res in _SOUND_RESOLUTION_OPTIONS if minimum <= res <= maximum
+    ]
+    if not available:
+        available = [res for res in _SOUND_RESOLUTION_OPTIONS if res >= minimum]
+    if not available:
+        available = list(_SOUND_RESOLUTION_OPTIONS)
+
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    unlocked = max(1, min(len(available), int(np.floor(difficulty * len(available))) + 1))
+    return int(rng.choice(available[:unlocked]))
+
+
+def _randomize_sound_parameters(
+    rng: np.random.Generator,
+    sample_bounds: tuple[int, int],
+    resolution_bounds: tuple[int, int],
+    difficulty: float,
+) -> tuple[int, int]:
+    """Randomly choose sound synthesis parameters within provided bounds."""
+
+    sample_rate = _random_sample_rate(rng, sample_bounds, difficulty)
+    resolution = _random_resolution(rng, resolution_bounds, difficulty)
+    return sample_rate, resolution
+
+
+def _compute_adaptive_noise(
+    base_encoder_sigma: float, base_decoder_sigma: float, difficulty: float
+) -> tuple[float, float]:
+    """Scale encoder/decoder sigmas based on the adaptive difficulty."""
+
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    encoder_sigma = base_encoder_sigma * (1.0 + 0.75 * difficulty)
+    if base_decoder_sigma <= 0:
+        decoder_sigma = 0.0
+    else:
+        decoder_sigma = max(base_decoder_sigma * (1.0 - 0.5 * difficulty), 0.05)
+    return float(encoder_sigma), float(decoder_sigma)
+
+
 def run() -> None:
     """Entry-point for the Streamlit application."""
     st.set_page_config(page_title="Project Umbra Visual Explorer", layout="wide")
@@ -156,15 +225,18 @@ def run() -> None:
     state.setdefault("generations_to_queue", 5)
     state.setdefault("evolution_mode", "Finite")
     state.setdefault("shared_seed", 1234)
-    state.setdefault("encoder_sigma", 0.2)
-    state.setdefault("decoder_sigma", 1.0)
+    state.setdefault("encoder_sigma_base", 0.2)
+    state.setdefault("decoder_sigma_base", 1.0)
     state.setdefault("sound_seed", 4321)
-    state.setdefault("sound_sample_rate", 48_000)
-    state.setdefault("sound_resolution", 192)
     state.setdefault("sound_target_dwell", 10)
     state.setdefault("last_sound_target_dwell", int(state["sound_target_dwell"]))
     state.setdefault("sound_generations_left", int(state["sound_target_dwell"]))
     state.setdefault("last_sound_seed", int(state.get("sound_seed", 4321)))
+    state.setdefault("sound_sample_rate_range", (24_000, 48_000))
+    state.setdefault("sound_resolution_range", (128, 192))
+    state.setdefault("sound_reseed_count", 0)
+    state.setdefault("difficulty_progress", 0.0)
+    state.setdefault("max_overlap_seen", 0.0)
 
     st.sidebar.header("Input & Parameters")
     autosave_input = st.sidebar.text_input(
@@ -194,57 +266,82 @@ def run() -> None:
             key="shared_seed",
         )
     )
-    sigma = float(
+    base_encoder_sigma = float(
         st.sidebar.slider(
             "Encoder noise σ",
             min_value=0.0,
             max_value=1.0,
-            value=float(state.get("encoder_sigma", 0.2)),
+            value=float(state.get("encoder_sigma_base", 0.2)),
             step=0.01,
-            key="encoder_sigma",
+            key="encoder_sigma_base",
         )
     )
-    denoise_sigma = float(
+    base_decoder_sigma = float(
         st.sidebar.slider(
             "Decoder denoise σ",
             min_value=0.0,
             max_value=5.0,
-            value=float(state.get("decoder_sigma", 1.0)),
+            value=float(state.get("decoder_sigma_base", 1.0)),
             step=0.1,
             help="Gaussian blur strength applied after decoding",
-            key="decoder_sigma",
+            key="decoder_sigma_base",
         )
     )
 
+    difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    encoder_sigma, denoise_sigma = _compute_adaptive_noise(
+        base_encoder_sigma, base_decoder_sigma, difficulty_progress
+    )
+    state["active_encoder_sigma"] = encoder_sigma
+    state["active_decoder_sigma"] = denoise_sigma
+
+    noise_cols = st.sidebar.columns(2)
+    noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
+    noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
+    st.sidebar.caption(
+        "Adaptive noise scales increase encoder randomness while tempering decoder blur "
+        "as the system improves."
+    )
+
     st.sidebar.subheader("Sound synthesis")
-    sound_seed = int(
+    sound_seed_input = int(
         st.sidebar.number_input(
             "Sound seed",
             min_value=0,
             value=int(state.get("sound_seed", seed)),
             step=1,
-            key="sound_seed",
+            key="sound_seed_input",
         )
     )
-    sample_rate = int(
-        st.sidebar.slider(
-            "Sound sample rate",
-            min_value=8_000,
-            max_value=96_000,
-            value=int(state.get("sound_sample_rate", 48_000)),
-            step=1_000,
-            help="Controls the number of random samples driving the colour volumes.",
-            key="sound_sample_rate",
-        )
+    state["sound_seed"] = sound_seed_input
+    sound_seed = int(state["sound_seed"])
+
+    sample_rate_range = st.sidebar.slider(
+        "Sound sample rate range",
+        min_value=8_000,
+        max_value=96_000,
+        value=tuple(int(v) for v in state.get("sound_sample_rate_range", (24_000, 48_000))),
+        step=1_000,
+        help=(
+            "Randomly selects a sample rate within this range whenever the sound scene "
+            "refreshes, encouraging robustness to diverse audio inputs."
+        ),
+        key="sound_sample_rate_range",
     )
-    resolution = int(
-        st.sidebar.select_slider(
-            "Generated image resolution",
-            options=[128, 192, 256],
-            value=int(state.get("sound_resolution", 192)),
-            key="sound_resolution",
-        )
+    resolution_range = st.sidebar.select_slider(
+        "Generated image resolution range",
+        options=_SOUND_RESOLUTION_OPTIONS,
+        value=tuple(
+            int(v) for v in state.get("sound_resolution_range", (128, 192))
+        ),
+        key="sound_resolution_range",
+        help=(
+            "Randomly chooses a target image size within the range. Smaller images dominate "
+            "early on, with larger canvases introduced as accuracy grows."
+        ),
     )
+    sample_rate_range = (int(sample_rate_range[0]), int(sample_rate_range[1]))
+    resolution_range = (int(resolution_range[0]), int(resolution_range[1]))
     target_dwell = int(
         st.sidebar.number_input(
             "Generations per sound target",
@@ -260,6 +357,9 @@ def run() -> None:
         )
     )
 
+    state["sound_sample_rate_bounds"] = sample_rate_range
+    state["sound_resolution_bounds"] = resolution_range
+
     if state.get("last_sound_target_dwell") != target_dwell:
         state["last_sound_target_dwell"] = target_dwell
         state["sound_generations_left"] = target_dwell
@@ -267,22 +367,63 @@ def run() -> None:
     if state.get("last_sound_seed") != sound_seed:
         state["last_sound_seed"] = sound_seed
         state["sound_generations_left"] = target_dwell
+        rng_manual = np.random.default_rng()
+        manual_difficulty = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+        new_rate, new_resolution = _randomize_sound_parameters(
+            rng_manual, sample_rate_range, resolution_range, manual_difficulty
+        )
+        state["current_sound_sample_rate"] = new_rate
+        state["current_sound_resolution"] = new_resolution
 
     state["sound_generations_left"] = int(
         max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
     )
     remaining_before = int(state.get("sound_generations_left", target_dwell))
 
+    rng_params = np.random.default_rng()
+    difficulty_for_params = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    if "current_sound_sample_rate" not in state or "current_sound_resolution" not in state:
+        current_sample_rate, current_resolution = _randomize_sound_parameters(
+            rng_params, sample_rate_range, resolution_range, difficulty_for_params
+        )
+        state["current_sound_sample_rate"] = current_sample_rate
+        state["current_sound_resolution"] = current_resolution
+    else:
+        current_sample_rate = int(state["current_sound_sample_rate"])
+        current_resolution = int(state["current_sound_resolution"])
+        if not (sample_rate_range[0] <= current_sample_rate <= sample_rate_range[1]):
+            current_sample_rate = _random_sample_rate(
+                rng_params, sample_rate_range, difficulty_for_params
+            )
+        if not (resolution_range[0] <= current_resolution <= resolution_range[1]):
+            current_resolution = _random_resolution(
+                rng_params, resolution_range, difficulty_for_params
+            )
+        state["current_sound_sample_rate"] = current_sample_rate
+        state["current_sound_resolution"] = current_resolution
+
+    current_sample_rate = int(state["current_sound_sample_rate"])
+    current_resolution = int(state["current_sound_resolution"])
+
+    st.sidebar.metric("Active sample rate", f"{current_sample_rate:,} Hz")
+    st.sidebar.metric(
+        "Active image resolution",
+        f"{current_resolution}×{current_resolution} px",
+    )
+    st.sidebar.metric("Adaptive difficulty", f"{difficulty_progress * 100:.0f}%")
+
     original_color, original, sound_clip, shape_specs = generate_sound_art(
         seed=sound_seed,
-        image_size=(resolution, resolution),
-        sample_rate=sample_rate,
+        image_size=(current_resolution, current_resolution),
+        sample_rate=current_sample_rate,
     )
     source_label = f"Sound seed {sound_seed}"
     color_template = _build_color_template(original_color, original)
 
-    encoder = NoiseStreamEncoder(sigma=sigma)
-    decoder = NoiseStreamDecoder(denoise_sigma=denoise_sigma if denoise_sigma > 0 else None)
+    encoder = NoiseStreamEncoder(sigma=encoder_sigma)
+    decoder = NoiseStreamDecoder(
+        denoise_sigma=denoise_sigma if denoise_sigma > 0 else None
+    )
 
     packet = encoder.encode(original, int(seed))
     reconstructed = decoder.decode(packet, int(seed))
@@ -337,6 +478,14 @@ def run() -> None:
     sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
 
     st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
+
+    overlap_pct = float(overlap_score)
+    state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
+    reseed_progress = min(1.0, state.get("sound_reseed_count", 0) / 10.0)
+    progress_target = max(state["max_overlap_seen"] / 100.0, reseed_progress)
+    state["difficulty_progress"] = min(
+        1.0, max(state.get("difficulty_progress", 0.0), progress_target)
+    )
 
     st.write(
         "The overlap score multiplies the normalized original and reconstructed pixels," \
@@ -497,11 +646,27 @@ def run() -> None:
                 new_seed = int(rng.integers(0, np.iinfo(np.int32).max))
             state["sound_seed"] = new_seed
             state["last_sound_seed"] = new_seed
+            state["sound_reseed_count"] = state.get("sound_reseed_count", 0) + 1
             state["sound_generations_left"] = target_dwell
             remaining_after = target_dwell
             reseeded = True
+            sample_bounds = state.get("sound_sample_rate_bounds", sample_rate_range)
+            resolution_bounds = state.get("sound_resolution_bounds", resolution_range)
+            sample_bounds = (int(sample_bounds[0]), int(sample_bounds[1]))
+            resolution_bounds = (int(resolution_bounds[0]), int(resolution_bounds[1]))
+            next_rate, next_resolution = _randomize_sound_parameters(
+                rng,
+                sample_bounds,
+                resolution_bounds,
+                float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
+            )
+            state["current_sound_sample_rate"] = next_rate
+            state["current_sound_resolution"] = next_resolution
+            state["sound_seed_input"] = new_seed
             st.sidebar.info(
-                f"Auto-randomised sound seed to {new_seed} after {target_dwell} generations."
+                "Auto-randomised sound seed to "
+                f"{new_seed} after {target_dwell} generations "
+                f"({next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
             )
 
         if len(manager.generations) % manager.autosave_interval == 0:
