@@ -1119,7 +1119,6 @@ def run() -> None:
                 "Auto-randomised sound scene after completing the dwell window "
                 f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
             )
-            break
 
     else:
         state["sound_generations_left"] = remaining_before
