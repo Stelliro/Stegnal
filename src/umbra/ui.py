@@ -228,6 +228,7 @@ def _migrate_legacy_state(state: st.session_state) -> None:
             state["active_sound_seed"] = int(legacy_seed)
         except (TypeError, ValueError):  # pragma: no cover - defensive
             pass
+    _reset_widget_key(state, "sound_seed")
 
     for noisy_key in (
         "encoder_sigma",
@@ -1095,10 +1096,17 @@ def run() -> None:
             st.subheader("Best-of-generation trend")
             if not progress_df.empty:
                 progress_df = progress_df.set_index("Generation")
-                if progress_df.index.size > 1 and any(
-                    progress_df[col].nunique() > 1 for col in progress_df.columns
-                ):
+                has_variation = (
+                    progress_df.index.size > 1
+                    and any(progress_df[col].nunique() > 1 for col in progress_df.columns)
+                )
+                has_finite = bool(np.isfinite(progress_df.to_numpy()).all())
+                if has_variation and has_finite:
                     st.line_chart(progress_df, width="stretch")
+                elif not has_finite:
+                    st.caption(
+                        "Trend chart hidden until generations contain finite metric values."
+                    )
                 else:
                     st.caption(
                         "Trend chart will appear once multiple non-identical generations are"
