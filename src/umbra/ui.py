@@ -7,7 +7,7 @@ import html
 import json
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict
+from typing import Dict
 import zipfile
 
 import numpy as np
@@ -31,6 +31,94 @@ from umbra.visualization import (
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
 
 
+def _sample_adaptive_scene(difficulty: float) -> Dict[str, float | int]:
+    """Randomise encoder/decoder and sound parameters based on difficulty."""
+
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    rng = np.random.default_rng()
+
+    base_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+    sound_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+
+    resolution_choices = np.array([96, 128, 160, 192, 224, 256])
+    max_index = int(
+        np.clip(
+            np.floor(difficulty * (len(resolution_choices) - 2)) + 1,
+            1,
+            len(resolution_choices) - 1,
+        )
+    )
+    resolution = int(rng.choice(resolution_choices[: max_index + 1]))
+
+    min_rate = int(np.interp(difficulty, [0.0, 1.0], [16_000, 36_000]))
+    max_rate = int(np.interp(difficulty, [0.0, 1.0], [36_000, 96_000]))
+    # Snap to the nearest 1000 Hz to keep numbers tidy.
+    raw_rate = int(rng.integers(min_rate, max_rate + 1000))
+    sample_rate = int(max(8_000, raw_rate // 1_000 * 1_000))
+
+    encoder_sigma = float(
+        np.clip(
+            np.interp(difficulty, [0.0, 1.0], [0.18, 0.55])
+            + rng.normal(0.0, 0.02 + 0.03 * difficulty),
+            0.08,
+            0.7,
+        )
+    )
+    decoder_sigma = float(
+        np.clip(
+            np.interp(difficulty, [0.0, 1.0], [1.4, 0.3])
+            + rng.normal(0.0, 0.05 + 0.05 * (1.0 - difficulty)),
+            0.05,
+            2.5,
+        )
+    )
+
+    dwell = float(np.interp(difficulty, [0.0, 1.0], [6.0, 18.0]))
+    dwell = dwell + rng.normal(0.0, 1.5)
+    target_dwell = int(np.clip(round(dwell), 4, 24))
+
+    return {
+        "base_seed": base_seed,
+        "sound_seed": sound_seed,
+        "encoder_sigma": encoder_sigma,
+        "decoder_sigma": decoder_sigma,
+        "sample_rate": sample_rate,
+        "resolution": resolution,
+        "target_dwell": target_dwell,
+    }
+
+
+def _ensure_adaptive_scene(state: st.session_state, difficulty: float) -> Dict[str, float | int]:
+    scene = state.get("adaptive_scene")
+    if not scene:
+        scene = _sample_adaptive_scene(difficulty)
+        state["adaptive_scene"] = scene
+        state["sound_generations_left"] = scene["target_dwell"]
+    return scene
+
+
+def _refresh_adaptive_scene(state: st.session_state, difficulty: float) -> Dict[str, float | int]:
+    scene = _sample_adaptive_scene(difficulty)
+    state["adaptive_scene"] = scene
+    state["sound_generations_left"] = scene["target_dwell"]
+    return scene
+
+
+def _scene_summary(scene: Dict[str, float | int]) -> str:
+    return (
+        f"seed {scene['sound_seed']}, {scene['sample_rate']:,} Hz, "
+        f"{scene['resolution']}×{scene['resolution']} px"
+    )
+
+
+def _update_difficulty(state: st.session_state, latest_overlap: float) -> float:
+    target = float(np.clip(latest_overlap / 100.0, 0.0, 1.0))
+    previous = float(state.get("difficulty", 0.0))
+    difficulty = float(np.clip(0.7 * previous + 0.3 * target, 0.0, 1.0))
+    state["difficulty"] = difficulty
+    return difficulty
+
+
 def _autosave_path(directory: Path) -> Path:
     return directory / "evolution_state.pkl"
 
@@ -52,11 +140,24 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         float(manager.decoder.denoise_sigma or 0.0),
         int(manager.base_seed),
     )
-    state["shared_seed"] = manager.base_seed
-    state["encoder_sigma_base"] = float(manager.encoder.sigma)
-    state["decoder_sigma_base"] = float(manager.decoder.denoise_sigma or 0.0)
-    state["active_encoder_sigma"] = float(manager.encoder.sigma)
-    state["active_decoder_sigma"] = float(manager.decoder.denoise_sigma or 0.0)
+
+    previous_scene = state.get("adaptive_scene")
+    scene = dict(previous_scene) if isinstance(previous_scene, dict) else {}
+    rng = np.random.default_rng()
+    scene.setdefault("sound_seed", int(rng.integers(0, np.iinfo(np.int32).max)))
+    scene.setdefault("sample_rate", 48_000)
+    resolution = int(manager.original.shape[0]) if manager.original.ndim >= 2 else 192
+    scene.setdefault("resolution", resolution)
+    scene.setdefault("target_dwell", 10)
+    scene.update(
+        {
+            "base_seed": int(manager.base_seed),
+            "encoder_sigma": float(manager.encoder.sigma),
+            "decoder_sigma": float(manager.decoder.denoise_sigma or 0.0),
+        }
+    )
+    state["adaptive_scene"] = scene
+    state["sound_generations_left"] = int(scene["target_dwell"])
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
     st.sidebar.success("Loaded autosaved evolution session.")
@@ -689,6 +790,7 @@ def run() -> None:
 
     if state.get("sound_generations_left", target_dwell) > target_dwell:
         state["sound_generations_left"] = target_dwell
+    remaining_before = int(state.get("sound_generations_left", target_dwell))
 
     manual_refresh = st.sidebar.button(
         "Refresh sound scene",
@@ -752,7 +854,6 @@ def run() -> None:
     state["sound_generations_left"] = int(
         max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
     )
-    remaining_before = int(state.get("sound_generations_left", target_dwell))
 
     current_sample_rate = int(state.get("current_sound_sample_rate", sample_rate_range[0]))
     current_resolution = int(state.get("current_sound_resolution", resolution_range[0]))
@@ -976,12 +1077,16 @@ def run() -> None:
         state.pop("evolution_signature", None)
         state["pending_generations"] = 0
         state["run_infinite"] = False
+        state.pop("adaptive_scene", None)
+        state["sound_generations_left"] = 0
+        state["difficulty"] = 0.0
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
         state.pop("evolution_manager", None)
         state.pop("evolution_signature", None)
         state["autosave_checked"] = False
+        state.pop("adaptive_scene", None)
 
     manager = _ensure_manager(
         original=original,
@@ -1028,29 +1133,32 @@ def run() -> None:
                     0,
                 )
 
-            remaining_before = int(state.get("sound_generations_left", target_dwell))
-            remaining_after = max(remaining_before - 1, 0)
-            state["sound_generations_left"] = remaining_after
+    trigger_rerun = False
+    if generations_ran:
+        remaining_before = int(state.get("sound_generations_left", target_dwell))
+        remaining_after = max(remaining_before - 1, 0)
+        state["sound_generations_left"] = remaining_after
 
-            if remaining_after == 0:
-                new_seed, next_rate, next_resolution = _refresh_sound_scene(
-                    state,
-                    float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
-                    target_dwell,
-                    improvement=float(state.get("difficulty_improvement", 0.0)),
-                    volatility=float(state.get("difficulty_volatility", 0.0)),
-                )
-                seed = int(state.get("shared_seed", seed))
-                sound_seed = int(state.get("active_sound_seed", new_seed))
-                current_sample_rate = next_rate
-                current_resolution = next_resolution
-                state["sound_generations_left"] = int(target_dwell)
-                reseeded = True
-                st.sidebar.info(
-                    "Auto-randomised sound scene after completing the dwell window "
-                    f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
-                )
-                break
+        if remaining_after == 0:
+            new_seed, next_rate, next_resolution = _refresh_sound_scene(
+                state,
+                float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
+                target_dwell,
+                improvement=float(state.get("difficulty_improvement", 0.0)),
+                volatility=float(state.get("difficulty_volatility", 0.0)),
+            )
+            seed = int(state.get("shared_seed", seed))
+            sound_seed = int(state.get("active_sound_seed", new_seed))
+            current_sample_rate = next_rate
+            current_resolution = next_resolution
+            state["sound_generations_left"] = int(target_dwell)
+            reseeded = True
+            st.sidebar.info(
+                "Auto-randomised sound scene after completing the dwell window "
+                f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
+            )
+            break
+
     else:
         state["sound_generations_left"] = remaining_before
 
