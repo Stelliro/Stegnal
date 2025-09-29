@@ -223,12 +223,6 @@ def _migrate_legacy_state(state: st.session_state) -> None:
         legacy_seed = state.get("sound_seed")
     except Exception:  # pragma: no cover - defensive guard
         legacy_seed = None
-
-    try:
-        _reset_widget_key(state, "sound_seed")
-        state.pop("sound_seed", None)
-    except Exception:  # pragma: no cover - defensive guard
-        pass
     if legacy_seed is not None and "active_sound_seed" not in state:
         try:
             state["active_sound_seed"] = int(legacy_seed)
@@ -271,6 +265,7 @@ def _migrate_legacy_state(state: st.session_state) -> None:
 _SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (96, 128, 160, 192, 224, 256)
 _PERFORMANCE_HISTORY = 60
 _RECENT_PERFORMANCE = 8
+_MAX_GENERATIONS_PER_TICK = 3
 
 
 def _detect_hardware_backend() -> str:
@@ -559,11 +554,6 @@ def _refresh_sound_scene(
     new_sound_seed = int(rng.integers(0, np.iinfo(np.int32).max))
     new_shared_seed = int(rng.integers(0, np.iinfo(np.int32).max))
 
-    try:
-        _reset_widget_key(state, "sound_seed")
-        state.pop("sound_seed", None)
-    except Exception:  # pragma: no cover - defensive guard
-        pass
     state["active_sound_seed"] = new_sound_seed
     state["current_sound_sample_rate"] = int(sample_rate)
     state["current_sound_resolution"] = int(resolution)
@@ -1016,47 +1006,65 @@ def run() -> None:
         state["run_infinite"] = False
         state["pending_generations"] = 0
 
-    generations_ran = 0
-    if state.get("pending_generations", 0) > 0:
-        manager.run_generation()
-        state["pending_generations"] -= 1
-        generations_ran = 1
+    pending_generations = int(state.get("pending_generations", 0))
+    runs_to_execute = 0
+    finite_batch = False
+    if pending_generations > 0:
+        finite_batch = True
+        runs_to_execute = min(pending_generations, _MAX_GENERATIONS_PER_TICK)
     elif state.get("run_infinite", False):
-        manager.run_generation()
-        generations_ran = 1
+        runs_to_execute = 1
 
-    trigger_rerun = False
-    if generations_ran:
-        remaining_after = max(remaining_before - 1, 0)
-        state["sound_generations_left"] = remaining_after
-        reseeded = False
+    generations_ran = 0
+    reseeded = False
+    if runs_to_execute:
+        for _ in range(runs_to_execute):
+            manager.run_generation()
+            generations_ran += 1
+            if finite_batch:
+                state["pending_generations"] = max(
+                    int(state.get("pending_generations", 0)) - 1,
+                    0,
+                )
 
-        if remaining_after == 0:
-            new_seed, next_rate, next_resolution = _refresh_sound_scene(
-                state,
-                float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
-                target_dwell,
-                improvement=float(state.get("difficulty_improvement", 0.0)),
-                volatility=float(state.get("difficulty_volatility", 0.0)),
-            )
-            seed = int(state.get("shared_seed", seed))
-            sound_seed = int(state.get("active_sound_seed", new_seed))
-            current_sample_rate = next_rate
-            current_resolution = next_resolution
-            remaining_after = target_dwell
-            reseeded = True
-            st.sidebar.info(
-                "Auto-randomised sound scene after completing the dwell window "
-                f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
-            )
+            remaining_before = int(state.get("sound_generations_left", target_dwell))
+            remaining_after = max(remaining_before - 1, 0)
+            state["sound_generations_left"] = remaining_after
 
-        if len(manager.generations) % manager.autosave_interval == 0:
-            save_path = manager.save(autosave_dir)
-            st.sidebar.success(f"Autosaved evolution session to {save_path}")
-        if reseeded or state.get("pending_generations", 0) > 0 or state.get("run_infinite", False):
-            trigger_rerun = True
+            if remaining_after == 0:
+                new_seed, next_rate, next_resolution = _refresh_sound_scene(
+                    state,
+                    float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
+                    target_dwell,
+                    improvement=float(state.get("difficulty_improvement", 0.0)),
+                    volatility=float(state.get("difficulty_volatility", 0.0)),
+                )
+                seed = int(state.get("shared_seed", seed))
+                sound_seed = int(state.get("active_sound_seed", new_seed))
+                current_sample_rate = next_rate
+                current_resolution = next_resolution
+                state["sound_generations_left"] = int(target_dwell)
+                reseeded = True
+                st.sidebar.info(
+                    "Auto-randomised sound scene after completing the dwell window "
+                    f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
+                )
+                break
     else:
         state["sound_generations_left"] = remaining_before
+
+    trigger_rerun = bool(
+        generations_ran
+        and (
+            reseeded
+            or (finite_batch and state.get("pending_generations", 0) > 0)
+            or (not finite_batch and state.get("run_infinite", False))
+        )
+    )
+
+    if generations_ran and len(manager.generations) % manager.autosave_interval == 0:
+        save_path = manager.save(autosave_dir)
+        st.sidebar.success(f"Autosaved evolution session to {save_path}")
 
     st.sidebar.metric(
         "Generations remaining on sound target",
@@ -1246,9 +1254,10 @@ def run() -> None:
     }
 
     export_bundle = _build_export_bundle(export_payload, generation_progress_rows)
+    export_bundle.seek(0)
     st.sidebar.download_button(
         "Download session snapshot",
-        data=export_bundle.getvalue(),
+        data=export_bundle,
         file_name="umbra_session_snapshot.zip",
         mime="application/zip",
     )
