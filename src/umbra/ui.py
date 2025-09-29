@@ -31,86 +31,6 @@ from umbra.visualization import (
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
 
 
-def _sample_adaptive_scene(difficulty: float) -> Dict[str, float | int]:
-    """Randomise encoder/decoder and sound parameters based on difficulty."""
-
-    difficulty = float(np.clip(difficulty, 0.0, 1.0))
-    rng = np.random.default_rng()
-
-    base_seed = int(rng.integers(0, np.iinfo(np.int32).max))
-    sound_seed = int(rng.integers(0, np.iinfo(np.int32).max))
-
-    resolution_choices = np.array([96, 128, 160, 192, 224, 256])
-    max_index = int(
-        np.clip(
-            np.floor(difficulty * (len(resolution_choices) - 2)) + 1,
-            1,
-            len(resolution_choices) - 1,
-        )
-    )
-    resolution = int(rng.choice(resolution_choices[: max_index + 1]))
-
-    min_rate = int(np.interp(difficulty, [0.0, 1.0], [16_000, 36_000]))
-    max_rate = int(np.interp(difficulty, [0.0, 1.0], [36_000, 96_000]))
-    # Snap to the nearest 1000 Hz to keep numbers tidy.
-    raw_rate = int(rng.integers(min_rate, max_rate + 1000))
-    sample_rate = int(max(8_000, raw_rate // 1_000 * 1_000))
-
-    encoder_sigma = float(
-        np.clip(
-            np.interp(difficulty, [0.0, 1.0], [0.18, 0.55])
-            + rng.normal(0.0, 0.02 + 0.03 * difficulty),
-            0.08,
-            0.7,
-        )
-    )
-    decoder_sigma = float(
-        np.clip(
-            np.interp(difficulty, [0.0, 1.0], [1.4, 0.3])
-            + rng.normal(0.0, 0.05 + 0.05 * (1.0 - difficulty)),
-            0.05,
-            2.5,
-        )
-    )
-
-    dwell = float(np.interp(difficulty, [0.0, 1.0], [6.0, 18.0]))
-    dwell = dwell + rng.normal(0.0, 1.5)
-    target_dwell = int(np.clip(round(dwell), 4, 24))
-
-    return {
-        "base_seed": base_seed,
-        "sound_seed": sound_seed,
-        "encoder_sigma": encoder_sigma,
-        "decoder_sigma": decoder_sigma,
-        "sample_rate": sample_rate,
-        "resolution": resolution,
-        "target_dwell": target_dwell,
-    }
-
-
-def _ensure_adaptive_scene(state: st.session_state, difficulty: float) -> Dict[str, float | int]:
-    scene = state.get("adaptive_scene")
-    if not scene:
-        scene = _sample_adaptive_scene(difficulty)
-        state["adaptive_scene"] = scene
-        state["sound_generations_left"] = scene["target_dwell"]
-    return scene
-
-
-def _refresh_adaptive_scene(state: st.session_state, difficulty: float) -> Dict[str, float | int]:
-    scene = _sample_adaptive_scene(difficulty)
-    state["adaptive_scene"] = scene
-    state["sound_generations_left"] = scene["target_dwell"]
-    return scene
-
-
-def _scene_summary(scene: Dict[str, float | int]) -> str:
-    return (
-        f"seed {scene['sound_seed']}, {scene['sample_rate']:,} Hz, "
-        f"{scene['resolution']}×{scene['resolution']} px"
-    )
-
-
 def _update_difficulty(state: st.session_state, latest_overlap: float) -> float:
     target = float(np.clip(latest_overlap / 100.0, 0.0, 1.0))
     previous = float(state.get("difficulty", 0.0))
@@ -320,16 +240,18 @@ def _reset_widget_key(state: st.session_state, key: str) -> None:
 def _migrate_legacy_state(state: st.session_state) -> None:
     """Remove legacy widget-driven keys that conflict with automated controls."""
 
+    legacy_seed = None
     try:
-        legacy_seed = state.get("sound_seed")
+        if "sound_seed" in state:
+            legacy_seed = state.get("sound_seed")
     except Exception:  # pragma: no cover - defensive guard
         legacy_seed = None
+    _reset_widget_key(state, "sound_seed")
     if legacy_seed is not None and "active_sound_seed" not in state:
         try:
             state["active_sound_seed"] = int(legacy_seed)
         except (TypeError, ValueError):  # pragma: no cover - defensive
             pass
-    _reset_widget_key(state, "sound_seed")
 
     for noisy_key in (
         "encoder_sigma",
@@ -364,7 +286,7 @@ def _migrate_legacy_state(state: st.session_state) -> None:
     _reset_widget_key(state, "sound_resolution_max")
 
 
-_SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (96, 128, 160, 192, 224, 256)
+_SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (64, 96, 128, 160, 192, 224, 256)
 _PERFORMANCE_HISTORY = 60
 _RECENT_PERFORMANCE = 8
 _MAX_GENERATIONS_PER_TICK = 3
@@ -413,7 +335,7 @@ def _random_sample_rate(
 
     span = max(high - low, 1)
     difficulty = float(np.clip(difficulty, 0.0, 1.0))
-    exponent = max(0.3, 2.5 - 2.0 * difficulty)
+    exponent = float(np.clip(np.interp(difficulty, [0.0, 1.0], [2.3, 0.6]), 0.4, 3.0))
     sample = rng.random() ** exponent
     value = low + sample * span
     value = int(1_000 * round(value / 1_000))
@@ -453,16 +375,28 @@ def _randomize_sound_parameters(
 
 
 def _compute_adaptive_noise(
-    base_encoder_sigma: float, base_decoder_sigma: float, difficulty: float
+    base_encoder_sigma: float,
+    base_decoder_sigma: float,
+    difficulty: float,
+    max_overlap: float,
 ) -> tuple[float, float]:
     """Scale encoder/decoder sigmas based on the adaptive difficulty."""
 
     difficulty = float(np.clip(difficulty, 0.0, 1.0))
-    encoder_sigma = base_encoder_sigma * (1.0 + 0.75 * difficulty)
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
+    effective = float(np.clip(0.5 * difficulty + 0.5 * overlap_push, 0.0, 1.0))
+
+    encoder_sigma = base_encoder_sigma * float(
+        np.interp(effective, [0.0, 1.0], [0.9, 1.45])
+    )
     if base_decoder_sigma <= 0:
         decoder_sigma = 0.0
     else:
-        decoder_sigma = max(base_decoder_sigma * (1.0 - 0.5 * difficulty), 0.05)
+        decoder_sigma = max(
+            base_decoder_sigma
+            * float(np.interp(effective, [0.0, 1.0], [1.1, 0.55])),
+            0.05,
+        )
     return float(encoder_sigma), float(decoder_sigma)
 
 
@@ -471,21 +405,25 @@ def _adaptive_sample_bounds(
     previous: tuple[int, int] | None,
     improvement: float = 0.0,
     volatility: float = 0.0,
+    max_overlap: float = 0.0,
 ) -> tuple[int, int]:
     """Derive a difficulty-weighted sample-rate window with gentle inertia."""
 
     difficulty = float(np.clip(difficulty, 0.0, 1.0))
     improvement = float(np.clip(improvement, 0.0, 1.0))
     volatility = float(max(0.0, volatility))
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
 
-    base_low = float(np.interp(difficulty, [0.0, 1.0], [12_000, 8_000]))
-    base_high = float(np.interp(difficulty, [0.0, 1.0], [24_000, 96_000]))
-    spread = float(np.interp(difficulty, [0.0, 1.0], [3_000, 26_000]))
+    effective = float(np.clip(0.55 * difficulty + 0.45 * overlap_push, 0.0, 1.0))
 
-    spread *= float(np.clip(1.0 + 0.8 * improvement - 0.6 * volatility, 0.5, 1.8))
+    base_low = float(np.interp(effective, [0.0, 1.0], [16_000, 52_000]))
+    base_high = float(np.interp(effective, [0.0, 1.0], [28_000, 96_000]))
+    spread = float(np.interp(effective, [0.0, 1.0], [4_000, 36_000]))
+
+    spread *= float(np.clip(1.0 + 0.9 * improvement - 0.7 * volatility, 0.45, 1.9))
 
     rng = np.random.default_rng()
-    jitter_low = float((rng.random() - 0.5) * spread)
+    jitter_low = float((rng.random() - 0.5) * spread * 0.7)
     jitter_high = float((rng.random() - 0.5) * spread)
 
     low = int(np.clip(base_low + jitter_low, 8_000, 96_000))
@@ -493,7 +431,7 @@ def _adaptive_sample_bounds(
 
     if previous is not None:
         prev_low, prev_high = int(previous[0]), int(previous[1])
-        blend = 0.6
+        blend = 0.55
         low = int(np.clip(blend * prev_low + (1.0 - blend) * low, 8_000, 96_000))
         high = int(
             np.clip(blend * prev_high + (1.0 - blend) * high, low + 1_000, 96_000)
@@ -507,23 +445,27 @@ def _adaptive_resolution_bounds(
     previous: tuple[int, int] | None,
     improvement: float = 0.0,
     volatility: float = 0.0,
+    max_overlap: float = 0.0,
 ) -> tuple[int, int]:
     """Unlock larger image sizes as difficulty progresses."""
 
     difficulty = float(np.clip(difficulty, 0.0, 1.0))
     improvement = float(np.clip(improvement, 0.0, 1.0))
     volatility = float(max(0.0, volatility))
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
+
+    effective = float(np.clip(0.5 * difficulty + 0.5 * overlap_push, 0.0, 1.0))
 
     options = sorted(_SOUND_RESOLUTION_OPTIONS)
-    unlocked = max(1, min(len(options), 1 + int(np.floor(difficulty * len(options)))))
+    unlocked = max(1, min(len(options), int(np.floor(effective * len(options))) + 1))
 
     if improvement > 0.05 and unlocked < len(options):
         unlocked += 1
 
     rng = np.random.default_rng()
-    if unlocked < len(options) and rng.random() > 0.85:
+    if unlocked < len(options) and rng.random() > 0.82:
         unlocked = min(len(options), unlocked + 1)
-    if volatility > 0.08 and unlocked > 1:
+    if volatility > 0.1 and unlocked > 1:
         unlocked -= 1
 
     lower = options[0]
@@ -531,8 +473,8 @@ def _adaptive_resolution_bounds(
 
     if previous is not None:
         prev_low, prev_high = int(previous[0]), int(previous[1])
-        lower = int(np.clip(0.65 * prev_low + 0.35 * lower, options[0], options[-1]))
-        upper = int(np.clip(0.65 * prev_high + 0.35 * upper, lower, options[-1]))
+        lower = int(np.clip(0.6 * prev_low + 0.4 * lower, options[0], options[-1]))
+        upper = int(np.clip(0.6 * prev_high + 0.4 * upper, lower, options[-1]))
 
     return lower, upper
 
@@ -542,6 +484,7 @@ def _update_noise_bases(
     difficulty: float,
     improvement: float,
     volatility: float,
+    max_overlap: float,
 ) -> None:
     """Gently steer encoder/decoder noise levels in response to difficulty."""
 
@@ -549,27 +492,31 @@ def _update_noise_bases(
     difficulty = float(np.clip(difficulty, 0.0, 1.0))
     improvement = float(np.clip(improvement, 0.0, 1.0))
     volatility = float(max(0.0, volatility))
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
+
+    effective = float(np.clip(0.55 * difficulty + 0.45 * overlap_push, 0.0, 1.0))
 
     prev_encoder = float(state.get("encoder_sigma_base", 0.2))
-    exploration_gain = 1.0 + 0.7 * improvement
-    stability_pull = 1.0 - min(0.5, 1.4 * volatility)
+    exploration_gain = 1.0 + 0.9 * improvement
+    stability_pull = 1.0 - min(0.55, 1.6 * volatility)
     target_encoder = float(
-        np.interp(difficulty, [0.0, 1.0], [0.16, 0.65]) * exploration_gain * stability_pull
+        np.interp(effective, [0.0, 1.0], [0.14, 0.8]) * exploration_gain * stability_pull
     )
     encoder_jitter = float(
-        rng.normal(0.0, 0.02 + 0.05 * difficulty + 0.03 * improvement)
+        rng.normal(0.0, 0.015 + 0.05 * effective + 0.03 * improvement)
     )
     encoder_sigma = float(np.clip(target_encoder + encoder_jitter, 0.05, 0.9))
     state["encoder_sigma_base"] = float(0.6 * prev_encoder + 0.4 * encoder_sigma)
 
     prev_decoder = float(state.get("decoder_sigma_base", 1.0))
-    denoise_target = float(np.interp(difficulty, [0.0, 1.0], [1.4, 0.25]))
-    denoise_target *= float(np.clip(1.0 - 0.6 * improvement, 0.35, 1.0))
-    denoise_target *= float(np.clip(1.0 + 0.8 * volatility, 0.5, 1.6))
+    denoise_floor = 0.12
+    denoise_target = float(np.interp(effective, [0.0, 1.0], [1.45, denoise_floor]))
+    denoise_target *= float(np.clip(1.0 - 0.7 * improvement, 0.35, 1.0))
+    denoise_target *= float(np.clip(1.0 + 0.9 * volatility, 0.45, 1.5))
     decoder_jitter = float(
-        rng.normal(0.0, 0.05 + 0.04 * (1.0 - difficulty) + 0.03 * volatility)
+        rng.normal(0.0, 0.04 + 0.05 * (1.0 - effective) + 0.03 * volatility)
     )
-    decoder_sigma = float(np.clip(denoise_target + decoder_jitter, 0.05, 2.5))
+    decoder_sigma = float(np.clip(denoise_target + decoder_jitter, denoise_floor, 2.5))
     state["decoder_sigma_base"] = float(0.6 * prev_decoder + 0.4 * decoder_sigma)
 
 
@@ -629,6 +576,7 @@ def _refresh_sound_scene(
     record_event: bool = True,
     improvement: float = 0.0,
     volatility: float = 0.0,
+    max_overlap: float = 0.0,
 ) -> tuple[int, int, int]:
     """Randomise the sound target and associated hyper-parameters."""
 
@@ -637,12 +585,14 @@ def _refresh_sound_scene(
         state.get("sound_sample_rate_bounds"),
         improvement,
         volatility,
+        max_overlap,
     )
     resolution_bounds = _adaptive_resolution_bounds(
         difficulty,
         state.get("sound_resolution_bounds"),
         improvement,
         volatility,
+        max_overlap,
     )
 
     rng = np.random.default_rng()
@@ -672,7 +622,7 @@ def _refresh_sound_scene(
     else:
         state.setdefault("sound_reseed_count", 0)
 
-    _update_noise_bases(state, difficulty, improvement, volatility)
+    _update_noise_bases(state, difficulty, improvement, volatility, max_overlap)
     return new_sound_seed, int(sample_rate), int(resolution)
 
 
@@ -737,6 +687,8 @@ def run() -> None:
     state.setdefault("difficulty_volatility", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
 
+    max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
+
     st.sidebar.header("Input & Parameters")
     autosave_input = st.sidebar.text_input(
         "Autosave directory",
@@ -786,6 +738,7 @@ def run() -> None:
             record_event=False,
             improvement=float(state.get("difficulty_improvement", 0.0)),
             volatility=float(state.get("difficulty_volatility", 0.0)),
+            max_overlap=max_overlap_so_far,
         )
 
     if state.get("sound_generations_left", target_dwell) > target_dwell:
@@ -804,6 +757,7 @@ def run() -> None:
             target_dwell,
             improvement=float(state.get("difficulty_improvement", 0.0)),
             volatility=float(state.get("difficulty_volatility", 0.0)),
+            max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
         )
         st.sidebar.info(
             "Forced refresh triggered new scene "
@@ -826,7 +780,10 @@ def run() -> None:
     base_encoder_sigma = float(state.get("encoder_sigma_base", 0.2))
     base_decoder_sigma = float(state.get("decoder_sigma_base", 1.0))
     encoder_sigma, denoise_sigma = _compute_adaptive_noise(
-        base_encoder_sigma, base_decoder_sigma, difficulty_progress
+        base_encoder_sigma,
+        base_decoder_sigma,
+        difficulty_progress,
+        float(state.get("max_overlap_seen", max_overlap_so_far)),
     )
     state["active_encoder_sigma"] = encoder_sigma
     state["active_decoder_sigma"] = denoise_sigma
@@ -945,6 +902,7 @@ def run() -> None:
 
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
+    max_overlap_so_far = float(state["max_overlap_seen"])
     history = _record_performance_history(
         state,
         overlap_pct,
@@ -1146,6 +1104,7 @@ def run() -> None:
                 target_dwell,
                 improvement=float(state.get("difficulty_improvement", 0.0)),
                 volatility=float(state.get("difficulty_volatility", 0.0)),
+                max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
             )
             seed = int(state.get("shared_seed", seed))
             sound_seed = int(state.get("active_sound_seed", new_seed))
