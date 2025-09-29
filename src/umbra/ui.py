@@ -580,6 +580,9 @@ def _refresh_sound_scene(
 ) -> tuple[int, int, int]:
     """Randomise the sound target and associated hyper-parameters."""
 
+    # Ensure any lingering legacy widget keys are purged before mutating state.
+    _reset_widget_key(state, "sound_seed")
+
     sample_bounds = _adaptive_sample_bounds(
         difficulty,
         state.get("sound_sample_rate_bounds"),
