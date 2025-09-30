@@ -68,5 +68,23 @@ class NoiseStreamDecoder:
         image = Image.fromarray(data)
         image.save(path)
 
+    def save_image(self, array: np.ndarray, path: str | Path) -> None:
+        """Save a normalized float image array directly to disk.
+
+        Expects values in [0, 1] with shape (H, W) or (H, W, C) where C in {1,3,4}.
+        """
+
+        data = (np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
+        if array.ndim == 3:
+            if array.shape[2] == 1:
+                data = data[:, :, 0]
+            elif array.shape[2] not in (3, 4):
+                raise ValueError("Unsupported array shape for image export")
+        elif array.ndim != 2:
+            raise ValueError("Unsupported array shape for image export")
+
+        image = Image.fromarray(data)
+        image.save(path)
+
 
 __all__ = ["NoiseStreamDecoder"]

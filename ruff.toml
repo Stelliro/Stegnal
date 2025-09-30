@@ -1,0 +1,14 @@
+line-length = 100
+target-version = "py39"
+
+[lint]
+select = [
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "I",  # isort
+  "UP", # pyupgrade
+]
+ignore = [
+  "E501", # line length handled by formatter/editor
+]
+

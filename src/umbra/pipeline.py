@@ -42,7 +42,7 @@ def run_pipeline(
     reconstructed = decoder.decode(packet, seed)
 
     if reconstruction_path is not None:
-        decoder.decode_to_image(packet, seed, reconstruction_path)
+        decoder.save_image(reconstructed, reconstruction_path)
 
     metrics = compute_metrics(original, reconstructed)
     return PipelineResult(

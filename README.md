@@ -22,6 +22,14 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+On Windows PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
 ## Usage
 
 Encode an image:
@@ -51,6 +59,7 @@ umbra evaluate --reference path/to/input.png --candidate recon.png
 Launch the visual explorer UI (uses [Streamlit](https://streamlit.io/)):
 
 ```bash
+pip install -e .[ui]
 umbra ui --port 8501
 ```
 
@@ -85,3 +94,4 @@ This build establishes the scaffolding for more sophisticated experiments. Follo
 2. Integrating a learned decoder (e.g., convolutional autoencoder).
 3. Scaling the training dataset and benchmarking across different success metrics.
 4. Documenting experimental results in the "Umbra Codex" logbook.
+5. Add CI with linting and tests: `ruff`, `mypy`, `pytest`.

@@ -13,27 +13,37 @@ except Exception:  # pragma: no cover - optional dependency
 def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
     """Average pixels within ``block_size`` square regions.
 
-    The function makes the visual overlays easier to inspect by expanding fine
-    details into larger, more uniform shapes. Any trailing pixels that do not
-    perfectly fit the block grid are handled by averaging over their partial
-    blocks as well.
+    Vectorized implementation that handles trailing edges by averaging over
+    their partial blocks.
     """
 
     if block_size <= 1:
         return np.asarray(channel, dtype=np.float32)
 
     arr = np.asarray(channel, dtype=np.float32)
-    height, width = arr.shape
-    averaged = np.empty_like(arr)
+    h, w = arr.shape
 
-    for row in range(0, height, block_size):
-        row_end = min(row + block_size, height)
-        for col in range(0, width, block_size):
-            col_end = min(col + block_size, width)
-            block = arr[row:row_end, col:col_end]
-            averaged[row:row_end, col:col_end] = float(block.mean())
+    pad_h = (block_size - (h % block_size)) % block_size
+    pad_w = (block_size - (w % block_size)) % block_size
+    if pad_h or pad_w:
+        pad_bottom = arr[-(h % block_size) :] if (h % block_size) else arr[-block_size :]
+        pad_right = arr[:, -(w % block_size) :] if (w % block_size) else arr[:, -block_size :]
+        last_row = arr[-1:, :]
+        last_col = arr[:, -1:]
+        pad = np.pad(
+            arr,
+            ((0, pad_h), (0, pad_w)),
+            mode="edge",
+        )
+    else:
+        pad = arr
 
-    return averaged
+    ph, pw = pad.shape
+    reshaped = pad.reshape(ph // block_size, block_size, pw // block_size, block_size)
+    block_means = reshaped.mean(axis=(1, 3))
+    expanded = np.repeat(np.repeat(block_means, block_size, axis=0), block_size, axis=1)
+    result = expanded[:h, :w]
+    return result.astype(np.float32)
 
 
 def normalize_for_display(array: np.ndarray) -> np.ndarray:

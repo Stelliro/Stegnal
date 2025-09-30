@@ -14,7 +14,18 @@ dependencies = [
     "numpy>=1.24",
     "pillow>=10.0",
     "scikit-image>=0.22",
+]
+
+[project.optional-dependencies]
+ui = [
     "streamlit>=1.31",
+    "pandas>=1.5",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "types-Pillow",
 ]
 
 [project.scripts]
