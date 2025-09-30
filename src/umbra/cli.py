@@ -81,6 +81,10 @@ def command_ui(args: argparse.Namespace) -> None:
         str(script_path),
         "--server.port",
         str(args.port),
+        "--server.address",
+        "127.0.0.1",
+        "--browser.serverAddress",
+        "localhost",
     ]
     if args.headless:
         cmd.extend(["--server.headless", "true"])

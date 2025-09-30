@@ -27,6 +27,8 @@ from umbra.visualization import (
     normalize_for_display,
     to_uint8_image,
 )
+import logging
+import os
 
 
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
@@ -651,6 +653,13 @@ def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, 
 def run() -> None:
     """Entry-point for the Streamlit application."""
     st.set_page_config(page_title="Project Umbra Visual Explorer", layout="wide")
+    # Streamlit options: show detailed errors and reduce external telemetry
+    try:
+        st.set_option("client.showErrorDetails", True)
+        st.set_option("browser.gatherUsageStats", False)
+    except Exception:
+        pass
+    logging.basicConfig(level=logging.INFO)
     st.title("Project Umbra Visual Explorer")
     st.markdown(
         """
