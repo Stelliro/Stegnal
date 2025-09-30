@@ -897,7 +897,7 @@ def run() -> None:
     ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
     ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
 
-    if adversarial_enabled:
+    if state.get("adversarial_enabled", False):
         adv: AdversarialManager = state.get("adversarial")
         pred_image = apply_generator(original, adv.state.generator)
         pred_metrics = compute_metrics(colored_original, _apply_color_template(pred_image, color_template))
@@ -1050,15 +1050,16 @@ def run() -> None:
     reload_button = st.sidebar.button("Reload autosave")
 
     st.sidebar.subheader("Adversarial mode (beta)")
-    adversarial_enabled = st.sidebar.checkbox(
+    st.sidebar.checkbox(
         "Enable generator vs decoder co-evolution",
-        value=False,
+        key="adversarial_enabled",
+        value=bool(state.get("adversarial_enabled", False)),
         help=(
             "Trains a predictive generator to approximate the decoder's output without passing through"
             " the channel, while the decoder adapts its denoise level."
         ),
     )
-    if adversarial_enabled and "adversarial" not in state:
+    if state.get("adversarial_enabled", False) and "adversarial" not in state:
         state["adversarial"] = AdversarialManager()
 
     if reset_button:
