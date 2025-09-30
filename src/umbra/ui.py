@@ -19,6 +19,7 @@ from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, compute_image_signature
 from umbra.metrics import compute_metrics
+from umbra.adversarial import AdversarialManager, GeneratorParams, apply_generator
 from umbra.sound import ShapeGuess, generate_sound_art, guess_shapes
 from umbra.visualization import (
     colorize_comparison,
@@ -896,6 +897,21 @@ def run() -> None:
     ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
     ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
 
+    if adversarial_enabled:
+        adv: AdversarialManager = state.get("adversarial")
+        pred_image = apply_generator(original, adv.state.generator)
+        pred_metrics = compute_metrics(colored_original, _apply_color_template(pred_image, color_template))
+        _, pred_overlap_score = multiplicative_overlap(original, pred_image)
+        gen, best_score, dec_sigma = adv.step(original, reconstructed)
+        state["decoder_sigma_base"] = dec_sigma
+        st.subheader("Adversarial generator")
+        gen_cols = st.columns(4)
+        gen_cols[0].metric("Gen blur σ", f"{gen.blur_sigma:.2f}")
+        gen_cols[1].metric("Gen contrast", f"{gen.contrast:.2f}")
+        gen_cols[2].metric("Gen brightness", f"{gen.brightness:.2f}")
+        gen_cols[3].metric("Gen score", f"{best_score:.3f}")
+        st.metric("Predicted overlap", f"{pred_overlap_score:.1f}%")
+
     sound_metrics_cols = st.columns(3)
     sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
     sound_metrics_cols[1].metric("Sound colour SSIM", f"{sound_metrics.ssim:.3f}")
@@ -1032,6 +1048,18 @@ def run() -> None:
     reset_button = st.sidebar.button("Reset evolution")
     save_button = st.sidebar.button("Save snapshot now")
     reload_button = st.sidebar.button("Reload autosave")
+
+    st.sidebar.subheader("Adversarial mode (beta)")
+    adversarial_enabled = st.sidebar.checkbox(
+        "Enable generator vs decoder co-evolution",
+        value=False,
+        help=(
+            "Trains a predictive generator to approximate the decoder's output without passing through"
+            " the channel, while the decoder adapts its denoise level."
+        ),
+    )
+    if adversarial_enabled and "adversarial" not in state:
+        state["adversarial"] = AdversarialManager()
 
     if reset_button:
         state.pop("evolution_manager", None)
@@ -1339,8 +1367,14 @@ def run() -> None:
         mime="application/zip",
     )
 
+    # Ensure infinite mode keeps ticking by scheduling a rerun quickly
     if trigger_rerun:
         _trigger_rerun()
+    elif state.get("run_infinite", False):
+        st.experimental_singleton.clear() if hasattr(st, "experimental_singleton") else None
+        st.experimental_memo.clear() if hasattr(st, "experimental_memo") else None
+        st.write("")
+        st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
 
     st.markdown(
         """

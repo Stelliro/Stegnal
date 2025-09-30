@@ -1,0 +1,136 @@
+"""Adversarial co-evolution between a predictive generator and decoder.
+
+The generator learns editable parameters to predict how an image would look after
+passing through the stochastic encode/decode process, using only the original
+image at inference time. During training it uses the actual reconstructions as
+supervision. The decoder evolves its denoise parameter to counter the generator.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import numpy as np
+
+
+@dataclass
+class GeneratorParams:
+    blur_sigma: float = 0.8
+    contrast: float = 1.05
+    brightness: float = 0.0
+
+
+def _gaussian_kernel1d(sigma: float) -> np.ndarray:
+    sigma = float(max(0.05, sigma))
+    radius = max(1, int(np.ceil(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(x ** 2) / (2.0 * sigma ** 2))
+    kernel /= float(kernel.sum())
+    return kernel
+
+
+def _separable_gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
+    if sigma <= 0.05:
+        return np.asarray(image, dtype=np.float32)
+    kernel = _gaussian_kernel1d(sigma)
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 3:
+        channels = arr.shape[2]
+        out = np.empty_like(arr)
+        for c in range(channels):
+            tmp = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 0, arr[..., c])
+            out[..., c] = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 1, tmp)
+        return out
+    tmp = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 0, arr)
+    return np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 1, tmp)
+
+
+def apply_generator(original: np.ndarray, params: GeneratorParams) -> np.ndarray:
+    """Apply editable transforms to predict a reconstruction from original.
+
+    The transform sequence is: blur -> contrast -> brightness -> clip.
+    """
+
+    image = np.asarray(original, dtype=np.float32)
+    blurred = _separable_gaussian_blur(image, params.blur_sigma)
+    adjusted = blurred * float(params.contrast) + float(params.brightness)
+    return np.clip(adjusted, 0.0, 1.0).astype(np.float32)
+
+
+@dataclass
+class CoevolutionState:
+    generator: GeneratorParams
+    decoder_sigma: float
+    best_score: float
+    step_count: int
+
+
+class AdversarialManager:
+    """Coordinate co-evolution of generator and decoder hyperparameters."""
+
+    def __init__(self, *, initial_generator: GeneratorParams | None = None, initial_decoder_sigma: float = 1.0) -> None:
+        self.state = CoevolutionState(
+            generator=initial_generator or GeneratorParams(),
+            decoder_sigma=float(initial_decoder_sigma),
+            best_score=-np.inf,
+            step_count=0,
+        )
+        self.rng = np.random.default_rng()
+
+    def _score(self, original: np.ndarray, target: np.ndarray, params: GeneratorParams) -> float:
+        pred = apply_generator(original, params)
+        overlap = float(np.mean(np.clip(pred * target, 0.0, 1.0)))
+        ssim_proxy = float(np.mean(1.0 - np.abs(pred - target)))
+        return 0.6 * overlap + 0.4 * ssim_proxy
+
+    def step(self, original: np.ndarray, target: np.ndarray) -> Tuple[GeneratorParams, float, float]:
+        """Perform one co-evolution step.
+
+        The generator proposes parameter jitters; the decoder responds by nudging
+        its sigma based on target similarity. Returns (best_params, best_score, decoder_sigma).
+        """
+
+        current = self.state.generator
+        base_score = self._score(original, target, current)
+        best_params = current
+        best_score = base_score
+
+        # Propose a few jittered candidates around the current generator parameters
+        for _ in range(6):
+            candidate = GeneratorParams(
+                blur_sigma=float(np.clip(current.blur_sigma + self.rng.normal(0.0, 0.12), 0.0, 3.0)),
+                contrast=float(np.clip(current.contrast + self.rng.normal(0.0, 0.05), 0.5, 2.0)),
+                brightness=float(np.clip(current.brightness + self.rng.normal(0.0, 0.03), -0.25, 0.25)),
+            )
+            score = self._score(original, target, candidate)
+            if score > best_score:
+                best_score = score
+                best_params = candidate
+
+        # Update generator towards the best local candidate with inertia
+        inertia = 0.7
+        self.state.generator = GeneratorParams(
+            blur_sigma=float(inertia * current.blur_sigma + (1.0 - inertia) * best_params.blur_sigma),
+            contrast=float(inertia * current.contrast + (1.0 - inertia) * best_params.contrast),
+            brightness=float(inertia * current.brightness + (1.0 - inertia) * best_params.brightness),
+        )
+
+        # Decoder responds: if target looks over-blurred, reduce sigma; if noisy, increase
+        target_var = float(np.var(target))
+        adjustment = np.interp(target_var, [0.005, 0.05], [0.05, -0.05])
+        self.state.decoder_sigma = float(np.clip(self.state.decoder_sigma + adjustment, 0.05, 2.5))
+
+        self.state.best_score = max(self.state.best_score, best_score)
+        self.state.step_count += 1
+        return self.state.generator, float(best_score), float(self.state.decoder_sigma)
+
+
+__all__ = [
+    "GeneratorParams",
+    "AdversarialManager",
+    "apply_generator",
+]
+
+
+
