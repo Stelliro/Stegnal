@@ -632,8 +632,11 @@ def _refresh_sound_scene(
     return new_sound_seed, int(sample_rate), int(resolution)
 
 
-def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, Any]]) -> BytesIO:
-    """Create a zipped export containing session metrics and progress curves."""
+def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, Any]]) -> bytes:
+    """Create a zipped export containing session metrics and progress curves.
+
+    Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
+    """
 
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -647,7 +650,7 @@ def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, 
             if not export_df.empty:
                 archive.writestr("generation_progress.csv", export_df.to_csv(index=False))
     buffer.seek(0)
-    return buffer
+    return buffer.getvalue()
 
 
 def run() -> None:
@@ -1371,13 +1374,15 @@ def run() -> None:
         },
     }
 
-    export_bundle = _build_export_bundle(export_payload, generation_progress_rows)
-    export_bundle.seek(0)
-    st.sidebar.download_button(
-        "Download session snapshot",
-        data=export_bundle,
-        file_name="umbra_session_snapshot.zip",
-        mime="application/zip",
+    export_bytes = _build_export_bundle(export_payload, generation_progress_rows)
+    export_b64 = base64.b64encode(export_bytes).decode("ascii")
+    st.sidebar.markdown(
+        (
+            "<a href=\"data:application/zip;base64,{data}\" "
+            "download=\"umbra_session_snapshot.zip\" "
+            "class=\"st-emotion-cache-3a2x2s e1nzilvr5\">Download session snapshot</a>"
+        ).format(data=export_b64),
+        unsafe_allow_html=True,
     )
 
     # Ensure infinite mode keeps ticking by scheduling a rerun after work
