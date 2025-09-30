@@ -12,6 +12,7 @@ from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
 from .metrics import compute_metrics
 from .pipeline import run_pipeline
+from .testing import run_smoke_test
 
 
 def _add_common_seed_argument(parser: argparse.ArgumentParser) -> None:
@@ -54,6 +55,18 @@ def command_evaluate(args: argparse.Namespace) -> None:
     candidate = encoder.load_image(args.candidate)
     metrics = compute_metrics(reference, candidate)
     print("Evaluation metrics:")
+    print(f"  PSNR: {metrics.psnr:.3f}")
+    print(f"  SSIM: {metrics.ssim:.3f}")
+
+
+def command_smoke_test(args: argparse.Namespace) -> None:
+    metrics = run_smoke_test(
+        seed=args.seed,
+        size=args.size,
+        sigma=args.sigma,
+        denoise_sigma=args.denoise_sigma,
+    )
+    print("Smoke test complete. Reconstruction metrics:")
     print(f"  PSNR: {metrics.psnr:.3f}")
     print(f"  SSIM: {metrics.ssim:.3f}")
 
@@ -121,6 +134,31 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--reference", required=True, help="Reference image path")
     evaluate_parser.add_argument("--candidate", required=True, help="Candidate image path")
     evaluate_parser.set_defaults(func=command_evaluate)
+
+    smoke_parser = subparsers.add_parser(
+        "smoke-test",
+        help="Run an encode/decode cycle on a synthetic gradient to validate the pipeline",
+    )
+    smoke_parser.add_argument("--seed", type=int, default=1234, help="Seed controlling the noise")
+    smoke_parser.add_argument(
+        "--size",
+        type=int,
+        default=128,
+        help="Size of the generated gradient image (pixels)",
+    )
+    smoke_parser.add_argument(
+        "--sigma",
+        type=float,
+        default=0.25,
+        help="Encoder noise standard deviation",
+    )
+    smoke_parser.add_argument(
+        "--denoise-sigma",
+        type=float,
+        default=0.9,
+        help="Decoder Gaussian denoise sigma",
+    )
+    smoke_parser.set_defaults(func=command_smoke_test)
 
     ui_parser = subparsers.add_parser("ui", help="Launch the interactive visual explorer")
     ui_parser.add_argument(

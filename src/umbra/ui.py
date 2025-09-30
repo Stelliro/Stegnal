@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import html
+import json
+from io import BytesIO
 from pathlib import Path
 from typing import Dict
+import zipfile
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
@@ -23,6 +29,14 @@ from umbra.visualization import (
 
 
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
+
+
+def _update_difficulty(state: st.session_state, latest_overlap: float) -> float:
+    target = float(np.clip(latest_overlap / 100.0, 0.0, 1.0))
+    previous = float(state.get("difficulty", 0.0))
+    difficulty = float(np.clip(0.7 * previous + 0.3 * target, 0.0, 1.0))
+    state["difficulty"] = difficulty
+    return difficulty
 
 
 def _autosave_path(directory: Path) -> Path:
@@ -46,9 +60,24 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         float(manager.decoder.denoise_sigma or 0.0),
         int(manager.base_seed),
     )
-    state["shared_seed"] = manager.base_seed
-    state["encoder_sigma"] = float(manager.encoder.sigma)
-    state["decoder_sigma"] = float(manager.decoder.denoise_sigma or 0.0)
+
+    previous_scene = state.get("adaptive_scene")
+    scene = dict(previous_scene) if isinstance(previous_scene, dict) else {}
+    rng = np.random.default_rng()
+    scene.setdefault("sound_seed", int(rng.integers(0, np.iinfo(np.int32).max)))
+    scene.setdefault("sample_rate", 48_000)
+    resolution = int(manager.original.shape[0]) if manager.original.ndim >= 2 else 192
+    scene.setdefault("resolution", resolution)
+    scene.setdefault("target_dwell", 10)
+    scene.update(
+        {
+            "base_seed": int(manager.base_seed),
+            "encoder_sigma": float(manager.encoder.sigma),
+            "decoder_sigma": float(manager.decoder.denoise_sigma or 0.0),
+        }
+    )
+    state["adaptive_scene"] = scene
+    state["sound_generations_left"] = int(scene["target_dwell"])
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
     st.sidebar.success("Loaded autosaved evolution session.")
@@ -132,6 +161,492 @@ def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.nda
     return np.clip(tinted, 0.0, 1.0).astype(np.float32)
 
 
+def _image_to_png_bytes(image: np.ndarray) -> bytes:
+    """Encode an image array as PNG bytes for inline display."""
+
+    array = np.asarray(image)
+    if array.dtype != np.uint8 or array.ndim not in (2, 3):
+        array = to_uint8_image(array)
+
+    if array.ndim == 3:
+        if array.shape[2] == 1:
+            array = array[:, :, 0]
+        elif array.shape[2] not in (3, 4):  # pragma: no cover - defensive
+            raise ValueError("Expected 1, 3, or 4 channel image for PNG conversion")
+
+    pil_image = Image.fromarray(array)
+
+    buffer = BytesIO()
+    pil_image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _image_to_data_url(image: np.ndarray) -> str:
+    """Convert an image into a ``data:`` URL for stable inline rendering."""
+
+    png_bytes = _image_to_png_bytes(image)
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _render_image(column: st.delta_generator.DeltaGenerator, image: np.ndarray, caption: str) -> None:
+    """Render ``image`` inside ``column`` with a semantic caption."""
+
+    data_url = _image_to_data_url(image)
+    alt_text = html.escape(caption)
+    caption_html = html.escape(caption).replace("\n", "<br />")
+    column.markdown(
+        """
+        <figure style="margin:0;text-align:center;">
+          <img src="{src}" alt="{alt}" style="width:100%;height:auto;border-radius:4px;" />
+          <figcaption style="font-size:0.8rem;color:var(--text-color,#666);">{caption}</figcaption>
+        </figure>
+        """.format(src=data_url, alt=alt_text, caption=caption_html),
+        unsafe_allow_html=True,
+    )
+
+
+def _reset_widget_key(state: st.session_state, key: str) -> None:
+    """Safely clear a widget-managed session key if it exists."""
+
+    reset = getattr(state, "reset_state_value", None)
+    if callable(reset):  # pragma: no branch - Streamlit >= 1.32
+        try:
+            reset(key, None)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    setter = getattr(state, "_set_widget_state", None)
+    if callable(setter):  # pragma: no branch - private Streamlit helper
+        try:
+            setter(key, None)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    widget_state = getattr(state, "_new_widget_state", None)
+    if isinstance(widget_state, dict):  # pragma: no branch - legacy internals
+        widget_state.pop(key, None)
+
+    if key in state:
+        try:
+            del state[key]
+        except Exception:  # pragma: no cover - defensive guard
+            try:
+                state.pop(key, None)
+            except Exception:
+                pass
+
+
+def _migrate_legacy_state(state: st.session_state) -> None:
+    """Remove legacy widget-driven keys that conflict with automated controls."""
+
+    legacy_seed = None
+    try:
+        if "sound_seed" in state:
+            legacy_seed = state.get("sound_seed")
+    except Exception:  # pragma: no cover - defensive guard
+        legacy_seed = None
+    _reset_widget_key(state, "sound_seed")
+    if legacy_seed is not None and "active_sound_seed" not in state:
+        try:
+            state["active_sound_seed"] = int(legacy_seed)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+
+    for noisy_key in (
+        "encoder_sigma",
+        "decoder_sigma",
+        "encoder_noise",
+        "decoder_noise",
+    ):
+        _reset_widget_key(state, noisy_key)
+
+    bounds_low = state.get("sound_sample_rate_min")
+    bounds_high = state.get("sound_sample_rate_max")
+    if (
+        bounds_low is not None
+        and bounds_high is not None
+        and "sound_sample_rate_bounds" not in state
+    ):
+        try:
+            state["sound_sample_rate_bounds"] = (int(bounds_low), int(bounds_high))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+    _reset_widget_key(state, "sound_sample_rate_min")
+    _reset_widget_key(state, "sound_sample_rate_max")
+
+    res_low = state.get("sound_resolution_min")
+    res_high = state.get("sound_resolution_max")
+    if res_low is not None and res_high is not None and "sound_resolution_bounds" not in state:
+        try:
+            state["sound_resolution_bounds"] = (int(res_low), int(res_high))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+    _reset_widget_key(state, "sound_resolution_min")
+    _reset_widget_key(state, "sound_resolution_max")
+
+
+_SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (64, 96, 128, 160, 192, 224, 256)
+_PERFORMANCE_HISTORY = 60
+_RECENT_PERFORMANCE = 8
+_MAX_GENERATIONS_PER_TICK = 3
+
+
+def _detect_hardware_backend() -> str:
+    """Attempt to detect accelerated compute backends available to the app."""
+
+    backends: list[str] = []
+
+    try:  # pragma: no cover - optional dependency
+        import cupy as cp  # type: ignore
+
+        try:
+            device_count = int(cp.cuda.runtime.getDeviceCount())
+        except cp.cuda.runtime.CUDARuntimeError:  # pragma: no cover - defensive
+            device_count = 0
+        if device_count > 0:
+            suffix = "s" if device_count > 1 else ""
+            backends.append(f"CuPy CUDA ({device_count} device{suffix})")
+    except Exception:  # pragma: no cover - optional dependency
+        pass
+
+    try:  # pragma: no cover - optional dependency
+        import torch
+
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            backends.append(f"PyTorch CUDA ({name})")
+    except Exception:  # pragma: no cover - optional dependency
+        pass
+
+    if backends:
+        return ", ".join(backends)
+    return "CPU (NumPy)"
+
+
+def _random_sample_rate(
+    rng: np.random.Generator, bounds: tuple[int, int], difficulty: float
+) -> int:
+    """Sample a sound rate biased by ``difficulty`` towards the upper bound."""
+
+    low, high = bounds
+    if low >= high:
+        return int(low)
+
+    span = max(high - low, 1)
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    exponent = float(np.clip(np.interp(difficulty, [0.0, 1.0], [2.3, 0.6]), 0.4, 3.0))
+    sample = rng.random() ** exponent
+    value = low + sample * span
+    value = int(1_000 * round(value / 1_000))
+    return int(np.clip(value, low, high))
+
+
+def _random_resolution(
+    rng: np.random.Generator, bounds: tuple[int, int], difficulty: float
+) -> int:
+    """Choose a resolution that unlocks larger sizes as ``difficulty`` increases."""
+
+    minimum, maximum = bounds
+    available = [
+        res for res in _SOUND_RESOLUTION_OPTIONS if minimum <= res <= maximum
+    ]
+    if not available:
+        available = [res for res in _SOUND_RESOLUTION_OPTIONS if res >= minimum]
+    if not available:
+        available = list(_SOUND_RESOLUTION_OPTIONS)
+
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    unlocked = max(1, min(len(available), int(np.floor(difficulty * len(available))) + 1))
+    return int(rng.choice(available[:unlocked]))
+
+
+def _randomize_sound_parameters(
+    rng: np.random.Generator,
+    sample_bounds: tuple[int, int],
+    resolution_bounds: tuple[int, int],
+    difficulty: float,
+) -> tuple[int, int]:
+    """Randomly choose sound synthesis parameters within provided bounds."""
+
+    sample_rate = _random_sample_rate(rng, sample_bounds, difficulty)
+    resolution = _random_resolution(rng, resolution_bounds, difficulty)
+    return sample_rate, resolution
+
+
+def _compute_adaptive_noise(
+    base_encoder_sigma: float,
+    base_decoder_sigma: float,
+    difficulty: float,
+    max_overlap: float,
+) -> tuple[float, float]:
+    """Scale encoder/decoder sigmas based on the adaptive difficulty."""
+
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
+    effective = float(np.clip(0.5 * difficulty + 0.5 * overlap_push, 0.0, 1.0))
+
+    encoder_sigma = base_encoder_sigma * float(
+        np.interp(effective, [0.0, 1.0], [0.9, 1.45])
+    )
+    if base_decoder_sigma <= 0:
+        decoder_sigma = 0.0
+    else:
+        decoder_sigma = max(
+            base_decoder_sigma
+            * float(np.interp(effective, [0.0, 1.0], [1.1, 0.55])),
+            0.05,
+        )
+    return float(encoder_sigma), float(decoder_sigma)
+
+
+def _adaptive_sample_bounds(
+    difficulty: float,
+    previous: tuple[int, int] | None,
+    improvement: float = 0.0,
+    volatility: float = 0.0,
+    max_overlap: float = 0.0,
+) -> tuple[int, int]:
+    """Derive a difficulty-weighted sample-rate window with gentle inertia."""
+
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    improvement = float(np.clip(improvement, 0.0, 1.0))
+    volatility = float(max(0.0, volatility))
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
+
+    effective = float(np.clip(0.55 * difficulty + 0.45 * overlap_push, 0.0, 1.0))
+
+    base_low = float(np.interp(effective, [0.0, 1.0], [16_000, 52_000]))
+    base_high = float(np.interp(effective, [0.0, 1.0], [28_000, 96_000]))
+    spread = float(np.interp(effective, [0.0, 1.0], [4_000, 36_000]))
+
+    spread *= float(np.clip(1.0 + 0.9 * improvement - 0.7 * volatility, 0.45, 1.9))
+
+    rng = np.random.default_rng()
+    jitter_low = float((rng.random() - 0.5) * spread * 0.7)
+    jitter_high = float((rng.random() - 0.5) * spread)
+
+    low = int(np.clip(base_low + jitter_low, 8_000, 96_000))
+    high = int(np.clip(base_high + jitter_high, low + 1_000, 96_000))
+
+    if previous is not None:
+        prev_low, prev_high = int(previous[0]), int(previous[1])
+        blend = 0.55
+        low = int(np.clip(blend * prev_low + (1.0 - blend) * low, 8_000, 96_000))
+        high = int(
+            np.clip(blend * prev_high + (1.0 - blend) * high, low + 1_000, 96_000)
+        )
+
+    return low, high
+
+
+def _adaptive_resolution_bounds(
+    difficulty: float,
+    previous: tuple[int, int] | None,
+    improvement: float = 0.0,
+    volatility: float = 0.0,
+    max_overlap: float = 0.0,
+) -> tuple[int, int]:
+    """Unlock larger image sizes as difficulty progresses."""
+
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    improvement = float(np.clip(improvement, 0.0, 1.0))
+    volatility = float(max(0.0, volatility))
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
+
+    effective = float(np.clip(0.5 * difficulty + 0.5 * overlap_push, 0.0, 1.0))
+
+    options = sorted(_SOUND_RESOLUTION_OPTIONS)
+    unlocked = max(1, min(len(options), int(np.floor(effective * len(options))) + 1))
+
+    if improvement > 0.05 and unlocked < len(options):
+        unlocked += 1
+
+    rng = np.random.default_rng()
+    if unlocked < len(options) and rng.random() > 0.82:
+        unlocked = min(len(options), unlocked + 1)
+    if volatility > 0.1 and unlocked > 1:
+        unlocked -= 1
+
+    lower = options[0]
+    upper = options[unlocked - 1]
+
+    if previous is not None:
+        prev_low, prev_high = int(previous[0]), int(previous[1])
+        lower = int(np.clip(0.6 * prev_low + 0.4 * lower, options[0], options[-1]))
+        upper = int(np.clip(0.6 * prev_high + 0.4 * upper, lower, options[-1]))
+
+    return lower, upper
+
+
+def _update_noise_bases(
+    state: st.session_state,
+    difficulty: float,
+    improvement: float,
+    volatility: float,
+    max_overlap: float,
+) -> None:
+    """Gently steer encoder/decoder noise levels in response to difficulty."""
+
+    rng = np.random.default_rng()
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    improvement = float(np.clip(improvement, 0.0, 1.0))
+    volatility = float(max(0.0, volatility))
+    overlap_push = float(np.clip(max_overlap / 100.0, 0.0, 1.0))
+
+    effective = float(np.clip(0.55 * difficulty + 0.45 * overlap_push, 0.0, 1.0))
+
+    prev_encoder = float(state.get("encoder_sigma_base", 0.2))
+    exploration_gain = 1.0 + 0.9 * improvement
+    stability_pull = 1.0 - min(0.55, 1.6 * volatility)
+    target_encoder = float(
+        np.interp(effective, [0.0, 1.0], [0.14, 0.8]) * exploration_gain * stability_pull
+    )
+    encoder_jitter = float(
+        rng.normal(0.0, 0.015 + 0.05 * effective + 0.03 * improvement)
+    )
+    encoder_sigma = float(np.clip(target_encoder + encoder_jitter, 0.05, 0.9))
+    state["encoder_sigma_base"] = float(0.6 * prev_encoder + 0.4 * encoder_sigma)
+
+    prev_decoder = float(state.get("decoder_sigma_base", 1.0))
+    denoise_floor = 0.12
+    denoise_target = float(np.interp(effective, [0.0, 1.0], [1.45, denoise_floor]))
+    denoise_target *= float(np.clip(1.0 - 0.7 * improvement, 0.35, 1.0))
+    denoise_target *= float(np.clip(1.0 + 0.9 * volatility, 0.45, 1.5))
+    decoder_jitter = float(
+        rng.normal(0.0, 0.04 + 0.05 * (1.0 - effective) + 0.03 * volatility)
+    )
+    decoder_sigma = float(np.clip(denoise_target + decoder_jitter, denoise_floor, 2.5))
+    state["decoder_sigma_base"] = float(0.6 * prev_decoder + 0.4 * decoder_sigma)
+
+
+def _record_performance_history(
+    state: st.session_state,
+    ai_overlap: float,
+    ai_ssim: float,
+    ai_psnr: float,
+    sound_overlap: float,
+) -> list[Dict[str, float]]:
+    """Track recent reconstruction metrics for adaptive scheduling."""
+
+    history: list[Dict[str, float]] = list(state.get("performance_history", []))
+    history.append(
+        {
+            "ai_overlap": float(ai_overlap),
+            "ai_ssim": float(ai_ssim),
+            "ai_psnr": float(ai_psnr),
+            "sound_overlap": float(sound_overlap),
+        }
+    )
+    if len(history) > _PERFORMANCE_HISTORY:
+        history = history[-_PERFORMANCE_HISTORY:]
+    state["performance_history"] = history
+    return history
+
+
+def _derive_difficulty_metrics(
+    history: list[Dict[str, float]]
+) -> tuple[float, float, float]:
+    """Compute difficulty progress, improvement, and volatility signals."""
+
+    if not history:
+        return 0.0, 0.0, 0.0
+
+    overlaps = np.asarray([entry["ai_overlap"] for entry in history], dtype=np.float32)
+    recent_window = int(min(len(history), _RECENT_PERFORMANCE))
+    recent = overlaps[-recent_window:]
+    recent_mean = float(np.mean(recent)) / 100.0
+    best = float(np.max(overlaps)) / 100.0
+    long_term = float(np.mean(overlaps[:-recent_window])) / 100.0 if len(history) > recent_window else recent_mean
+    improvement = float(np.clip(recent_mean - long_term, 0.0, 1.0))
+    volatility = float(np.std(recent) / 100.0)
+
+    coverage = float(min(len(history) / _PERFORMANCE_HISTORY, 1.0))
+    difficulty_target = float(
+        np.clip(0.45 * best + 0.35 * recent_mean + 0.2 * coverage + 0.4 * improvement, 0.0, 1.0)
+    )
+    return difficulty_target, improvement, float(np.clip(volatility, 0.0, 1.0))
+
+
+def _refresh_sound_scene(
+    state: st.session_state,
+    difficulty: float,
+    target_dwell: int,
+    *,
+    record_event: bool = True,
+    improvement: float = 0.0,
+    volatility: float = 0.0,
+    max_overlap: float = 0.0,
+) -> tuple[int, int, int]:
+    """Randomise the sound target and associated hyper-parameters."""
+
+    # Ensure any lingering legacy widget keys are purged before mutating state.
+    _reset_widget_key(state, "sound_seed")
+
+    sample_bounds = _adaptive_sample_bounds(
+        difficulty,
+        state.get("sound_sample_rate_bounds"),
+        improvement,
+        volatility,
+        max_overlap,
+    )
+    resolution_bounds = _adaptive_resolution_bounds(
+        difficulty,
+        state.get("sound_resolution_bounds"),
+        improvement,
+        volatility,
+        max_overlap,
+    )
+
+    rng = np.random.default_rng()
+    sample_rate, resolution = _randomize_sound_parameters(
+        rng,
+        sample_bounds,
+        resolution_bounds,
+        difficulty,
+    )
+
+    new_sound_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+    new_shared_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+
+    state["active_sound_seed"] = new_sound_seed
+    state["current_sound_sample_rate"] = int(sample_rate)
+    state["current_sound_resolution"] = int(resolution)
+    state["sound_sample_rate_bounds"] = (int(sample_bounds[0]), int(sample_bounds[1]))
+    state["sound_resolution_bounds"] = (
+        int(resolution_bounds[0]),
+        int(resolution_bounds[1]),
+    )
+    state["sound_generations_left"] = int(target_dwell)
+    state["shared_seed"] = new_shared_seed
+
+    if record_event:
+        state["sound_reseed_count"] = int(state.get("sound_reseed_count", 0) + 1)
+    else:
+        state.setdefault("sound_reseed_count", 0)
+
+    _update_noise_bases(state, difficulty, improvement, volatility, max_overlap)
+    return new_sound_seed, int(sample_rate), int(resolution)
+
+
+def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, Any]]) -> BytesIO:
+    """Create a zipped export containing session metrics and progress curves."""
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("session_summary.json", json.dumps(payload, indent=2))
+        if progress_rows:
+            export_df = (
+                pd.DataFrame(progress_rows)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna(how="all")
+            )
+            if not export_df.empty:
+                archive.writestr("generation_progress.csv", export_df.to_csv(index=False))
+    buffer.seek(0)
+    return buffer
+
+
 def run() -> None:
     """Entry-point for the Streamlit application."""
     st.set_page_config(page_title="Project Umbra Visual Explorer", layout="wide")
@@ -146,6 +661,7 @@ def run() -> None:
     )
 
     state = st.session_state
+    _migrate_legacy_state(state)
     state.setdefault("pending_generations", 0)
     state.setdefault("run_infinite", False)
     state.setdefault("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))
@@ -155,16 +671,26 @@ def run() -> None:
     state.setdefault("autosave_interval", 5)
     state.setdefault("generations_to_queue", 5)
     state.setdefault("evolution_mode", "Finite")
-    state.setdefault("shared_seed", 1234)
-    state.setdefault("encoder_sigma", 0.2)
-    state.setdefault("decoder_sigma", 1.0)
-    state.setdefault("sound_seed", 4321)
-    state.setdefault("sound_sample_rate", 48_000)
-    state.setdefault("sound_resolution", 192)
+    if "shared_seed" not in state:
+        state["shared_seed"] = int(np.random.default_rng().integers(0, np.iinfo(np.int32).max))
+    state.setdefault("encoder_sigma_base", 0.2)
+    state.setdefault("decoder_sigma_base", 1.0)
+    if "active_sound_seed" not in state:
+        state["active_sound_seed"] = int(
+            np.random.default_rng().integers(0, np.iinfo(np.int32).max)
+        )
     state.setdefault("sound_target_dwell", 10)
     state.setdefault("last_sound_target_dwell", int(state["sound_target_dwell"]))
     state.setdefault("sound_generations_left", int(state["sound_target_dwell"]))
-    state.setdefault("last_sound_seed", int(state.get("sound_seed", 4321)))
+    state.setdefault("sound_reseed_count", 0)
+    state.setdefault("difficulty_progress", 0.0)
+    state.setdefault("max_overlap_seen", 0.0)
+    state.setdefault("performance_history", [])
+    state.setdefault("difficulty_improvement", 0.0)
+    state.setdefault("difficulty_volatility", 0.0)
+    state.setdefault("hardware_backend", _detect_hardware_backend())
+
+    max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
     st.sidebar.header("Input & Parameters")
     autosave_input = st.sidebar.text_input(
@@ -185,66 +711,9 @@ def run() -> None:
             _attempt_autoload(autosave_dir)
         state["autosave_checked"] = True
 
-    seed = int(
-        st.sidebar.number_input(
-            "Shared seed",
-            min_value=0,
-            value=int(state.get("shared_seed", 1234)),
-            step=1,
-            key="shared_seed",
-        )
-    )
-    sigma = float(
-        st.sidebar.slider(
-            "Encoder noise σ",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(state.get("encoder_sigma", 0.2)),
-            step=0.01,
-            key="encoder_sigma",
-        )
-    )
-    denoise_sigma = float(
-        st.sidebar.slider(
-            "Decoder denoise σ",
-            min_value=0.0,
-            max_value=5.0,
-            value=float(state.get("decoder_sigma", 1.0)),
-            step=0.1,
-            help="Gaussian blur strength applied after decoding",
-            key="decoder_sigma",
-        )
-    )
+    difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
 
-    st.sidebar.subheader("Sound synthesis")
-    sound_seed = int(
-        st.sidebar.number_input(
-            "Sound seed",
-            min_value=0,
-            value=int(state.get("sound_seed", seed)),
-            step=1,
-            key="sound_seed",
-        )
-    )
-    sample_rate = int(
-        st.sidebar.slider(
-            "Sound sample rate",
-            min_value=8_000,
-            max_value=96_000,
-            value=int(state.get("sound_sample_rate", 48_000)),
-            step=1_000,
-            help="Controls the number of random samples driving the colour volumes.",
-            key="sound_sample_rate",
-        )
-    )
-    resolution = int(
-        st.sidebar.select_slider(
-            "Generated image resolution",
-            options=[128, 192, 256],
-            value=int(state.get("sound_resolution", 192)),
-            key="sound_resolution",
-        )
-    )
+    st.sidebar.subheader("Sound cadence")
     target_dwell = int(
         st.sidebar.number_input(
             "Generations per sound target",
@@ -264,25 +733,121 @@ def run() -> None:
         state["last_sound_target_dwell"] = target_dwell
         state["sound_generations_left"] = target_dwell
 
-    if state.get("last_sound_seed") != sound_seed:
-        state["last_sound_seed"] = sound_seed
+    if "sound_sample_rate_bounds" not in state or "sound_resolution_bounds" not in state:
+        _refresh_sound_scene(
+            state,
+            difficulty_progress,
+            target_dwell,
+            record_event=False,
+            improvement=float(state.get("difficulty_improvement", 0.0)),
+            volatility=float(state.get("difficulty_volatility", 0.0)),
+            max_overlap=max_overlap_so_far,
+        )
+
+    if state.get("sound_generations_left", target_dwell) > target_dwell:
         state["sound_generations_left"] = target_dwell
+    remaining_before = int(state.get("sound_generations_left", target_dwell))
+
+    manual_refresh = st.sidebar.button(
+        "Refresh sound scene",
+        key="refresh_sound_scene",
+        help="Force an immediate reseed using the current difficulty profile.",
+    )
+    if manual_refresh:
+        new_seed, new_rate, new_resolution = _refresh_sound_scene(
+            state,
+            difficulty_progress,
+            target_dwell,
+            improvement=float(state.get("difficulty_improvement", 0.0)),
+            volatility=float(state.get("difficulty_volatility", 0.0)),
+            max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
+        )
+        st.sidebar.info(
+            "Forced refresh triggered new scene "
+            f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
+        )
+
+    seed = int(state.get("shared_seed", 0))
+    sound_seed = int(state.get("active_sound_seed", seed))
+    sample_rate_range = tuple(
+        int(v) for v in state.get("sound_sample_rate_bounds", (24_000, 48_000))
+    )
+    resolution_range = tuple(
+        int(v)
+        for v in state.get(
+            "sound_resolution_bounds",
+            (_SOUND_RESOLUTION_OPTIONS[0], _SOUND_RESOLUTION_OPTIONS[0]),
+        )
+    )
+
+    base_encoder_sigma = float(state.get("encoder_sigma_base", 0.2))
+    base_decoder_sigma = float(state.get("decoder_sigma_base", 1.0))
+    encoder_sigma, denoise_sigma = _compute_adaptive_noise(
+        base_encoder_sigma,
+        base_decoder_sigma,
+        difficulty_progress,
+        float(state.get("max_overlap_seen", max_overlap_so_far)),
+    )
+    state["active_encoder_sigma"] = encoder_sigma
+    state["active_decoder_sigma"] = denoise_sigma
+
+    st.sidebar.subheader("Adaptive configuration")
+    st.sidebar.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
+    st.sidebar.metric("Shared seed", str(seed))
+    st.sidebar.metric("Sound seed", str(sound_seed))
+    st.sidebar.metric(
+        "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
+    )
+    st.sidebar.metric(
+        "Image resolution window",
+        f"{resolution_range[0]}–{resolution_range[1]} px",
+    )
+
+    noise_cols = st.sidebar.columns(2)
+    noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
+    noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
+    st.sidebar.caption(
+        "Adaptive noise scales increase encoder randomness while tempering decoder blur "
+        "as the system improves."
+    )
 
     state["sound_generations_left"] = int(
         max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
     )
-    remaining_before = int(state.get("sound_generations_left", target_dwell))
+
+    current_sample_rate = int(state.get("current_sound_sample_rate", sample_rate_range[0]))
+    current_resolution = int(state.get("current_sound_resolution", resolution_range[0]))
+
+    rng_params = np.random.default_rng()
+    if not (sample_rate_range[0] <= current_sample_rate <= sample_rate_range[1]):
+        current_sample_rate = _random_sample_rate(
+            rng_params, sample_rate_range, difficulty_progress
+        )
+        state["current_sound_sample_rate"] = current_sample_rate
+    if not (resolution_range[0] <= current_resolution <= resolution_range[1]):
+        current_resolution = _random_resolution(
+            rng_params, resolution_range, difficulty_progress
+        )
+        state["current_sound_resolution"] = current_resolution
+
+    st.sidebar.metric("Active sample rate", f"{current_sample_rate:,} Hz")
+    st.sidebar.metric(
+        "Active image resolution",
+        f"{current_resolution}×{current_resolution} px",
+    )
 
     original_color, original, sound_clip, shape_specs = generate_sound_art(
         seed=sound_seed,
-        image_size=(resolution, resolution),
-        sample_rate=sample_rate,
+        image_size=(current_resolution, current_resolution),
+        sample_rate=current_sample_rate,
     )
     source_label = f"Sound seed {sound_seed}"
     color_template = _build_color_template(original_color, original)
 
-    encoder = NoiseStreamEncoder(sigma=sigma)
-    decoder = NoiseStreamDecoder(denoise_sigma=denoise_sigma if denoise_sigma > 0 else None)
+    encoder = NoiseStreamEncoder(sigma=encoder_sigma)
+    decoder = NoiseStreamDecoder(
+        denoise_sigma=denoise_sigma if denoise_sigma > 0 else None
+    )
 
     packet = encoder.encode(original, int(seed))
     reconstructed = decoder.decode(packet, int(seed))
@@ -303,7 +868,7 @@ def run() -> None:
     ai_colored = _apply_color_template(reconstructed, color_template)
     sound_colored = _apply_color_template(sound_reconstruction, color_template)
 
-    overlap_map, overlap_score = multiplicative_overlap(original, reconstructed)
+    _, ai_overlap_score = multiplicative_overlap(original, reconstructed)
     ai_overlap_color = colorize_comparison(original, reconstructed)
     _, sound_overlap_score = multiplicative_overlap(original, sound_reconstruction)
     sound_overlap_color = colorize_comparison(original, sound_reconstruction)
@@ -329,7 +894,7 @@ def run() -> None:
     ai_metrics_cols = st.columns(3)
     ai_metrics_cols[0].metric("AI colour PSNR", f"{metrics.psnr:.2f} dB")
     ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
-    ai_metrics_cols[2].metric("AI overlap", f"{overlap_score:.1f}%")
+    ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
 
     sound_metrics_cols = st.columns(3)
     sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
@@ -337,6 +902,35 @@ def run() -> None:
     sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
 
     st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
+
+    overlap_pct = float(ai_overlap_score)
+    state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
+    max_overlap_so_far = float(state["max_overlap_seen"])
+    history = _record_performance_history(
+        state,
+        overlap_pct,
+        float(metrics.ssim),
+        float(metrics.psnr),
+        float(sound_overlap_score),
+    )
+    target_progress, improvement_signal, volatility_signal = _derive_difficulty_metrics(history)
+    reseed_progress = min(1.0, state.get("sound_reseed_count", 0) / 10.0)
+    blended_target = max(target_progress, reseed_progress)
+    previous_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    updated_progress = float(
+        np.clip(0.6 * previous_progress + 0.4 * blended_target, 0.0, 1.0)
+    )
+    state["difficulty_progress"] = updated_progress
+    state["difficulty_improvement"] = float(improvement_signal)
+    state["difficulty_volatility"] = float(volatility_signal)
+    difficulty_progress = updated_progress
+
+    st.sidebar.metric("Adaptive difficulty", f"{difficulty_progress * 100:.0f}%")
+    momentum = float(state.get("difficulty_improvement", 0.0)) * 100.0
+    variability = float(state.get("difficulty_volatility", 0.0)) * 100.0
+    trend_cols = st.sidebar.columns(2)
+    trend_cols[0].metric("Difficulty momentum", f"{momentum:.1f} pts")
+    trend_cols[1].metric("Difficulty range", f"{variability:.1f} pts")
 
     st.write(
         "The overlap score multiplies the normalized original and reconstructed pixels," \
@@ -376,21 +970,21 @@ def run() -> None:
 
     st.subheader("Visual comparisons")
     overview_row = [
-        (to_uint8_image(colored_original), f"Sound-derived image ({source_label})"),
-        (to_uint8_image(packet_display), "Encoded packet (noise + signal)"),
-        (to_uint8_image(ai_colored), "AI reconstruction (colourised)"),
-        (to_uint8_image(sound_colored), "Sound-only reconstruction (colourised)"),
+        (colored_original, f"Sound-derived image ({source_label})"),
+        (packet_display, "Encoded packet (noise + signal)"),
+        (ai_colored, "AI reconstruction (colourised)"),
+        (sound_colored, "Sound-only reconstruction (colourised)"),
     ]
     overlay_row = [
-        (to_uint8_image(noise_display), "Predicted noise contribution"),
-        (to_uint8_image(ai_overlap_color), "Colour overlap: AI vs original"),
-        (to_uint8_image(sound_overlap_color), "Colour overlap: Sound vs original"),
-        (to_uint8_image(cross_overlap_color), "Colour overlap: AI vs sound"),
+        (noise_display, "Predicted noise contribution"),
+        (ai_overlap_color, "Colour overlap: AI vs original"),
+        (sound_overlap_color, "Colour overlap: Sound vs original"),
+        (cross_overlap_color, "Colour overlap: AI vs sound"),
     ]
 
     for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
         for col, (image, caption) in zip(columns, content):
-            col.image(image, caption=caption, use_container_width=True, clamp=True)
+            _render_image(col, image, caption)
 
     st.caption(
         "Red highlights information present only in the generated candidate, blue marks"
@@ -444,12 +1038,16 @@ def run() -> None:
         state.pop("evolution_signature", None)
         state["pending_generations"] = 0
         state["run_infinite"] = False
+        state.pop("adaptive_scene", None)
+        state["sound_generations_left"] = 0
+        state["difficulty"] = 0.0
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
         state.pop("evolution_manager", None)
         state.pop("evolution_signature", None)
         state["autosave_checked"] = False
+        state.pop("adaptive_scene", None)
 
     manager = _ensure_manager(
         original=original,
@@ -475,78 +1073,142 @@ def run() -> None:
         state["run_infinite"] = False
         state["pending_generations"] = 0
 
-    generations_ran = 0
-    if state.get("pending_generations", 0) > 0:
-        manager.run_generation()
-        state["pending_generations"] -= 1
-        generations_ran = 1
+    pending_generations = int(state.get("pending_generations", 0))
+    runs_to_execute = 0
+    finite_batch = False
+    if pending_generations > 0:
+        finite_batch = True
+        runs_to_execute = min(pending_generations, _MAX_GENERATIONS_PER_TICK)
     elif state.get("run_infinite", False):
-        manager.run_generation()
-        generations_ran = 1
+        runs_to_execute = 1
+
+    generations_ran = 0
+    reseeded = False
+    if runs_to_execute:
+        for _ in range(runs_to_execute):
+            manager.run_generation()
+            generations_ran += 1
+            if finite_batch:
+                state["pending_generations"] = max(
+                    int(state.get("pending_generations", 0)) - 1,
+                    0,
+                )
 
     trigger_rerun = False
     if generations_ran:
+        remaining_before = int(state.get("sound_generations_left", target_dwell))
         remaining_after = max(remaining_before - 1, 0)
         state["sound_generations_left"] = remaining_after
-        reseeded = False
 
         if remaining_after == 0:
-            rng = np.random.default_rng()
-            new_seed = int(rng.integers(0, np.iinfo(np.int32).max))
-            if new_seed == sound_seed:
-                new_seed = int(rng.integers(0, np.iinfo(np.int32).max))
-            state["sound_seed"] = new_seed
-            state["last_sound_seed"] = new_seed
-            state["sound_generations_left"] = target_dwell
-            remaining_after = target_dwell
+            new_seed, next_rate, next_resolution = _refresh_sound_scene(
+                state,
+                float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
+                target_dwell,
+                improvement=float(state.get("difficulty_improvement", 0.0)),
+                volatility=float(state.get("difficulty_volatility", 0.0)),
+                max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
+            )
+            seed = int(state.get("shared_seed", seed))
+            sound_seed = int(state.get("active_sound_seed", new_seed))
+            current_sample_rate = next_rate
+            current_resolution = next_resolution
+            state["sound_generations_left"] = int(target_dwell)
             reseeded = True
             st.sidebar.info(
-                f"Auto-randomised sound seed to {new_seed} after {target_dwell} generations."
+                "Auto-randomised sound scene after completing the dwell window "
+                f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
             )
 
-        if len(manager.generations) % manager.autosave_interval == 0:
-            save_path = manager.save(autosave_dir)
-            st.sidebar.success(f"Autosaved evolution session to {save_path}")
-        if reseeded or state.get("pending_generations", 0) > 0 or state.get("run_infinite", False):
-            trigger_rerun = True
     else:
         state["sound_generations_left"] = remaining_before
+
+    trigger_rerun = bool(
+        generations_ran
+        and (
+            reseeded
+            or (finite_batch and state.get("pending_generations", 0) > 0)
+            or (not finite_batch and state.get("run_infinite", False))
+        )
+    )
+
+    if generations_ran and len(manager.generations) % manager.autosave_interval == 0:
+        save_path = manager.save(autosave_dir)
+        st.sidebar.success(f"Autosaved evolution session to {save_path}")
 
     st.sidebar.metric(
         "Generations remaining on sound target",
         int(state.get("sound_generations_left", target_dwell)),
     )
 
+    generation_progress_rows: list[Dict[str, Any]] = []
+    best_candidate_summary: Dict[str, Any] | None = None
+
     if manager.generations:
         st.header("Evolution progress")
-        progress_rows = []
-        for record in manager.generations:
-            best = record.best_candidate
-            progress_rows.append(
-                {
-                    "Generation": record.index,
-                    "Best SSIM": best.metrics.ssim,
-                    "Best PSNR": best.metrics.psnr,
-                    "Best overlap": best.overlap_score,
-                }
-            )
+        generation_progress_rows = [
+            {
+                "Generation": record.index,
+                "Best SSIM": record.best_candidate.metrics.ssim,
+                "Best PSNR": record.best_candidate.metrics.psnr,
+                "Best overlap": record.best_candidate.overlap_score,
+            }
+            for record in manager.generations
+        ]
 
-        if progress_rows:
-            progress_df = pd.DataFrame(progress_rows).set_index("Generation")
+        if generation_progress_rows:
+            progress_df = (
+                pd.DataFrame(generation_progress_rows)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+            )
             st.subheader("Best-of-generation trend")
-            st.line_chart(progress_df, use_container_width=True)
+            if not progress_df.empty:
+                progress_df = progress_df.set_index("Generation")
+                has_variation = (
+                    progress_df.index.size > 1
+                    and any(progress_df[col].nunique() > 1 for col in progress_df.columns)
+                )
+                has_finite = bool(np.isfinite(progress_df.to_numpy()).all())
+                if has_variation and has_finite:
+                    st.line_chart(progress_df, width="stretch")
+                elif not has_finite:
+                    st.caption(
+                        "Trend chart hidden until generations contain finite metric values."
+                    )
+                else:
+                    st.caption(
+                        "Trend chart will appear once multiple non-identical generations are"
+                        " available."
+                    )
+            else:
+                st.caption(
+                    "Trend chart will appear once generations contain finite metric values."
+                )
 
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
-        selected_generation = st.select_slider(
-            "Select generation",
-            options=gen_indices,
-            value=default_gen,
-            key="selected_generation",
-            format_func=lambda idx: f"Generation {idx}",
-        )
+        if len(gen_indices) > 1:
+            selected_generation = st.select_slider(
+                "Select generation",
+                options=gen_indices,
+                value=default_gen,
+                key="selected_generation",
+                format_func=lambda idx: f"Generation {idx}",
+            )
+        else:
+            selected_generation = default_gen
+            st.caption("Only one generation so far; displaying the latest results.")
         generation = manager.generations[selected_generation]
         best_candidate = generation.best_candidate
+
+        best_candidate_summary = {
+            "generation": generation.index,
+            "seed": best_candidate.seed,
+            "psnr": best_candidate.metrics.psnr,
+            "ssim": best_candidate.metrics.ssim,
+            "overlap": best_candidate.overlap_score,
+        }
 
         st.subheader("Best candidate metrics")
         best_cols = st.columns(3)
@@ -563,12 +1225,8 @@ def run() -> None:
                 caption = (
                     f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
                 )
-                col.image(
-                    to_uint8_image(_apply_color_template(candidate.reconstruction, color_template)),
-                    caption=caption,
-                    use_container_width=True,
-                    clamp=True,
-                )
+                candidate_image = _apply_color_template(candidate.reconstruction, color_template)
+                _render_image(col, candidate_image, caption)
 
         st.subheader("Candidate inspector")
         option_labels = [
@@ -588,27 +1246,28 @@ def run() -> None:
             key="candidate_selector",
         )
         inspected = generation.candidates[selected_index]
-        overlap_map, overlap_score = multiplicative_overlap(manager.original, inspected.reconstruction)
+        inspect_overlap_map, inspect_overlap_score = multiplicative_overlap(
+            manager.original, inspected.reconstruction
+        )
         inspected_color = colorize_comparison(manager.original, inspected.reconstruction)
 
         inspect_cols = st.columns(4)
-        inspect_cols[0].image(
-            to_uint8_image(colored_original), caption="Evolution reference", use_container_width=True
+        _render_image(inspect_cols[0], colored_original, "Evolution reference")
+        inspected_reconstruction = _apply_color_template(inspected.reconstruction, color_template)
+        _render_image(
+            inspect_cols[1],
+            inspected_reconstruction,
+            f"Candidate seed {inspected.seed}",
         )
-        inspect_cols[1].image(
-            to_uint8_image(_apply_color_template(inspected.reconstruction, color_template)),
-            caption=f"Candidate seed {inspected.seed}",
-            use_container_width=True,
+        _render_image(
+            inspect_cols[2],
+            inspect_overlap_map,
+            f"Overlap map ({inspect_overlap_score:.1f}%)",
         )
-        inspect_cols[2].image(
-            to_uint8_image(overlap_map),
-            caption=f"Overlap map ({overlap_score:.1f}%)",
-            use_container_width=True,
-        )
-        inspect_cols[3].image(
-            to_uint8_image(inspected_color),
-            caption="Colour overlap vs reference",
-            use_container_width=True,
+        _render_image(
+            inspect_cols[3],
+            inspected_color,
+            "Colour overlap vs reference",
         )
 
         st.subheader("Generation summary")
@@ -623,6 +1282,62 @@ def run() -> None:
             for idx, cand in enumerate(generation.candidates)
         ]
         st.table(summary_rows)
+
+    export_payload = {
+        "hardware_backend": state.get("hardware_backend", "CPU (NumPy)"),
+        "difficulty": {
+            "current": float(state.get("difficulty_progress", 0.0)),
+            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
+            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
+            "dwell_generations": int(target_dwell),
+            "momentum": float(state.get("difficulty_improvement", 0.0)),
+            "volatility": float(state.get("difficulty_volatility", 0.0)),
+        },
+        "seeds": {
+            "shared": int(seed),
+            "sound": int(sound_seed),
+        },
+        "noise": {
+            "base_encoder_sigma": float(base_encoder_sigma),
+            "base_decoder_sigma": float(base_decoder_sigma),
+            "active_encoder_sigma": float(encoder_sigma),
+            "active_decoder_sigma": float(denoise_sigma),
+        },
+        "sound": {
+            "current_sample_rate": int(current_sample_rate),
+            "current_resolution": int(current_resolution),
+            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
+            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
+            "band_volumes": sound_clip.band_volumes,
+            "generator_seed": int(sound_clip.seed),
+            "generator_sample_rate": int(sound_clip.sample_rate),
+        },
+        "metrics": {
+            "ai_vs_reference": metrics.as_dict(),
+            "sound_vs_reference": sound_metrics.as_dict(),
+            "ai_vs_sound": ai_sound_alignment.as_dict(),
+            "overlap": {
+                "ai_vs_reference": float(ai_overlap_score),
+                "sound_vs_reference": float(sound_overlap_score),
+            },
+        },
+        "performance_history": list(state.get("performance_history", [])),
+        "manager": {
+            "population_size": int(manager.population_size),
+            "autosave_interval": int(manager.autosave_interval),
+            "generation_count": len(manager.generations),
+            "best_candidate": best_candidate_summary,
+        },
+    }
+
+    export_bundle = _build_export_bundle(export_payload, generation_progress_rows)
+    export_bundle.seek(0)
+    st.sidebar.download_button(
+        "Download session snapshot",
+        data=export_bundle,
+        file_name="umbra_session_snapshot.zip",
+        mime="application/zip",
+    )
 
     if trigger_rerun:
         _trigger_rerun()

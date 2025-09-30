@@ -57,13 +57,15 @@ class NoiseStreamDecoder:
     def decode_to_image(self, packet: NoisePacket, seed: int, path: str | Path) -> None:
         array = self.decode(packet, seed)
         data = (array * 255.0).astype(np.uint8)
-        if array.ndim == 2:
-            image = Image.fromarray(data, mode="L")
-        elif array.ndim == 3 and array.shape[2] in (3, 4):
-            mode = "RGB" if array.shape[2] == 3 else "RGBA"
-            image = Image.fromarray(data, mode=mode)
-        else:
+        if array.ndim == 3:
+            if array.shape[2] == 1:
+                data = data[:, :, 0]
+            elif array.shape[2] not in (3, 4):
+                raise ValueError("Unsupported array shape for image export")
+        elif array.ndim != 2:
             raise ValueError("Unsupported array shape for image export")
+
+        image = Image.fromarray(data)
         image.save(path)
 
 
