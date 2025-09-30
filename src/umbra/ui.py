@@ -907,7 +907,10 @@ def run() -> None:
     ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
 
     if state.get("adversarial_enabled", False):
-        adv: AdversarialManager = state.get("adversarial")
+        adv: AdversarialManager | None = state.get("adversarial")
+        if adv is None:
+            adv = AdversarialManager()
+            state["adversarial"] = adv
         pred_image = apply_generator(original, adv.state.generator)
         pred_metrics = compute_metrics(colored_original, _apply_color_template(pred_image, color_template))
         _, pred_overlap_score = multiplicative_overlap(original, pred_image)
@@ -1377,14 +1380,9 @@ def run() -> None:
         mime="application/zip",
     )
 
-    # Ensure infinite mode keeps ticking by scheduling a rerun quickly
+    # Ensure infinite mode keeps ticking by scheduling a rerun after work
     if trigger_rerun:
         _trigger_rerun()
-    elif state.get("run_infinite", False):
-        st.experimental_singleton.clear() if hasattr(st, "experimental_singleton") else None
-        st.experimental_memo.clear() if hasattr(st, "experimental_memo") else None
-        st.write("")
-        st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
 
     st.markdown(
         """
