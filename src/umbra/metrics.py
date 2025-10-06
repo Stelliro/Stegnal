@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
 
 import numpy as np
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
@@ -14,7 +13,7 @@ class ReconstructionMetrics:
     psnr: float
     ssim: float
 
-    def as_dict(self) -> Dict[str, float]:
+    def as_dict(self) -> dict[str, float]:
         return {"psnr": self.psnr, "ssim": self.ssim}
 
 

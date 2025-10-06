@@ -5,21 +5,22 @@ from __future__ import annotations
 import base64
 import html
 import json
+import logging
+import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Dict
-import zipfile
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, compute_image_signature
 from umbra.metrics import compute_metrics
-from umbra.adversarial import AdversarialManager, GeneratorParams, apply_generator
 from umbra.sound import ShapeGuess, generate_sound_art, guess_shapes
 from umbra.visualization import (
     colorize_comparison,
@@ -27,9 +28,6 @@ from umbra.visualization import (
     normalize_for_display,
     to_uint8_image,
 )
-import logging
-import os
-
 
 logger = logging.getLogger(__name__)
 
@@ -203,12 +201,12 @@ def _render_image(column: st.delta_generator.DeltaGenerator, image: np.ndarray, 
     alt_text = html.escape(caption)
     caption_html = html.escape(caption).replace("\n", "<br />")
     column.markdown(
-        """
+        f"""
         <figure style="margin:0;text-align:center;">
-          <img src="{src}" alt="{alt}" style="width:100%;height:auto;border-radius:4px;" />
-          <figcaption style="font-size:0.8rem;color:var(--text-color,#666);">{caption}</figcaption>
+          <img src=\"{data_url}\" alt=\"{alt_text}\" style=\"width:100%;height:auto;border-radius:4px;\" />
+          <figcaption style=\"font-size:0.8rem;color:var(--text-color,#666);\">{caption_html}</figcaption>
         </figure>
-        """.format(src=data_url, alt=alt_text, caption=caption_html),
+        """,
         unsafe_allow_html=True,
     )
 
@@ -539,10 +537,10 @@ def _record_performance_history(
     ai_ssim: float,
     ai_psnr: float,
     sound_overlap: float,
-) -> list[Dict[str, float]]:
+) -> list[dict[str, float]]:
     """Track recent reconstruction metrics for adaptive scheduling."""
 
-    history: list[Dict[str, float]] = list(state.get("performance_history", []))
+    history: list[dict[str, float]] = list(state.get("performance_history", []))
     history.append(
         {
             "ai_overlap": float(ai_overlap),
@@ -558,7 +556,7 @@ def _record_performance_history(
 
 
 def _derive_difficulty_metrics(
-    history: list[Dict[str, float]]
+    history: list[dict[str, float]]
 ) -> tuple[float, float, float]:
     """Compute difficulty progress, improvement, and volatility signals."""
 
@@ -642,7 +640,7 @@ def _refresh_sound_scene(
     return new_sound_seed, int(sample_rate), int(resolution)
 
 
-def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, Any]]) -> bytes:
+def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, Any]]) -> bytes:
     """Create a zipped export containing session metrics and progress curves.
 
     Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
@@ -925,7 +923,6 @@ def run() -> None:
             adv = AdversarialManager()
             state["adversarial"] = adv
         pred_image = apply_generator(original, adv.state.generator)
-        pred_metrics = compute_metrics(colored_original, _apply_color_template(pred_image, color_template))
         _, pred_overlap_score = multiplicative_overlap(original, pred_image)
         gen, best_score, dec_sigma = adv.step(original, reconstructed)
         state["decoder_sigma_base"] = dec_sigma
@@ -979,8 +976,8 @@ def run() -> None:
     )
 
     st.subheader("Shape guessing AI")
-    ai_guess_map: Dict[str, ShapeGuess] = {guess.color: guess for guess in guess_shapes(ai_colored)}
-    sound_guess_map: Dict[str, ShapeGuess] = {
+    ai_guess_map: dict[str, ShapeGuess] = {guess.color: guess for guess in guess_shapes(ai_colored)}
+    sound_guess_map: dict[str, ShapeGuess] = {
         guess.color: guess for guess in guess_shapes(sound_colored)
     }
     guess_rows = []
@@ -1195,8 +1192,8 @@ def run() -> None:
         int(state.get("sound_generations_left", target_dwell)),
     )
 
-    generation_progress_rows: list[Dict[str, Any]] = []
-    best_candidate_summary: Dict[str, Any] | None = None
+    generation_progress_rows: list[dict[str, Any]] = []
+    best_candidate_summary: dict[str, Any] | None = None
 
     if manager.generations:
         st.header("Evolution progress")
@@ -1388,10 +1385,10 @@ def run() -> None:
     export_b64 = base64.b64encode(export_bytes).decode("ascii")
     st.sidebar.markdown(
         (
-            "<a href=\"data:application/zip;base64,{data}\" "
+            f"<a href=\"data:application/zip;base64,{export_b64}\" "
             "download=\"umbra_session_snapshot.zip\" "
             "class=\"st-emotion-cache-3a2x2s e1nzilvr5\">Download session snapshot</a>"
-        ).format(data=export_b64),
+        ),
         unsafe_allow_html=True,
     )
 

@@ -9,7 +9,6 @@ supervision. The decoder evolves its denoise parameter to counter the generator.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 
@@ -84,7 +83,7 @@ class AdversarialManager:
         ssim_proxy = float(np.mean(1.0 - np.abs(pred - target)))
         return 0.6 * overlap + 0.4 * ssim_proxy
 
-    def step(self, original: np.ndarray, target: np.ndarray) -> Tuple[GeneratorParams, float, float]:
+    def step(self, original: np.ndarray, target: np.ndarray) -> tuple[GeneratorParams, float, float]:
         """Perform one co-evolution step.
 
         The generator proposes parameter jitters; the decoder responds by nudging

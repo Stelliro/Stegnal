@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -15,7 +15,7 @@ class SyntheticSound:
     seed: int
     sample_rate: int
     samples: np.ndarray
-    band_volumes: Dict[str, float]
+    band_volumes: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class ShapeSpec:
     color: str
     shape: str
     volume: float
-    center: Tuple[int, int]
+    center: tuple[int, int]
     rotation: float
     size: int
 
@@ -40,7 +40,7 @@ class ShapeGuess:
     volume: float
 
 
-def _normalized_band_volumes(spectrum: np.ndarray) -> Dict[str, float]:
+def _normalized_band_volumes(spectrum: np.ndarray) -> dict[str, float]:
     """Split ``spectrum`` into three bands and normalise their magnitudes."""
 
     if spectrum.ndim != 1:
@@ -66,7 +66,7 @@ def _normalized_band_volumes(spectrum: np.ndarray) -> Dict[str, float]:
     return {"red": norm[0], "green": norm[1], "blue": norm[2]}
 
 
-def _draw_circle(canvas: np.ndarray, center: Tuple[int, int], radius: int, channel: int, intensity: float) -> None:
+def _draw_circle(canvas: np.ndarray, center: tuple[int, int], radius: int, channel: int, intensity: float) -> None:
     rows, cols = canvas.shape[:2]
     y_indices, x_indices = np.ogrid[:rows, :cols]
     cy, cx = center
@@ -86,7 +86,7 @@ def _rotate_offsets(points: np.ndarray, angle: float) -> np.ndarray:
 
 def _draw_polygon(
     canvas: np.ndarray,
-    vertices: Sequence[Tuple[float, float]],
+    vertices: Sequence[tuple[float, float]],
     channel: int,
     intensity: float,
 ) -> None:
@@ -135,9 +135,9 @@ def _draw_polygon(
 def generate_sound_art(
     seed: int,
     *,
-    image_size: Tuple[int, int] = (192, 192),
+    image_size: tuple[int, int] = (192, 192),
     sample_rate: int = 48_000,
-) -> Tuple[np.ndarray, np.ndarray, SyntheticSound, List[ShapeSpec]]:
+) -> tuple[np.ndarray, np.ndarray, SyntheticSound, list[ShapeSpec]]:
     """Create a colour image and grayscale reference from a synthetic sound clip."""
 
     rng = np.random.default_rng(seed)
@@ -151,7 +151,7 @@ def generate_sound_art(
     max_extent = max(min(rows, cols) // 4, min_extent + 6)
     padding = int(np.ceil(max_extent * 1.25))
 
-    shapes: List[ShapeSpec] = []
+    shapes: list[ShapeSpec] = []
     shape_types = ("circle", "square", "triangle")
     channels = {"red": 0, "green": 1, "blue": 2}
 
@@ -225,13 +225,13 @@ def generate_sound_art(
     return color_canvas, grayscale, sound, shapes
 
 
-def guess_shapes(image: np.ndarray, threshold: float = 0.2) -> List[ShapeGuess]:
+def guess_shapes(image: np.ndarray, threshold: float = 0.2) -> list[ShapeGuess]:
     """Attempt to recover geometric primitives from ``image`` on a per-channel basis."""
 
     if image.ndim != 3 or image.shape[2] < 3:
         raise ValueError("Expected a colour image with three channels")
 
-    results: List[ShapeGuess] = []
+    results: list[ShapeGuess] = []
     prototypes = {"square": 1.0, "circle": np.pi / 4.0, "triangle": 0.5}
     channels = {"red": 0, "green": 1, "blue": 2}
 

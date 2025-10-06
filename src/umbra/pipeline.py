@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -15,8 +14,8 @@ from .metrics import ReconstructionMetrics, compute_metrics
 
 @dataclass
 class PipelineResult:
-    packet_path: Optional[Path]
-    reconstruction_path: Optional[Path]
+    packet_path: Path | None
+    reconstruction_path: Path | None
     metrics: ReconstructionMetrics
 
 

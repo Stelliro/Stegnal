@@ -26,10 +26,6 @@ def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
     pad_h = (block_size - (h % block_size)) % block_size
     pad_w = (block_size - (w % block_size)) % block_size
     if pad_h or pad_w:
-        pad_bottom = arr[-(h % block_size) :] if (h % block_size) else arr[-block_size :]
-        pad_right = arr[:, -(w % block_size) :] if (w % block_size) else arr[:, -block_size :]
-        last_row = arr[-1:, :]
-        last_col = arr[:, -1:]
         pad = np.pad(
             arr,
             ((0, pad_h), (0, pad_w)),

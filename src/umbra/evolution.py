@@ -6,7 +6,6 @@ import hashlib
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -88,11 +87,11 @@ class EvolutionManager:
     def update_settings(
         self,
         *,
-        original: Optional[np.ndarray] = None,
-        encoder: Optional[NoiseStreamEncoder] = None,
-        decoder: Optional[NoiseStreamDecoder] = None,
-        population_size: Optional[int] = None,
-        autosave_interval: Optional[int] = None,
+        original: np.ndarray | None = None,
+        encoder: NoiseStreamEncoder | None = None,
+        decoder: NoiseStreamDecoder | None = None,
+        population_size: int | None = None,
+        autosave_interval: int | None = None,
     ) -> None:
         """Update runtime settings without discarding existing history."""
 
@@ -169,7 +168,7 @@ class EvolutionManager:
         return path
 
     @classmethod
-    def load(cls, directory: str | Path) -> "EvolutionManager":
+    def load(cls, directory: str | Path) -> EvolutionManager:
         """Restore a manager from :meth:`save` output."""
 
         directory = Path(directory)

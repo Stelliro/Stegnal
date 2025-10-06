@@ -23,7 +23,7 @@ class NoiseStreamDecoder:
         return {"denoise_sigma": None if self.denoise_sigma is None else float(self.denoise_sigma)}
 
     @classmethod
-    def from_config(cls, config: dict[str, float | None]) -> "NoiseStreamDecoder":
+    def from_config(cls, config: dict[str, float | None]) -> NoiseStreamDecoder:
         """Instantiate the decoder from :meth:`to_config` output."""
 
         return cls(denoise_sigma=config.get("denoise_sigma"))

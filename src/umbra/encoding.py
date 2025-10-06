@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 from PIL import Image
@@ -15,7 +14,7 @@ class NoisePacket:
     """Container for an encoded image represented as noise."""
 
     encoded: np.ndarray
-    image_shape: Tuple[int, ...]
+    image_shape: tuple[int, ...]
     permutation_seed: int
     sigma: float
 
@@ -30,7 +29,7 @@ class NoisePacket:
         )
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "NoisePacket":
+    def from_file(cls, path: str | Path) -> NoisePacket:
         with np.load(path) as data:
             encoded = data["encoded"].astype(np.float32)
             shape = tuple(int(v) for v in data["image_shape"].astype(int))
@@ -51,7 +50,7 @@ class NoiseStreamEncoder:
         return {"sigma": float(self.sigma)}
 
     @classmethod
-    def from_config(cls, config: dict[str, float]) -> "NoiseStreamEncoder":
+    def from_config(cls, config: dict[str, float]) -> NoiseStreamEncoder:
         """Instantiate the encoder from :meth:`to_config` output."""
 
         return cls(sigma=float(config.get("sigma", 0.2)))
@@ -66,7 +65,7 @@ class NoiseStreamEncoder:
         """Encode the image using a permutation driven by ``seed``."""
         if image.ndim not in (2, 3):
             raise ValueError("Expected image array with shape (H, W) or (H, W, C)")
-        image_shape: Tuple[int, ...] = tuple(int(dim) for dim in image.shape)
+        image_shape: tuple[int, ...] = tuple(int(dim) for dim in image.shape)
         rng = np.random.default_rng(seed)
         flat = np.asarray(image, dtype=np.float32).reshape(-1)
         permutation = rng.permutation(flat.size)
