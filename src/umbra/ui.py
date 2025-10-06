@@ -31,6 +31,9 @@ import logging
 import os
 
 
+logger = logging.getLogger(__name__)
+
+
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
 
 
@@ -53,6 +56,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     except FileNotFoundError:
         return
     except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Failed to load autosave from %s", autosave_dir)
         st.sidebar.warning(f"Failed to load autosave: {exc}")
         return
 
@@ -217,14 +221,16 @@ def _reset_widget_key(state: st.session_state, key: str) -> None:
         try:
             reset(key, None)
         except Exception:  # pragma: no cover - defensive guard
-            pass
+            logger.debug(
+                "reset_state_value failed for key '%s'", key, exc_info=True
+            )
 
     setter = getattr(state, "_set_widget_state", None)
     if callable(setter):  # pragma: no branch - private Streamlit helper
         try:
             setter(key, None)
         except Exception:  # pragma: no cover - defensive guard
-            pass
+            logger.debug("_set_widget_state failed for key '%s'", key, exc_info=True)
 
     widget_state = getattr(state, "_new_widget_state", None)
     if isinstance(widget_state, dict):  # pragma: no branch - legacy internals
@@ -234,10 +240,13 @@ def _reset_widget_key(state: st.session_state, key: str) -> None:
         try:
             del state[key]
         except Exception:  # pragma: no cover - defensive guard
+            logger.debug("Failed to delete key '%s' directly", key, exc_info=True)
             try:
                 state.pop(key, None)
             except Exception:
-                pass
+                logger.debug(
+                    "Failed to remove key '%s' using pop", key, exc_info=True
+                )
 
 
 def _migrate_legacy_state(state: st.session_state) -> None:
@@ -248,6 +257,7 @@ def _migrate_legacy_state(state: st.session_state) -> None:
         if "sound_seed" in state:
             legacy_seed = state.get("sound_seed")
     except Exception:  # pragma: no cover - defensive guard
+        logger.debug("Unable to read legacy sound_seed", exc_info=True)
         legacy_seed = None
     _reset_widget_key(state, "sound_seed")
     if legacy_seed is not None and "active_sound_seed" not in state:
@@ -311,7 +321,7 @@ def _detect_hardware_backend() -> str:
             suffix = "s" if device_count > 1 else ""
             backends.append(f"CuPy CUDA ({device_count} device{suffix})")
     except Exception:  # pragma: no cover - optional dependency
-        pass
+        logger.debug("CuPy backend check failed", exc_info=True)
 
     try:  # pragma: no cover - optional dependency
         import torch
@@ -320,7 +330,7 @@ def _detect_hardware_backend() -> str:
             name = torch.cuda.get_device_name(0)
             backends.append(f"PyTorch CUDA ({name})")
     except Exception:  # pragma: no cover - optional dependency
-        pass
+        logger.debug("PyTorch backend check failed", exc_info=True)
 
     if backends:
         return ", ".join(backends)
@@ -661,7 +671,7 @@ def run() -> None:
         st.set_option("client.showErrorDetails", True)
         st.set_option("browser.gatherUsageStats", False)
     except Exception:
-        pass
+        logger.debug("Failed to configure Streamlit options", exc_info=True)
     logging.basicConfig(level=logging.INFO)
     st.title("Project Umbra Visual Explorer")
     st.markdown(
