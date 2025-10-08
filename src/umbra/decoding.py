@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,8 @@ from PIL import Image
 from skimage import filters
 
 from .encoding import NoisePacket
+
+logger = logging.getLogger(__name__)
 
 
 class NoiseStreamDecoder:
@@ -33,6 +36,9 @@ class NoiseStreamDecoder:
         if seed != packet.permutation_seed:
             raise ValueError("Seed mismatch: cannot decode without the original seed")
 
+        logger.debug(
+            "Decoding packet with sigma %s using seed %d", packet.sigma, seed
+        )
         rng = np.random.default_rng(seed)
         flat_size = int(np.prod(packet.image_shape))
         permutation = rng.permutation(flat_size)
@@ -44,6 +50,9 @@ class NoiseStreamDecoder:
         recovered = recovered.reshape(packet.image_shape)
 
         if self.denoise_sigma and self.denoise_sigma > 0:
+            logger.debug(
+                "Applying Gaussian denoise with sigma %.3f", float(self.denoise_sigma)
+            )
             recovered = filters.gaussian(
                 recovered,
                 sigma=self.denoise_sigma,

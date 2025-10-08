@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,12 @@ def generate_sound_art(
     samples = rng.standard_normal(sample_rate).astype(np.float32)
     spectrum = np.abs(np.fft.rfft(samples))
     volumes = _normalized_band_volumes(spectrum)
+    logger.info(
+        "Generated sound spectrum for seed=%d sample_rate=%d with bands %s",
+        seed,
+        sample_rate,
+        {key: round(val, 3) for key, val in volumes.items()},
+    )
 
     color_canvas = np.zeros((*image_size, 3), dtype=np.float32)
     rows, cols = image_size
@@ -222,6 +231,10 @@ def generate_sound_art(
         band_volumes=volumes,
     )
 
+    logger.debug(
+        "Generated %d shapes for seed=%d", len(shapes), seed
+    )
+
     return color_canvas, grayscale, sound, shapes
 
 
@@ -258,6 +271,8 @@ def guess_shapes(image: np.ndarray, threshold: float = 0.2) -> list[ShapeGuess]:
         volume = float(layer[mask].mean())
 
         results.append(ShapeGuess(color=color_name, guess=guess, confidence=confidence, volume=volume))
+
+    logger.debug("Shape guesses: %s", results)
 
     return results
 

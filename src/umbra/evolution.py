@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,8 @@ from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .metrics import ReconstructionMetrics, compute_metrics
 from .visualization import multiplicative_overlap
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -105,12 +108,20 @@ class EvolutionManager:
             self.population_size = max(1, int(population_size))
         if autosave_interval is not None:
             self.autosave_interval = max(1, int(autosave_interval))
+        logger.info(
+            "Updated manager settings: population=%d autosave=%d",
+            self.population_size,
+            self.autosave_interval,
+        )
 
     def run_generation(self) -> GenerationRecord:
         """Evaluate a new generation and append it to the history."""
 
         seeds = self.rng.integers(0, np.iinfo(np.int32).max, size=self.population_size, dtype=np.int64)
         generation = GenerationRecord(index=len(self.generations))
+        logger.info(
+            "Running generation %d with %d candidates", generation.index, self.population_size
+        )
 
         for seed in seeds.tolist():
             packet = self.encoder.encode(self.original, int(seed))
@@ -126,6 +137,14 @@ class EvolutionManager:
             generation.candidates.append(candidate)
 
         self.generations.append(generation)
+        best = generation.best_candidate
+        logger.info(
+            "Completed generation %d; best seed %d with SSIM %.3f and overlap %.2f",
+            generation.index,
+            best.seed,
+            best.metrics.ssim,
+            best.overlap_score,
+        )
         return generation
 
     def to_session(self) -> EvolutionSession:
@@ -165,6 +184,11 @@ class EvolutionManager:
         path = directory / "evolution_state.pkl"
         with path.open("wb") as handle:
             pickle.dump(self.to_session(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(
+            "Saved evolution session with %d generations to %s",
+            len(self.generations),
+            path,
+        )
         return path
 
     @classmethod
@@ -199,6 +223,11 @@ class EvolutionManager:
                 )
             restored_generations.append(GenerationRecord(index=record.index, candidates=restored_candidates))
 
+        logger.info(
+            "Loaded evolution session from %s with %d generations",
+            path,
+            len(restored_generations),
+        )
         manager = cls(
             original=original,
             encoder=encoder,
@@ -219,4 +248,3 @@ __all__ = [
     "GenerationRecord",
     "compute_image_signature",
 ]
-

@@ -3,6 +3,7 @@
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
 from .evolution import EvolutionManager
+from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
 from .pipeline import PipelineResult, replay_packet, run_pipeline
 from .visualization import colorize_comparison, multiplicative_overlap, normalize_for_display
@@ -20,4 +21,5 @@ __all__ = [
     "multiplicative_overlap",
     "colorize_comparison",
     "normalize_for_display",
+    "configure_logging",
 ]

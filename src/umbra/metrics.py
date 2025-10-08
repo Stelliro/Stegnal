@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -32,6 +35,7 @@ def compute_metrics(reference: np.ndarray, candidate: np.ndarray) -> Reconstruct
             channel_axis=channel_axis,
         )
     )
+    logger.debug("Computed metrics: PSNR=%.2f SSIM=%.3f", psnr, ssim)
     return ReconstructionMetrics(psnr=psnr, ssim=ssim)
 
 

@@ -21,7 +21,9 @@ from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, compute_image_signature
+from umbra.logging_utils import configure_logging
 from umbra.metrics import compute_metrics
+from umbra.progress import prepare_trend_chart, sanitize_progress_rows
 from umbra.sound import ShapeGuess, generate_sound_art, guess_shapes
 from umbra.visualization import (
     colorize_comparison,
@@ -100,6 +102,11 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
     st.sidebar.success("Loaded autosaved evolution session.")
+    logger.info(
+        "Restored autosave from %s with %d generations",
+        autosave_dir,
+        len(manager.generations),
+    )
 
 
 def _ensure_manager(
@@ -684,7 +691,13 @@ def run() -> None:
         st.set_option("browser.gatherUsageStats", False)
     except Exception:
         logger.debug("Failed to configure Streamlit options", exc_info=True)
-    logging.basicConfig(level=logging.INFO)
+
+    log_dir = configure_logging()
+    state = st.session_state
+    if state.get("_umbra_log_directory") != str(log_dir):
+        state["_umbra_log_directory"] = str(log_dir)
+        logger.info("Logging configured; writing UI diagnostics to %s", log_dir)
+
     st.title("Project Umbra Visual Explorer")
     st.markdown(
         """
@@ -695,7 +708,6 @@ def run() -> None:
         """
     )
 
-    state = st.session_state
     _migrate_legacy_state(state)
     state.setdefault("pending_generations", 0)
     state.setdefault("run_infinite", False)
@@ -1131,12 +1143,15 @@ def run() -> None:
         if evolution_mode == "Finite":
             state["pending_generations"] = generations_to_queue
             state["run_infinite"] = False
+            logger.info("Queued %d generations for finite evolution", generations_to_queue)
         else:
             state["run_infinite"] = True
+            logger.info("Activated infinite evolution mode")
 
     if stop_button:
         state["run_infinite"] = False
         state["pending_generations"] = 0
+        logger.info("Requested evolution stop")
 
     pending_generations = int(state.get("pending_generations", 0))
     runs_to_execute = 0
@@ -1158,6 +1173,12 @@ def run() -> None:
                     int(state.get("pending_generations", 0)) - 1,
                     0,
                 )
+        logger.debug(
+            "Executed %d generation(s); pending=%d infinite=%s",
+            generations_ran,
+            int(state.get("pending_generations", 0)),
+            state.get("run_infinite", False),
+        )
 
     trigger_rerun = False
     if generations_ran:
@@ -1200,6 +1221,7 @@ def run() -> None:
     if generations_ran and len(manager.generations) % manager.autosave_interval == 0:
         save_path = manager.save(autosave_dir)
         st.sidebar.success(f"Autosaved evolution session to {save_path}")
+        logger.info("Autosaved evolution session to %s", save_path)
 
     st.sidebar.metric(
         "Generations remaining on sound target",
@@ -1222,99 +1244,17 @@ def run() -> None:
         ]
 
         if generation_progress_rows:
-            progress_df = pd.DataFrame(generation_progress_rows)
+            sanitized_rows, dropped_values = sanitize_progress_rows(generation_progress_rows)
             st.subheader("Best-of-generation trend")
 
-            sanitized = (
-                progress_df.replace([np.inf, -np.inf], np.nan)
-                .dropna()
-                .sort_values("Generation")
-            )
-
-            if sanitized.empty:
-                st.caption(
-                    "Trend chart will appear once generations contain finite metric values."
+            spec, message = prepare_trend_chart(sanitized_rows, had_non_finite=dropped_values)
+            if spec:
+                st.vega_lite_chart(spec, use_container_width=True)
+                logger.debug(
+                    "Rendered trend chart with %d records", len(sanitized_rows)
                 )
-            else:
-                value_columns = [
-                    column for column in sanitized.columns if column != "Generation"
-                ]
-
-                if not value_columns:
-                    st.caption("Trend chart requires metric columns to display.")
-                else:
-                    unique_generations = sanitized["Generation"].nunique()
-                    has_variation = unique_generations > 1 and any(
-                        sanitized[column].nunique() > 1 for column in value_columns
-                    )
-                    values = sanitized[value_columns].to_numpy(dtype=np.float32, copy=True)
-                    has_finite = bool(np.isfinite(values).all())
-
-                    if has_variation and has_finite:
-                        folded = sanitized.melt(
-                            id_vars="Generation",
-                            value_vars=value_columns,
-                            var_name="Metric",
-                            value_name="Value",
-                        )
-                        folded["Value"] = folded["Value"].astype(float)
-                        chart_spec = {
-                            "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
-                            "data": {"values": folded.to_dict(orient="records")},
-                            "autosize": {"type": "fit", "contains": "padding"},
-                            "mark": {
-                                "type": "line",
-                                "point": True,
-                            },
-                            "encoding": {
-                                "x": {
-                                    "field": "Generation",
-                                    "type": "quantitative",
-                                    "title": "Generation",
-                                },
-                                "y": {
-                                    "field": "Value",
-                                    "type": "quantitative",
-                                    "title": "Score",
-                                },
-                                "color": {
-                                    "field": "Metric",
-                                    "type": "nominal",
-                                    "title": "Metric",
-                                },
-                                "tooltip": [
-                                    {"field": "Generation", "type": "quantitative"},
-                                    {"field": "Metric", "type": "nominal"},
-                                    {"field": "Value", "type": "quantitative"},
-                                ],
-                            },
-                            "config": {
-                                "legend": {
-                                    "orient": "bottom",
-                                    "title": "",
-                                },
-                            },
-                            "usermeta": {
-                                "embedOptions": {
-                                    "tooltip": {
-                                        "modifiers": [
-                                            {"name": "preventOverflow"},
-                                            {"name": "hide"},
-                                        ]
-                                    }
-                                }
-                            },
-                        }
-                        st.vega_lite_chart(chart_spec, use_container_width=True)
-                    elif not has_finite:
-                        st.caption(
-                            "Trend chart hidden until generations contain finite metric values."
-                        )
-                    else:
-                        st.caption(
-                            "Trend chart will appear once multiple non-identical generations are"
-                            " available."
-                        )
+            if message:
+                st.caption(message)
 
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
@@ -1473,6 +1413,7 @@ def run() -> None:
 
     # Ensure infinite mode keeps ticking by scheduling a rerun after work
     if trigger_rerun:
+        logger.debug("Scheduling rerun for continued evolution")
         _trigger_rerun()
 
     st.markdown(
