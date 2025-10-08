@@ -1208,34 +1208,88 @@ def run() -> None:
         ]
 
         if generation_progress_rows:
-            progress_df = (
-                pd.DataFrame(generation_progress_rows)
-                .replace([np.inf, -np.inf], np.nan)
-                .dropna()
-            )
+            progress_df = pd.DataFrame(generation_progress_rows)
             st.subheader("Best-of-generation trend")
-            if not progress_df.empty:
-                progress_df = progress_df.set_index("Generation")
-                has_variation = (
-                    progress_df.index.size > 1
-                    and any(progress_df[col].nunique() > 1 for col in progress_df.columns)
-                )
-                has_finite = bool(np.isfinite(progress_df.to_numpy()).all())
-                if has_variation and has_finite:
-                    st.line_chart(progress_df, width="stretch")
-                elif not has_finite:
-                    st.caption(
-                        "Trend chart hidden until generations contain finite metric values."
-                    )
-                else:
-                    st.caption(
-                        "Trend chart will appear once multiple non-identical generations are"
-                        " available."
-                    )
-            else:
+
+            sanitized = (
+                progress_df.replace([np.inf, -np.inf], np.nan)
+                .dropna()
+                .sort_values("Generation")
+            )
+
+            if sanitized.empty:
                 st.caption(
                     "Trend chart will appear once generations contain finite metric values."
                 )
+            else:
+                value_columns = [
+                    column for column in sanitized.columns if column != "Generation"
+                ]
+
+                if not value_columns:
+                    st.caption("Trend chart requires metric columns to display.")
+                else:
+                    unique_generations = sanitized["Generation"].nunique()
+                    has_variation = unique_generations > 1 and any(
+                        sanitized[column].nunique() > 1 for column in value_columns
+                    )
+                    values = sanitized[value_columns].to_numpy(dtype=np.float32, copy=True)
+                    has_finite = bool(np.isfinite(values).all())
+
+                    if has_variation and has_finite:
+                        folded = sanitized.melt(
+                            id_vars="Generation",
+                            value_vars=value_columns,
+                            var_name="Metric",
+                            value_name="Value",
+                        )
+                        chart_spec = {
+                            "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+                            "data": {"values": folded.to_dict(orient="records")},
+                            "mark": {
+                                "type": "line",
+                                "point": True,
+                            },
+                            "encoding": {
+                                "x": {
+                                    "field": "Generation",
+                                    "type": "quantitative",
+                                    "title": "Generation",
+                                },
+                                "y": {
+                                    "field": "Value",
+                                    "type": "quantitative",
+                                    "title": "Score",
+                                },
+                                "color": {
+                                    "field": "Metric",
+                                    "type": "nominal",
+                                    "title": "Metric",
+                                },
+                                "tooltip": [
+                                    {"field": "Generation", "type": "quantitative"},
+                                    {"field": "Metric", "type": "nominal"},
+                                    {"field": "Value", "type": "quantitative"},
+                                ],
+                            },
+                            "config": {
+                                "view": {"continuousWidth": "container"},
+                                "legend": {
+                                    "orient": "bottom",
+                                    "title": "",
+                                },
+                            },
+                        }
+                        st.vega_lite_chart(chart_spec, use_container_width=True)
+                    elif not has_finite:
+                        st.caption(
+                            "Trend chart hidden until generations contain finite metric values."
+                        )
+                    else:
+                        st.caption(
+                            "Trend chart will appear once multiple non-identical generations are"
+                            " available."
+                        )
 
         gen_indices = [record.index for record in manager.generations]
         default_gen = gen_indices[-1]
