@@ -105,6 +105,13 @@ def prepare_trend_chart(
     if not values:
         return None, "Trend chart requires metric columns to display."
 
+    for entry in values:
+        if not math.isfinite(entry["Generation"]) or not math.isfinite(entry["Value"]):
+            logger.warning(
+                "Discarding trend chart due to non-finite values after sanitization"
+            )
+            return None, "Trend chart hidden until generations contain finite metric values."
+
     if not has_variation:
         return None, "Trend chart will appear once multiple non-identical generations are available."
 
@@ -129,9 +136,8 @@ def prepare_trend_chart(
                 "tooltip": {
                     "modifiers": [
                         {"name": "offset", "options": {"mainAxis": 8, "crossAxis": 0}},
-                        {"name": "preventOverflow", "options": {"padding": 16}},
                         {"name": "flip"},
-                        {"name": "hide", "options": {"strategy": "referenceHidden"}},
+                        {"name": "preventOverflow", "options": {"padding": 16}},
                     ]
                 }
             }

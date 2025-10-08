@@ -118,6 +118,7 @@ def _ensure_manager(
     autosave_interval: int,
 ) -> EvolutionManager:
     state = st.session_state
+    was_running_infinite = bool(state.get("run_infinite", False))
     signature = (
         compute_image_signature(original),
         float(encoder.sigma),
@@ -127,6 +128,8 @@ def _ensure_manager(
 
     manager: EvolutionManager | None = state.get("evolution_manager")
     if manager is None or state.get("evolution_signature") != signature:
+        if manager is not None:
+            logger.info("Reinitialising evolution manager due to signature change")
         manager = EvolutionManager(
             original=original,
             encoder=encoder,
@@ -138,7 +141,9 @@ def _ensure_manager(
         state["evolution_manager"] = manager
         state["evolution_signature"] = signature
         state["pending_generations"] = 0
-        state["run_infinite"] = False
+        state["run_infinite"] = was_running_infinite
+        if was_running_infinite:
+            logger.debug("Preserved infinite evolution run state after manager reset")
     else:
         manager.update_settings(
             original=original,
