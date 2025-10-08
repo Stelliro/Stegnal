@@ -6,6 +6,7 @@ import base64
 import html
 import json
 import logging
+import math
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -45,6 +46,19 @@ def _update_difficulty(state: st.session_state, latest_overlap: float) -> float:
 
 def _autosave_path(directory: Path) -> Path:
     return directory / "evolution_state.pkl"
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """Return ``value`` as a finite float, or ``None`` when unavailable."""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if math.isfinite(numeric):
+        return numeric
+    return None
 
 
 def _attempt_autoload(autosave_dir: Path) -> None:
@@ -1199,10 +1213,10 @@ def run() -> None:
         st.header("Evolution progress")
         generation_progress_rows = [
             {
-                "Generation": record.index,
-                "Best SSIM": record.best_candidate.metrics.ssim,
-                "Best PSNR": record.best_candidate.metrics.psnr,
-                "Best overlap": record.best_candidate.overlap_score,
+                "Generation": int(record.index),
+                "Best SSIM": _finite_or_none(record.best_candidate.metrics.ssim),
+                "Best PSNR": _finite_or_none(record.best_candidate.metrics.psnr),
+                "Best overlap": _finite_or_none(record.best_candidate.overlap_score),
             }
             for record in manager.generations
         ]
@@ -1243,9 +1257,11 @@ def run() -> None:
                             var_name="Metric",
                             value_name="Value",
                         )
+                        folded["Value"] = folded["Value"].astype(float)
                         chart_spec = {
                             "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
                             "data": {"values": folded.to_dict(orient="records")},
+                            "autosize": {"type": "fit", "contains": "padding"},
                             "mark": {
                                 "type": "line",
                                 "point": True,
@@ -1273,11 +1289,20 @@ def run() -> None:
                                 ],
                             },
                             "config": {
-                                "view": {"continuousWidth": "container"},
                                 "legend": {
                                     "orient": "bottom",
                                     "title": "",
                                 },
+                            },
+                            "usermeta": {
+                                "embedOptions": {
+                                    "tooltip": {
+                                        "modifiers": [
+                                            {"name": "preventOverflow"},
+                                            {"name": "hide"},
+                                        ]
+                                    }
+                                }
                             },
                         }
                         st.vega_lite_chart(chart_spec, use_container_width=True)
