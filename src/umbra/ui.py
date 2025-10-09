@@ -51,6 +51,27 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
 
+
+def _quantize_slider_value(
+    value: float,
+    *,
+    min_value: float,
+    max_value: float,
+    step: float,
+) -> float:
+    """Clip ``value`` to the slider domain and align it with the provided step."""
+
+    if step <= 0:
+        raise ValueError("Slider step must be positive")
+
+    clipped = float(np.clip(value, min_value, max_value))
+    steps = round((clipped - min_value) / step)
+    quantized = min_value + steps * step
+    quantized = float(np.clip(quantized, min_value, max_value))
+    # Guard against floating point drift so Streamlit accepts the default value.
+    decimals = max(0, -int(math.floor(math.log10(step))) if step < 1 else 0)
+    return round(quantized, decimals)
+
 _IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
     "Geometric Echo (balanced)": {
         "encoder_sigma": 0.2,
@@ -352,6 +373,21 @@ def _render_reconstruction_lab(
     dropout_value = float(cache.get("dropout_probability", 0.35))
     sample_rate_value = int(cache.get("sample_rate", default_sample_rate))
 
+    noise_default = _quantize_slider_value(
+        noise_value, min_value=0.05, max_value=0.6, step=0.05
+    )
+    dropout_default = _quantize_slider_value(
+        dropout_value, min_value=0.05, max_value=0.8, step=0.05
+    )
+    sample_rate_default = int(
+        _quantize_slider_value(
+            float(sample_rate_value),
+            min_value=16_000,
+            max_value=64_000,
+            step=2_000,
+        )
+    )
+
     seed = st.number_input(
         "Collage seed",
         value=seed_value,
@@ -372,7 +408,7 @@ def _render_reconstruction_lab(
         "Noise amplitude",
         min_value=0.05,
         max_value=0.6,
-        value=float(np.clip(noise_value, 0.05, 0.6)),
+        value=float(noise_default),
         step=0.05,
         key="reconstruction_noise",
         help="Standard deviation of the Gaussian noise added to each variation.",
@@ -381,7 +417,7 @@ def _render_reconstruction_lab(
         "Dropout probability",
         min_value=0.05,
         max_value=0.8,
-        value=float(np.clip(dropout_value, 0.05, 0.8)),
+        value=float(dropout_default),
         step=0.05,
         key="reconstruction_dropout",
         help="Likelihood that a pixel is replaced with unrelated noise in each glimpse.",
@@ -391,7 +427,7 @@ def _render_reconstruction_lab(
         min_value=16_000,
         max_value=64_000,
         step=2_000,
-        value=int(np.clip(sample_rate_value, 16_000, 64_000)),
+        value=sample_rate_default,
         key="reconstruction_sample_rate",
         help="Encoding rate for the collage-to-audio conversion stage.",
     )

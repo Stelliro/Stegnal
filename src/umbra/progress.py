@@ -136,8 +136,9 @@ def prepare_trend_chart(
                 "tooltip": {
                     "modifiers": [
                         {"name": "offset", "options": {"mainAxis": 8, "crossAxis": 0}},
-                        {"name": "flip"},
                         {"name": "preventOverflow", "options": {"padding": 16}},
+                        {"name": "hide"},
+                        {"name": "flip"},
                     ]
                 }
             }

@@ -42,6 +42,4 @@ def test_prepare_trend_chart_returns_spec_when_data_varies() -> None:
     assert spec is not None
     modifiers = spec["usermeta"]["embedOptions"]["tooltip"]["modifiers"]
     names = [item["name"] for item in modifiers]
-    assert names[0] == "offset"
-    assert "preventOverflow" in names
-    assert "hide" not in names
+    assert names == ["offset", "preventOverflow", "hide", "flip"]

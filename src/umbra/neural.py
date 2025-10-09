@@ -50,6 +50,9 @@ class NeuralRewardModel:
         self._feature_mean = np.zeros(self.input_dim, dtype=np.float32)
         self._feature_var = np.ones(self.input_dim, dtype=np.float32)
         self._samples_seen = 0
+        self._activation_clip = 50.0
+        self._grad_clip = 5.0
+        self._weight_clip = 10.0
 
     def _init_network(self) -> None:
         layer_dims = (self.input_dim, *self.hidden_layers, 1)
@@ -91,6 +94,7 @@ class NeuralRewardModel:
         self._samples_seen = total_samples
 
         normalized = (features - self._feature_mean) / np.sqrt(self._feature_var)
+        normalized = np.nan_to_num(normalized, nan=0.0, posinf=10.0, neginf=-10.0)
         return normalized.astype(np.float32)
 
     # ------------------------------------------------------------------
@@ -100,9 +104,16 @@ class NeuralRewardModel:
         pre_activations: list[np.ndarray] = []
         for idx, layer in enumerate(self._layers):
             z = activations[-1] @ layer.weight + layer.bias
+            z = np.nan_to_num(
+                z,
+                nan=0.0,
+                posinf=self._activation_clip,
+                neginf=-self._activation_clip,
+            )
+            z = np.clip(z, -self._activation_clip, self._activation_clip)
             pre_activations.append(z)
             if idx == len(self._layers) - 1:
-                activations.append(z)
+                activations.append(z.astype(np.float32))
             else:
                 activations.append(np.maximum(z, 0.0).astype(np.float32))
         return activations, pre_activations
@@ -127,16 +138,22 @@ class NeuralRewardModel:
         if features.shape[0] != rewards.shape[0]:
             raise ValueError("Feature and reward batches must share the same length")
 
+        rewards = np.clip(rewards, -1_000.0, 1_000.0)
+        rewards = np.nan_to_num(rewards, nan=0.0, posinf=1_000.0, neginf=-1_000.0)
+
         norm_features = self._normalise_features(features)
+        norm_features = np.nan_to_num(norm_features, nan=0.0, posinf=10.0, neginf=-10.0)
         for epoch in range(self.max_epochs):
             activations, pre_acts = self._forward(norm_features)
             predictions = activations[-1]
+            predictions = np.clip(predictions, -self._activation_clip, self._activation_clip)
             error = predictions - rewards
             loss = float(np.mean(error**2))
             if epoch == self.max_epochs - 1:
                 logger.debug("Neural reward epoch %d loss %.5f", epoch, loss)
 
             grad_output = (2.0 / rewards.shape[0]) * error
+            grad_output = np.clip(grad_output, -self._grad_clip, self._grad_clip)
             grads_w: list[np.ndarray] = [np.zeros_like(layer.weight) for layer in self._layers]
             grads_b: list[np.ndarray] = [np.zeros_like(layer.bias) for layer in self._layers]
             backprop = grad_output
@@ -144,13 +161,27 @@ class NeuralRewardModel:
             for layer_index in reversed(range(len(self._layers))):
                 layer = self._layers[layer_index]
                 input_activation = activations[layer_index]
-                grads_w[layer_index] = input_activation.T @ backprop + self.weight_decay * layer.weight
-                grads_b[layer_index] = backprop.sum(axis=0)
+                grads_w[layer_index] = (
+                    input_activation.T @ backprop + self.weight_decay * layer.weight
+                )
+                grads_w[layer_index] = np.clip(
+                    grads_w[layer_index], -self._grad_clip, self._grad_clip
+                )
+                grads_b[layer_index] = np.clip(
+                    backprop.sum(axis=0), -self._grad_clip, self._grad_clip
+                )
 
                 if layer_index:
                     upstream = backprop @ layer.weight.T
+                    upstream = np.nan_to_num(
+                        upstream,
+                        nan=0.0,
+                        posinf=self._grad_clip,
+                        neginf=-self._grad_clip,
+                    )
                     relu_grad = (pre_acts[layer_index - 1] > 0).astype(np.float32)
                     backprop = upstream * relu_grad
+                    backprop = np.clip(backprop, -self._grad_clip, self._grad_clip)
 
             for idx, layer in enumerate(self._layers):
                 layer.velocity_w = (
@@ -163,6 +194,12 @@ class NeuralRewardModel:
                 )
                 layer.weight += layer.velocity_w
                 layer.bias += layer.velocity_b
+                layer.weight = np.clip(
+                    layer.weight, -self._weight_clip, self._weight_clip
+                ).astype(np.float32)
+                layer.bias = np.clip(
+                    layer.bias, -self._weight_clip, self._weight_clip
+                ).astype(np.float32)
 
     # ------------------------------------------------------------------
     def to_state(self) -> dict[str, object]:
