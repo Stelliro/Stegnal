@@ -1,3 +1,5 @@
+import importlib
+
 import numpy as np
 
 from umbra.decoding import NoiseStreamDecoder
@@ -136,3 +138,42 @@ def test_difficulty_respects_overlap_improvement() -> None:
 
     assert second.best_candidate.overlap_score >= first.best_candidate.overlap_score
     assert second.difficulty_level >= first.difficulty_level
+
+
+def test_hyper_mode_profile_adapts(monkeypatch) -> None:
+    monkeypatch.setenv("UMBRA_HYPER_MODE", "1")
+    import umbra.evolution as evolution
+
+    evolution = importlib.reload(evolution)
+
+    rng = np.random.default_rng(11)
+    image = rng.random((16, 16), dtype=np.float32)
+    encoder = NoiseStreamEncoder(sigma=0.3)
+    decoder = NoiseStreamDecoder(denoise_sigma=0.8)
+    manager = evolution.EvolutionManager(
+        original=image,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=2,
+        base_seed=404,
+        autosave_interval=1,
+    )
+
+    profile = manager.hyper_profile
+    assert profile.enabled
+    assert manager.population_size == profile.batch_size
+    assert profile.batch_size >= 5
+
+    generation = manager.run_generation()
+    updated = manager.hyper_profile
+    assert updated.last_update == generation.index
+    assert manager.population_size == updated.batch_size
+    assert updated.batch_size >= profile.batch_size
+    assert updated.dwell_generations > 0
+    assert (
+        updated.batch_size * updated.dwell_generations
+        >= profile.batch_size * profile.dwell_generations
+    )
+
+    monkeypatch.delenv("UMBRA_HYPER_MODE", raising=False)
+    importlib.reload(evolution)

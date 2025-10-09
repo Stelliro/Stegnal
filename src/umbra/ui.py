@@ -26,6 +26,7 @@ from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import (
     EvolutionManager,
     GenerationRecord,
+    HyperPerformanceProfile,
     compute_image_signature,
     normalize_difficulty,
 )
@@ -575,6 +576,17 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     state["sound_generations_left"] = int(scene["target_dwell"])
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
+    if EvolutionManager.hyper_mode_enabled():
+        state["_hyper_profile_cache"] = manager.hyper_profile
+        state["generations_to_queue"] = int(
+            max(1, manager.hyper_profile.queue_generations or state.get("generations_to_queue", 1))
+        )
+        dwell = int(
+            max(1, manager.hyper_profile.dwell_generations or state.get("sound_target_dwell", scene["target_dwell"]))
+        )
+        state["sound_target_dwell"] = dwell
+        state["last_sound_target_dwell"] = dwell
+        state["sound_generations_left"] = min(int(state.get("sound_generations_left", dwell)), dwell)
     label = f"Autosave • {time.strftime('%H:%M:%S')}"
     metadata = {
         "shared_seed": int(scene["base_seed"]),
@@ -1375,6 +1387,17 @@ def _session_export_payload(
         },
         "provenance": provenance,
     }
+    if manager.hyper_profile.enabled:
+        profile = manager.hyper_profile
+        payload["hyper_performance"] = {
+            "target_subjects": int(profile.target_subjects),
+            "batch_size": int(profile.batch_size),
+            "dwell_generations": int(profile.dwell_generations),
+            "queue_generations": int(profile.queue_generations),
+            "autosave_interval": int(profile.autosave_interval),
+            "mean_generation_duration": float(profile.mean_duration),
+            "subjects_per_second": float(profile.throughput),
+        }
     return payload
 
 
@@ -1468,6 +1491,40 @@ def run() -> None:
     state.setdefault("_active_image_model", next(iter(_IMAGE_MODEL_PRESETS)))
     state.setdefault("_active_sound_model", next(iter(_SOUND_MODEL_PRESETS)))
     state.setdefault("_active_evolution_engine", "Lineage & noise (classic)")
+
+    hyper_enabled = EvolutionManager.hyper_mode_enabled()
+    hyper_profile: HyperPerformanceProfile | None = None
+    if hyper_enabled:
+        cached_profile = state.get("_hyper_profile_cache")
+        if isinstance(cached_profile, HyperPerformanceProfile):
+            hyper_profile = cached_profile
+        else:
+            hyper_profile = EvolutionManager.default_hyper_profile()
+        state["_hyper_profile_cache"] = hyper_profile
+        population_baseline = int(
+            max(1, hyper_profile.batch_size or state.get("population_size", 5))
+        )
+        autosave_baseline = int(
+            max(1, hyper_profile.autosave_interval or state.get("autosave_interval", 5))
+        )
+        dwell_baseline = int(
+            max(1, hyper_profile.dwell_generations or state.get("sound_target_dwell", 10))
+        )
+        queue_baseline = int(
+            max(1, hyper_profile.queue_generations or dwell_baseline)
+        )
+        state["population_size"] = population_baseline
+        state["autosave_interval"] = autosave_baseline
+        state["generations_to_queue"] = queue_baseline
+        state["sound_target_dwell"] = dwell_baseline
+        state["last_sound_target_dwell"] = dwell_baseline
+        state["sound_generations_left"] = min(
+            int(state.get("sound_generations_left", dwell_baseline)),
+            dwell_baseline,
+        )
+        state["evolution_mode"] = "Finite"
+    else:
+        hyper_profile = None
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
@@ -1564,20 +1621,39 @@ def run() -> None:
 
     sound_box = st.sidebar.expander("Sound cadence", expanded=False)
     with sound_box:
-        target_dwell = int(
-            st.number_input(
-                "Generations per sound target",
-                min_value=1,
-                max_value=500,
-                value=int(state.get("sound_target_dwell", 10)),
-                step=1,
-                key="sound_target_dwell",
-                help=(
-                    "Number of evolution steps to spend matching the current sound-derived "
-                    "image before refreshing it with a new randomised scene."
-                ),
+        if hyper_enabled and hyper_profile is not None:
+            target_dwell = int(
+                max(1, hyper_profile.dwell_generations or state.get("sound_target_dwell", 10))
             )
-        )
+            state["sound_target_dwell"] = target_dwell
+            state["last_sound_target_dwell"] = target_dwell
+            subjects_per_cycle = int(
+                max(
+                    hyper_profile.target_subjects,
+                    target_dwell * max(state.get("population_size", 1), 1),
+                )
+            )
+            st.metric("Generations per sound target", target_dwell)
+            st.metric("Subjects scheduled this cycle", subjects_per_cycle)
+            st.caption(
+                "Hyper performance mode rotates the sound scene automatically once the "
+                "dwell window completes."
+            )
+        else:
+            target_dwell = int(
+                st.number_input(
+                    "Generations per sound target",
+                    min_value=1,
+                    max_value=500,
+                    value=int(state.get("sound_target_dwell", 10)),
+                    step=1,
+                    key="sound_target_dwell",
+                    help=(
+                        "Number of evolution steps to spend matching the current sound-derived "
+                        "image before refreshing it with a new randomised scene."
+                    ),
+                )
+            )
 
     if state.get("last_sound_target_dwell") != target_dwell:
         state["last_sound_target_dwell"] = target_dwell
@@ -1952,40 +2028,85 @@ def run() -> None:
 
     run_box = st.sidebar.expander("Evolution run controls", expanded=True)
     with run_box:
-        population_size = int(
-            st.number_input(
-                "AI attempts per generation",
-                min_value=1,
-                max_value=32,
-                value=int(state.get("population_size", 4)),
-                step=1,
-                key="population_size",
+        if hyper_enabled and hyper_profile is not None:
+            population_size = int(
+                max(1, hyper_profile.batch_size or state.get("population_size", 5))
             )
-        )
-        generations_to_queue = int(
-            st.number_input(
-                "Generations to queue",
-                min_value=1,
-                value=int(state.get("generations_to_queue", 5)),
-                step=1,
-                key="generations_to_queue",
+            generations_to_queue = int(
+                max(
+                    1,
+                    hyper_profile.queue_generations
+                    or hyper_profile.dwell_generations
+                    or state.get("generations_to_queue", 5),
+                )
             )
-        )
-        evolution_mode = st.selectbox(
-            "Evolution length",
-            options=["Finite", "Infinite"],
-            index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
-            key="evolution_mode",
-        )
-        autosave_interval = int(
-            st.number_input(
-                "Autosave every N generations",
-                min_value=1,
-                value=int(state.get("autosave_interval", 5)),
-                step=1,
-                key="autosave_interval",
+            autosave_interval = int(
+                max(1, hyper_profile.autosave_interval or state.get("autosave_interval", 5))
             )
-        )
+            target_subjects = int(
+                max(
+                    hyper_profile.target_subjects,
+                    population_size * max(hyper_profile.dwell_generations, 1),
+                )
+            )
+            state["population_size"] = population_size
+            state["generations_to_queue"] = generations_to_queue
+            state["autosave_interval"] = autosave_interval
+            state["evolution_mode"] = "Finite"
+
+            col_top, col_bottom = st.columns(2)
+            col_top.metric("Subjects per generation", population_size)
+            col_top.metric("Queued generations", generations_to_queue)
+            col_bottom.metric("Subjects per sound cycle", target_subjects)
+            col_bottom.metric("Autosave interval", autosave_interval)
+            if hyper_profile.mean_duration > 0.0:
+                throughput = hyper_profile.throughput
+                timing_text = (
+                    f"Avg generation {hyper_profile.mean_duration:.2f}s • {throughput:.1f} subjects/s"
+                    if throughput > 0.0
+                    else f"Avg generation {hyper_profile.mean_duration:.2f}s"
+                )
+                st.caption(timing_text)
+            st.caption(
+                "Hyper performance mode tunes these parameters from runtime throughput "
+                "and the current difficulty so you can focus on results."
+            )
+            evolution_mode = "Finite"
+        else:
+            population_size = int(
+                st.number_input(
+                    "AI attempts per generation",
+                    min_value=1,
+                    max_value=32,
+                    value=int(state.get("population_size", 4)),
+                    step=1,
+                    key="population_size",
+                )
+            )
+            generations_to_queue = int(
+                st.number_input(
+                    "Generations to queue",
+                    min_value=1,
+                    value=int(state.get("generations_to_queue", 5)),
+                    step=1,
+                    key="generations_to_queue",
+                )
+            )
+            evolution_mode = st.selectbox(
+                "Evolution length",
+                options=["Finite", "Infinite"],
+                index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
+                key="evolution_mode",
+            )
+            autosave_interval = int(
+                st.number_input(
+                    "Autosave every N generations",
+                    min_value=1,
+                    value=int(state.get("autosave_interval", 5)),
+                    step=1,
+                    key="autosave_interval",
+                )
+            )
 
         run_button = st.button("Start evolution")
         stop_button = st.button("Stop evolution")
@@ -2157,6 +2278,31 @@ def run() -> None:
             int(state.get("pending_generations", 0)),
             state.get("run_infinite", False),
         )
+        if hyper_enabled:
+            profile = manager.hyper_profile
+            state["_hyper_profile_cache"] = profile
+            state["population_size"] = int(
+                max(1, profile.batch_size or state.get("population_size", population_size))
+            )
+            state["autosave_interval"] = int(
+                max(1, profile.autosave_interval or state.get("autosave_interval", autosave_interval))
+            )
+            state["generations_to_queue"] = int(
+                max(1, profile.queue_generations or state.get("generations_to_queue", generations_to_queue))
+            )
+            state["sound_target_dwell"] = int(
+                max(1, profile.dwell_generations or state.get("sound_target_dwell", target_dwell))
+            )
+            state["last_sound_target_dwell"] = int(state["sound_target_dwell"])
+            state["sound_generations_left"] = min(
+                int(state.get("sound_generations_left", state["sound_target_dwell"])),
+                int(state["sound_target_dwell"]),
+            )
+            state["evolution_mode"] = "Finite"
+            population_size = int(state["population_size"])
+            autosave_interval = int(state["autosave_interval"])
+            generations_to_queue = int(state["generations_to_queue"])
+            target_dwell = int(state["sound_target_dwell"])
         _sync_active_tree_state(state)
 
     trigger_rerun = False

@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import pickle
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +71,11 @@ PLATEAU_CFG = {
 }
 
 
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name, "0")
+    return value.lower() not in {"0", "false", "off", "no"}
+
+
 DIFFICULTY_LADDER_DEFAULTS = {
     "enabled": False,
     "base": 0.48,
@@ -109,6 +115,47 @@ def normalize_difficulty(raw_value: float) -> float:
     """Map the internal difficulty score to the [0, 1] display scale."""
 
     return float(np.clip(raw_value, 0.0, 1.0))
+
+
+@dataclass
+class HyperPerformanceProfile:
+    """Summary of hyper performance tuning recommendations."""
+
+    enabled: bool = False
+    target_subjects: int = 0
+    batch_size: int = 0
+    dwell_generations: int = 0
+    autosave_interval: int = 0
+    queue_generations: int = 0
+    mean_duration: float = 0.0
+    throughput: float = 0.0
+    last_update: int = -1
+
+    def as_dict(self) -> dict[str, float | int | bool]:
+        return {
+            "enabled": self.enabled,
+            "target_subjects": int(self.target_subjects),
+            "batch_size": int(self.batch_size),
+            "dwell_generations": int(self.dwell_generations),
+            "autosave_interval": int(self.autosave_interval),
+            "queue_generations": int(self.queue_generations),
+            "mean_duration": float(self.mean_duration),
+            "throughput": float(self.throughput),
+            "last_update": int(self.last_update),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> HyperPerformanceProfile:
+        profile = cls(enabled=bool(payload.get("enabled", False)))
+        profile.target_subjects = int(payload.get("target_subjects", 0))
+        profile.batch_size = int(payload.get("batch_size", 0))
+        profile.dwell_generations = int(payload.get("dwell_generations", 0))
+        profile.autosave_interval = int(payload.get("autosave_interval", 0))
+        profile.queue_generations = int(payload.get("queue_generations", 0))
+        profile.mean_duration = float(payload.get("mean_duration", 0.0))
+        profile.throughput = float(payload.get("throughput", 0.0))
+        profile.last_update = int(payload.get("last_update", -1))
+        return profile
 
 
 @dataclass
@@ -174,6 +221,7 @@ class EvolutionSession:
     best_overlap: float = 0.0
     plateau_generations: int = 0
     mutation_boost: int = 0
+    hyper_profile: dict[str, Any] | None = None
 
 
 @dataclass
@@ -213,9 +261,19 @@ class EvolutionManager:
         self.original = np.asarray(original, dtype=np.float32)
         self.encoder = encoder
         self.decoder = decoder
-        self.population_size = max(1, int(population_size))
+        self._hyper_enabled = self.hyper_mode_enabled()
+        if self._hyper_enabled:
+            baseline = self.default_hyper_profile()
+            batch_size = max(1, baseline.batch_size or int(population_size))
+            autosave = max(1, baseline.autosave_interval or int(autosave_interval))
+            self.population_size = batch_size
+            self.autosave_interval = autosave
+            self._hyper_profile = baseline
+        else:
+            self.population_size = max(1, int(population_size))
+            self.autosave_interval = max(1, int(autosave_interval))
+            self._hyper_profile = HyperPerformanceProfile(enabled=False)
         self.base_seed = int(base_seed)
-        self.autosave_interval = max(1, int(autosave_interval))
         self.generations: list[GenerationRecord] = []
         self.rng = np.random.default_rng(self.base_seed)
         self._parent_lineage: dict[int, ParentLineage] = {}
@@ -228,12 +286,44 @@ class EvolutionManager:
         self._best_overlap: float = 0.0
         self._plateau_generations: int = 0
         self._mutation_boost: int = 0
+        self._duration_ema: float = 0.0
+        self._throughput_ema: float = 0.0
 
     @property
     def mutation_boost(self) -> int:
         """Expose the number of additional exploratory candidates."""
 
         return self._mutation_boost
+
+    @staticmethod
+    def hyper_mode_enabled() -> bool:
+        """Return whether hyper performance mode is active via environment."""
+
+        return _env_flag("UMBRA_HYPER_MODE")
+
+    @staticmethod
+    def default_hyper_profile() -> HyperPerformanceProfile:
+        """Return the baseline hyper performance profile."""
+
+        if not EvolutionManager.hyper_mode_enabled():
+            return HyperPerformanceProfile(enabled=False)
+        return HyperPerformanceProfile(
+            enabled=True,
+            target_subjects=150,
+            batch_size=5,
+            dwell_generations=30,
+            autosave_interval=10,
+            queue_generations=30,
+            mean_duration=0.0,
+            throughput=0.0,
+            last_update=-1,
+        )
+
+    @property
+    def hyper_profile(self) -> HyperPerformanceProfile:
+        """Expose the most recent hyper performance recommendations."""
+
+        return self._hyper_profile
 
     @property
     def parent_lineage(self) -> list[ParentLineage]:
@@ -271,9 +361,9 @@ class EvolutionManager:
             self.encoder = encoder
         if decoder is not None:
             self.decoder = decoder
-        if population_size is not None:
+        if population_size is not None and not self._hyper_enabled:
             self.population_size = max(1, int(population_size))
-        if autosave_interval is not None:
+        if autosave_interval is not None and not self._hyper_enabled:
             self.autosave_interval = max(1, int(autosave_interval))
         logger.info(
             "Updated manager settings: population=%d autosave=%d",
@@ -442,6 +532,7 @@ class EvolutionManager:
 
         channel_axis = -1 if self.original.ndim == 3 else None
 
+        start_time = time.perf_counter()
         for seed in seeds:
             packet = self.encoder.encode(self.original, int(seed))
             reconstruction = self.decoder.decode(packet, int(seed))
@@ -511,6 +602,13 @@ class EvolutionManager:
         generation.difficulty_level = scheduled
         generation.improvement = improvement
         self.difficulty_trace.append(scheduled)
+        duration = time.perf_counter() - start_time
+        self._record_generation_duration(
+            duration=duration,
+            candidate_count=len(seeds),
+            difficulty=normalized_difficulty,
+            generation=generation,
+        )
         if self._reward_model is not None and feature_vectors:
             try:
                 feature_batch = np.vstack(feature_vectors).astype(np.float32)
@@ -551,6 +649,68 @@ class EvolutionManager:
         )
         self._handle_plateau(generation)
         return generation
+
+    def _record_generation_duration(
+        self,
+        *,
+        duration: float,
+        candidate_count: int,
+        difficulty: float,
+        generation: GenerationRecord,
+    ) -> None:
+        """Track throughput and update hyper tuning when enabled."""
+
+        if not self._hyper_enabled:
+            return
+
+        window = 0.2
+        if self._duration_ema <= 0.0:
+            self._duration_ema = duration
+        else:
+            self._duration_ema = (1.0 - window) * self._duration_ema + window * duration
+
+        subjects_per_second = candidate_count / max(duration, 1e-6)
+        if self._throughput_ema <= 0.0:
+            self._throughput_ema = subjects_per_second
+        else:
+            self._throughput_ema = (
+                (1.0 - window) * self._throughput_ema + window * subjects_per_second
+            )
+
+        difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        target_subjects = int(np.clip(round(140 + 60 * difficulty), 90, 220))
+        throughput_factor = float(np.clip(self._throughput_ema / 6.0, 0.0, 4.0))
+        batch_size = int(
+            np.clip(
+                round(5 + difficulty * 7 + throughput_factor),
+                5,
+                24,
+            )
+        )
+        dwell_generations = int(
+            np.clip(
+                np.ceil(target_subjects / max(batch_size, 1)),
+                18,
+                90,
+            )
+        )
+        autosave_interval = int(np.clip(max(dwell_generations // 4, 6), 6, 40))
+        queue_generations = int(np.clip(dwell_generations, 6, 120))
+
+        self._hyper_profile = HyperPerformanceProfile(
+            enabled=True,
+            target_subjects=target_subjects,
+            batch_size=batch_size,
+            dwell_generations=dwell_generations,
+            autosave_interval=autosave_interval,
+            queue_generations=queue_generations,
+            mean_duration=self._duration_ema,
+            throughput=self._throughput_ema,
+            last_update=generation.index,
+        )
+
+        self.population_size = max(1, batch_size)
+        self.autosave_interval = max(1, autosave_interval)
 
     def _handle_plateau(self, generation: GenerationRecord) -> None:
         """Adjust exploration and precision when progress stalls."""
@@ -704,6 +864,9 @@ class EvolutionManager:
             best_overlap=float(self._best_overlap),
             plateau_generations=int(self._plateau_generations),
             mutation_boost=int(self._mutation_boost),
+            hyper_profile=(
+                self._hyper_profile.as_dict() if self._hyper_profile.enabled else None
+            ),
         )
 
     def save(self, directory: str | Path) -> Path:
@@ -817,6 +980,20 @@ class EvolutionManager:
         manager._best_overlap = float(getattr(session, "best_overlap", 0.0))
         manager._plateau_generations = int(getattr(session, "plateau_generations", 0))
         manager._mutation_boost = int(getattr(session, "mutation_boost", 0))
+        saved_profile = getattr(session, "hyper_profile", None)
+        if saved_profile and manager._hyper_enabled:
+            try:
+                profile = HyperPerformanceProfile.from_dict(dict(saved_profile))
+            except Exception:  # pragma: no cover - corrupted saves fall back to defaults
+                logger.debug("Failed to restore hyper profile", exc_info=True)
+                profile = manager.default_hyper_profile()
+            manager._hyper_profile = profile
+            if profile.batch_size > 0:
+                manager.population_size = max(1, profile.batch_size)
+            if profile.autosave_interval > 0:
+                manager.autosave_interval = max(1, profile.autosave_interval)
+        manager._duration_ema = float(getattr(manager._hyper_profile, "mean_duration", 0.0))
+        manager._throughput_ema = float(getattr(manager._hyper_profile, "throughput", 0.0))
         if advisor is None and advisor_state is None:
             manager._reward_model = None
         return manager
@@ -830,4 +1007,5 @@ __all__ = [
     "normalize_difficulty",
     "compute_image_signature",
     "ParentLineage",
+    "HyperPerformanceProfile",
 ]

@@ -19,6 +19,7 @@ optional and disabled unless explicitly enabled.
 | `UMBRA_DIFFICULTY_LADDER_PERIOD` | `12` | Ladder period, in generations. |
 | `UMBRA_DIFFICULTY_LADDER_SPIKE_LEN` | `2` | Number of generations that use the spike value within each ladder period. |
 | `UMBRA_REWARD_MODE` | `strict` | Choose `strict` (overlap-weighted) or `perceptual_mix` (adds MS-SSIM and DCT correlation terms). |
+| `UMBRA_HYPER_MODE` | `0` | When set to `1`, enables hyper performance tuning that auto-sizes populations and dwell windows from runtime throughput and difficulty. |
 
 ## Export additions
 
@@ -27,6 +28,7 @@ optional and disabled unless explicitly enabled.
 * The `metrics` section distinguishes `global_pooled` and
   `per_candidate_strict` summaries.
 * The `difficulty` object exposes `raw`, `normalized`, and `target` values.
+* Hyper performance mode (when enabled) adds a `hyper_performance` block with throughput-aware recommendations.
 * `generation_progress.csv` includes `difficulty_raw`, `difficulty_normalized`,
   `reward_total`, `reward_overlap`, `reward_msssim`, `reward_dct_corr`, and
   `checkpoint_tag` (string markers for plateau kicks).

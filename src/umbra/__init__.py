@@ -2,7 +2,7 @@
 
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
-from .evolution import EvolutionManager, ParentLineage
+from .evolution import EvolutionManager, HyperPerformanceProfile, ParentLineage
 from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
 from .neural import NeuralRewardModel
@@ -27,6 +27,7 @@ __all__ = [
     "NoiseStreamDecoder",
     "EvolutionManager",
     "ParentLineage",
+    "HyperPerformanceProfile",
     "compute_metrics",
     "ReconstructionMetrics",
     "run_pipeline",
