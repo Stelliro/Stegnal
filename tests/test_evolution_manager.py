@@ -71,3 +71,27 @@ def test_neural_reward_model_learns_signal() -> None:
     prediction = model.predict(features[0])
     assert np.isfinite(prediction)
     assert prediction != 0.0
+
+
+def test_plateau_ramp_reduces_sigma_and_improves_overlap() -> None:
+    image = np.full((12, 12), 0.5, dtype=np.float32)
+    encoder = NoiseStreamEncoder(sigma=0.6)
+    decoder = NoiseStreamDecoder(denoise_sigma=1.0)
+    manager = EvolutionManager(
+        original=image,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=2,
+        base_seed=777,
+        autosave_interval=2,
+    )
+
+    initial_sigma = float(manager.encoder.sigma)
+    overlaps: list[float] = []
+    for _ in range(12):
+        generation = manager.run_generation()
+        overlaps.append(generation.best_candidate.overlap_score)
+
+    assert float(manager.encoder.sigma) < initial_sigma
+    assert max(overlaps) > overlaps[0]
+    assert manager.mutation_boost >= 0

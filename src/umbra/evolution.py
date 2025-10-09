@@ -72,6 +72,9 @@ class EvolutionSession:
     difficulty_trace: list[float] = field(default_factory=list)
     elite_seeds: list[int] = field(default_factory=list)
     advisor_state: dict[str, Any] | None = None
+    best_overlap: float = 0.0
+    plateau_generations: int = 0
+    mutation_boost: int = 0
 
 
 @dataclass
@@ -123,6 +126,15 @@ class EvolutionManager:
         self.lifetime_reward: float = 0.0
         self.reward_trace: list[float] = []
         self.difficulty_trace: list[float] = []
+        self._best_overlap: float = 0.0
+        self._plateau_generations: int = 0
+        self._mutation_boost: int = 0
+
+    @property
+    def mutation_boost(self) -> int:
+        """Expose the number of additional exploratory candidates."""
+
+        return self._mutation_boost
 
     @property
     def parent_lineage(self) -> list[ParentLineage]:
@@ -247,7 +259,7 @@ class EvolutionManager:
                 anchors.append(int(candidate.seed))
         anchors.extend(self._elite_pool)
         anchors = list(dict.fromkeys(anchors))
-        target_candidates = self.population_size + len(anchors)
+        target_candidates = self.population_size + len(anchors) + self._mutation_boost
         seen: set[int] = set()
         seeds: list[int] = []
 
@@ -358,7 +370,76 @@ class EvolutionManager:
             best.metrics.ssim,
             best.overlap_score,
         )
+        self._handle_plateau(generation)
         return generation
+
+    def _handle_plateau(self, generation: GenerationRecord) -> None:
+        """Adjust exploration and precision when progress stalls."""
+
+        best_overlap = float(generation.best_candidate.overlap_score)
+        tolerance = 1e-3
+        if best_overlap > self._best_overlap + tolerance:
+            self._best_overlap = best_overlap
+            self._plateau_generations = 0
+            if self._mutation_boost > 0:
+                self._mutation_boost = max(0, self._mutation_boost - 1)
+            logger.debug(
+                "Plateau reset at generation %d with overlap %.3f", generation.index, best_overlap
+            )
+            return
+
+        self._plateau_generations += 1
+        logger.debug(
+            "Plateau counter incremented to %d (overlap %.3f)",
+            self._plateau_generations,
+            best_overlap,
+        )
+        plateau_limit = self._carryover_generations + 2
+        if self._plateau_generations < plateau_limit:
+            return
+
+        self._plateau_generations = 0
+        self._mutation_boost = min(self._mutation_boost + 2, self.population_size * 3)
+        logger.info(
+            "Plateau detected; increasing mutation boost to %d and tightening precision",
+            self._mutation_boost,
+        )
+        self._apply_precision_ramp()
+
+    def _apply_precision_ramp(self) -> None:
+        """Reduce encode/decode noise to approach full reconstruction."""
+
+        encoder_sigma = getattr(self.encoder, "sigma", None)
+        if encoder_sigma is not None:
+            current_sigma = float(encoder_sigma)
+            target_sigma = max(current_sigma * 0.85, 0.01)
+            if target_sigma < current_sigma - 1e-5:
+                logger.info(
+                    "Precision ramp: encoder sigma adjusted from %.4f to %.4f",
+                    current_sigma,
+                    target_sigma,
+                )
+                encoder_cls = type(self.encoder)
+                try:
+                    self.encoder = encoder_cls(sigma=target_sigma)  # type: ignore[arg-type]
+                except TypeError:
+                    self.encoder = NoiseStreamEncoder(sigma=target_sigma)
+
+        decoder_sigma = getattr(self.decoder, "denoise_sigma", None)
+        if decoder_sigma is not None:
+            current_denoise = float(decoder_sigma)
+            target_denoise = max(current_denoise * 0.9, 0.03)
+            if target_denoise < current_denoise - 1e-5:
+                logger.info(
+                    "Precision ramp: decoder denoise sigma adjusted from %.4f to %.4f",
+                    current_denoise,
+                    target_denoise,
+                )
+                decoder_cls = type(self.decoder)
+                try:
+                    self.decoder = decoder_cls(denoise_sigma=target_denoise)  # type: ignore[arg-type]
+                except TypeError:
+                    self.decoder = NoiseStreamDecoder(denoise_sigma=target_denoise)
 
     def to_session(self) -> EvolutionSession:
         """Create a serializable snapshot of the manager."""
@@ -417,6 +498,9 @@ class EvolutionManager:
             advisor_state=(
                 self._reward_model.to_state() if self._reward_model is not None else None
             ),
+            best_overlap=float(self._best_overlap),
+            plateau_generations=int(self._plateau_generations),
+            mutation_boost=int(self._mutation_boost),
         )
 
     def save(self, directory: str | Path) -> Path:
@@ -520,6 +604,9 @@ class EvolutionManager:
         manager.reward_trace = list(getattr(session, "reward_trace", []))
         manager.difficulty_trace = list(getattr(session, "difficulty_trace", []))
         manager._elite_pool = list(getattr(session, "elite_seeds", []))
+        manager._best_overlap = float(getattr(session, "best_overlap", 0.0))
+        manager._plateau_generations = int(getattr(session, "plateau_generations", 0))
+        manager._mutation_boost = int(getattr(session, "mutation_boost", 0))
         if advisor is None and advisor_state is None:
             manager._reward_model = None
         return manager
