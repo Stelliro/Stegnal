@@ -112,7 +112,6 @@ def _activate_tree(state: st.session_state, tree_id: str) -> None:
     state["evolution_signature"] = entry["signature"]
     state["run_infinite"] = entry.get("run_infinite", False)
     state["pending_generations"] = entry.get("pending", 0)
-    state["active_tree_select"] = tree_id
     meta = dict(entry.get("metadata", {}))
     if "shared_seed" in meta:
         state["shared_seed"] = int(meta["shared_seed"])
@@ -267,7 +266,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         "sample_rate": int(scene["sample_rate"]),
         "resolution": int(scene["resolution"]),
     }
-    tree_id = _register_tree(
+    _register_tree(
         state,
         manager,
         label=label,
@@ -280,7 +279,6 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     state["pending_generations"] = 0
     state["run_infinite"] = False
     _sync_active_tree_state(state)
-    st.session_state["active_tree_select"] = tree_id
     st.sidebar.success("Loaded autosaved evolution session.")
     logger.info(
         "Restored autosave from %s with %d generations",
@@ -1110,13 +1108,11 @@ def run() -> None:
         if active_tree_id not in forest:
             active_tree_id = tree_ids[0]
             _activate_tree(state, active_tree_id)
-        state.setdefault("active_tree_select", active_tree_id)
         selected_tree_id = st.sidebar.selectbox(
             "Evolution tree",
             tree_ids,
             index=tree_ids.index(active_tree_id),
             format_func=lambda tid: _format_tree_label(forest[tid]),
-            key="active_tree_select",
         )
         if selected_tree_id != active_tree_id:
             _activate_tree(state, selected_tree_id)
@@ -1124,9 +1120,6 @@ def run() -> None:
         st.sidebar.caption(
             "Switch between stored evolution branches to revisit previous sound scenes."
         )
-    else:
-        state.pop("active_tree_select", None)
-
     new_tree_requested = st.sidebar.button(
         "Create new evolution tree",
         key="spawn_new_tree",
@@ -1446,7 +1439,6 @@ def run() -> None:
         state["difficulty"] = 0.0
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
-        state.pop("active_tree_select", None)
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
@@ -1456,7 +1448,6 @@ def run() -> None:
         state.pop("adaptive_scene", None)
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
-        state.pop("active_tree_select", None)
 
     tree_label = _default_tree_label(sound_seed, current_resolution, current_sample_rate)
     force_new_tree = bool(state.pop("_spawn_new_tree_requested", False))
