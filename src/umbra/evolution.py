@@ -50,7 +50,10 @@ class GenerationRecord:
 
     @property
     def best_candidate(self) -> CandidateResult:
-        return max(self.candidates, key=lambda cand: cand.metrics.ssim)
+        return max(
+            self.candidates,
+            key=lambda cand: (cand.overlap_score, cand.metrics.ssim, cand.reward),
+        )
 
 
 @dataclass
@@ -229,16 +232,39 @@ class EvolutionManager:
         self._elite_pool = [candidate.seed for candidate in ranked[:elite_count]]
 
     def _difficulty_from_generation(
-        self, generation: GenerationRecord, previous_best_ssim: float
+        self,
+        generation: GenerationRecord,
+        previous_best_ssim: float,
+        previous_best_overlap: float,
     ) -> tuple[float, float]:
         best = generation.best_candidate
         overlap_norm = float(np.clip(best.overlap_score / 100.0, 0.0, 1.0))
         ssim = float(np.clip(best.metrics.ssim, 0.0, 1.0))
-        improvement = float(max(ssim - previous_best_ssim, 0.0))
-        reward_signal = float(np.clip(generation.reward_peak / 5.0, 0.0, 1.5))
-        difficulty = 0.3 * overlap_norm + 0.35 * ssim + 0.2 * reward_signal + 0.15 * improvement
+        overlap_improvement = float(
+            max(best.overlap_score - previous_best_overlap, 0.0) / 100.0
+        )
+        ssim_improvement = float(max(ssim - previous_best_ssim, 0.0))
+        improvement = max(overlap_improvement, ssim_improvement)
+        reward_signal = float(np.clip(generation.reward_peak / 6.0, 0.0, 1.0))
+
+        difficulty = (
+            0.45 * overlap_norm
+            + 0.25 * ssim
+            + 0.2 * reward_signal
+            + 0.1 * improvement
+        )
+
         if overlap_norm >= 0.4:
-            difficulty += 0.2 * (overlap_norm - 0.4)
+            difficulty += 0.15 * (overlap_norm - 0.4)
+        if overlap_improvement > 0.0:
+            difficulty += 0.1 * min(overlap_improvement, 0.2)
+
+        previous_difficulty = self.difficulty_trace[-1] if self.difficulty_trace else 0.0
+        if best.overlap_score >= previous_best_overlap:
+            difficulty = max(difficulty, previous_difficulty)
+        else:
+            difficulty = max(difficulty, previous_difficulty * 0.9)
+
         return float(np.clip(difficulty, 0.0, 1.25)), improvement
 
     def run_generation(self, parent_selection: Sequence[int] | None = None) -> GenerationRecord:
@@ -283,8 +309,12 @@ class EvolutionManager:
             len(seeds) - len(anchors),
         )
 
+        previous_best_candidate = self.generations[-1].best_candidate if self.generations else None
         previous_best_ssim = (
-            self.generations[-1].best_candidate.metrics.ssim if self.generations else 0.0
+            previous_best_candidate.metrics.ssim if previous_best_candidate else 0.0
+        )
+        previous_best_overlap = (
+            previous_best_candidate.overlap_score if previous_best_candidate else 0.0
         )
         feature_vectors: list[np.ndarray] = []
         rewards: list[float] = []
@@ -327,7 +357,7 @@ class EvolutionManager:
         self.reward_trace.append(float(generation.reward_summary))
         self._update_elite_pool(generation)
         difficulty_level, improvement = self._difficulty_from_generation(
-            generation, previous_best_ssim
+            generation, previous_best_ssim, previous_best_overlap
         )
         generation.difficulty_level = difficulty_level
         generation.improvement = improvement

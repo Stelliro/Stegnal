@@ -114,3 +114,25 @@ def test_perfect_overlap_is_reachable_with_zero_noise() -> None:
     best = generation.best_candidate
     assert best.overlap_score > 99.9
     assert np.allclose(best.reconstruction.astype(np.float32), image, atol=1e-3)
+
+
+def test_difficulty_respects_overlap_improvement() -> None:
+    image = np.linspace(0.0, 1.0, 256, dtype=np.float32).reshape(16, 16)
+    encoder = NoiseStreamEncoder(sigma=0.9)
+    decoder = NoiseStreamDecoder(denoise_sigma=1.2)
+    manager = EvolutionManager(
+        original=image,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=1,
+        base_seed=31415,
+        autosave_interval=1,
+    )
+
+    first = manager.run_generation()
+    manager.encoder.sigma = 0.0
+    manager.decoder.denoise_sigma = 0.0
+    second = manager.run_generation()
+
+    assert second.best_candidate.overlap_score >= first.best_candidate.overlap_score
+    assert second.difficulty_level >= first.difficulty_level

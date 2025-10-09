@@ -1673,8 +1673,9 @@ def run() -> None:
 
     with overview_tab:
         st.write(
-            "The overlap score multiplies the normalized original and reconstructed pixels,"
-            " providing a quick proxy for how much of the signal is mutually present."
+            "The overlap score measures agreement as ``1 - |original - reconstruction|``,"
+            " so a perfect match reaches 100% while gaps in the prediction reduce the"
+            " percentage."
         )
 
         st.subheader("Shape guessing AI")
