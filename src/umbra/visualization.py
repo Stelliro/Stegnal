@@ -55,7 +55,14 @@ def normalize_for_display(array: np.ndarray) -> np.ndarray:
 def multiplicative_overlap(
     original: np.ndarray, reconstructed: np.ndarray
 ) -> tuple[np.ndarray, float]:
-    """Compute a multiplicative overlap map and its mean percentage score.
+    """Compute an agreement map and percentage score for two normalized images.
+
+    The previous implementation multiplied both images together which caused even
+    perfect reconstructions to cap well below 100% for natural scenes.  The new
+    formulation treats the overlap map as ``1 - |original - reconstructed|`` so a
+    perfect match yields ones everywhere and therefore a 100% score.  Values are
+    clipped to the [0, 1] interval which keeps the behaviour stable for inputs
+    that may slightly exceed the nominal range due to noise.
 
     Parameters
     ----------
@@ -67,7 +74,7 @@ def multiplicative_overlap(
     Returns
     -------
     overlap_map:
-        Element-wise product of ``original`` and ``reconstructed`` clipped to [0, 1].
+        Agreement intensity for each pixel expressed in [0, 1].
     score:
         Mean value of the overlap map expressed as a percentage in [0, 100].
     """
@@ -77,11 +84,13 @@ def multiplicative_overlap(
     if cp is not None and original.size >= 65_536:  # pragma: no branch - runtime check
         orig_gpu = cp.asarray(original, dtype=cp.float32)
         recon_gpu = cp.asarray(reconstructed, dtype=cp.float32)
-        overlap_gpu = cp.clip(orig_gpu * recon_gpu, 0.0, 1.0)
+        diff_gpu = cp.abs(orig_gpu - recon_gpu)
+        overlap_gpu = cp.clip(1.0 - diff_gpu, 0.0, 1.0)
         score = float(cp.mean(overlap_gpu).get() * 100.0)
         overlap = cp.asnumpy(overlap_gpu)
     else:
-        overlap = np.clip(np.asarray(original) * np.asarray(reconstructed), 0.0, 1.0)
+        diff = np.abs(np.asarray(original, dtype=np.float32) - np.asarray(reconstructed, dtype=np.float32))
+        overlap = np.clip(1.0 - diff, 0.0, 1.0)
         score = float(overlap.mean() * 100.0)
     return overlap.astype(np.float32), score
 

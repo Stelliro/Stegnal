@@ -95,3 +95,22 @@ def test_plateau_ramp_reduces_sigma_and_improves_overlap() -> None:
     assert float(manager.encoder.sigma) < initial_sigma
     assert max(overlaps) > overlaps[0]
     assert manager.mutation_boost >= 0
+
+
+def test_perfect_overlap_is_reachable_with_zero_noise() -> None:
+    image = np.linspace(0.0, 1.0, 64, dtype=np.float32).reshape(8, 8)
+    encoder = NoiseStreamEncoder(sigma=0.0)
+    decoder = NoiseStreamDecoder(denoise_sigma=0.0)
+    manager = EvolutionManager(
+        original=image,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=1,
+        base_seed=2024,
+        autosave_interval=1,
+    )
+
+    generation = manager.run_generation()
+    best = generation.best_candidate
+    assert best.overlap_score > 99.9
+    assert np.allclose(best.reconstruction.astype(np.float32), image, atol=1e-3)
