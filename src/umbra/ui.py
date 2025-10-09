@@ -26,6 +26,11 @@ from umbra.evolution import EvolutionManager, compute_image_signature
 from umbra.logging_utils import configure_logging
 from umbra.metrics import compute_metrics
 from umbra.progress import prepare_trend_chart, sanitize_progress_rows
+from umbra.reconstruction import (
+    ReconstructionResult,
+    run_reconstruction_cycle,
+    waveform_to_wav_bytes,
+)
 from umbra.sound import (
     ShapeGuess,
     generate_sound_art,
@@ -198,6 +203,202 @@ def _update_tree_label(state: st.session_state, label: str) -> None:
     if not forest or tree_id not in forest:
         return
     forest[tree_id]["label"] = label
+
+
+def _get_reconstruction_cache(state: st.session_state) -> dict[str, Any]:
+    """Access the memoized reconstruction lab state."""
+
+    return state.setdefault("_reconstruction_lab", {})
+
+
+def _store_reconstruction_result(
+    state: st.session_state, result: ReconstructionResult
+) -> None:
+    cache = _get_reconstruction_cache(state)
+    cache["result"] = result
+    cache["stored_at"] = time.time()
+
+
+def _render_reconstruction_result(result: ReconstructionResult) -> None:
+    st.markdown("### Reconstruction outcomes")
+    base_cols = st.columns(3)
+    base_cols[0].image(
+        to_uint8_image(result.base_image),
+        caption="Ground truth collage",
+        use_column_width=True,
+    )
+    base_cols[1].image(
+        to_uint8_image(result.ensemble_prediction),
+        caption="Ensemble prediction",
+        use_column_width=True,
+    )
+    base_cols[2].image(
+        to_uint8_image(result.hybrid_prediction),
+        caption="Hybrid fill (ensemble + audio)",
+        use_column_width=True,
+    )
+
+    comparison_cols = st.columns(2)
+    comparison_cols[0].image(
+        to_uint8_image(result.audio_reconstruction),
+        caption="Audio-derived reconstruction",
+        use_column_width=True,
+    )
+    overlay = colorize_comparison(result.base_image, result.hybrid_prediction)
+    comparison_cols[1].image(
+        to_uint8_image(overlay),
+        caption="Overlay vs. ground truth",
+        use_column_width=True,
+    )
+
+    diff = np.abs(result.base_image - result.hybrid_prediction)
+    st.image(
+        to_uint8_image(normalize_for_display(diff)),
+        caption="Residual difference heatmap",
+        use_column_width=True,
+    )
+
+    coverage_map = normalize_for_display(result.coverage)
+    coverage_rgb = np.stack(
+        [coverage_map, np.zeros_like(coverage_map), 1.0 - coverage_map],
+        axis=2,
+    )
+    st.image(
+        to_uint8_image(coverage_rgb),
+        caption="Coverage confidence (red = uncertain, blue = confident)",
+        use_column_width=True,
+    )
+
+    variation_count = result.variations.shape[0]
+    if variation_count > 0:
+        index = st.slider(
+            "Inspect noisy variation",
+            min_value=0,
+            max_value=variation_count - 1,
+            value=0,
+            key="reconstruction_variation_index",
+        )
+        st.image(
+            to_uint8_image(result.variations[index]),
+            caption=f"Variation sample {index + 1} of {variation_count}",
+            use_column_width=True,
+        )
+
+    try:
+        wav_bytes = waveform_to_wav_bytes(result.waveform, result.sample_rate)
+    except ValueError as exc:
+        st.warning(f"Unable to render waveform audio: {exc}")
+    else:
+        st.audio(wav_bytes, format="audio/wav")
+
+    shape_rows = [
+        {
+            "Shape": item.shape,
+            "Colour (RGB)": (
+                f"{item.color[0]:.2f}, {item.color[1]:.2f}, {item.color[2]:.2f}"
+            ),
+            "Centre": f"({item.center[0]}, {item.center[1]})",
+            "Rotation": f"{item.rotation:.1f}°",
+            "Size": item.size,
+        }
+        for item in result.shapes
+    ]
+    if shape_rows:
+        st.dataframe(pd.DataFrame(shape_rows), use_container_width=True)
+
+
+
+def _render_reconstruction_lab(
+    state: st.session_state, *, default_resolution: int, default_sample_rate: int
+) -> None:
+    cache = _get_reconstruction_cache(state)
+    default_seed = int(state.get("shared_seed", 0)) or 1
+
+    seed_value = int(cache.get("seed", default_seed))
+    variation_value = int(cache.get("variation_count", 6))
+    noise_value = float(cache.get("noise_sigma", 0.3))
+    dropout_value = float(cache.get("dropout_probability", 0.35))
+    sample_rate_value = int(cache.get("sample_rate", default_sample_rate))
+
+    seed = st.number_input(
+        "Collage seed",
+        value=seed_value,
+        min_value=1,
+        step=1,
+        key="reconstruction_seed",
+        help="Controls the random collage generator used for the reconstruction challenge.",
+    )
+    variation_count = st.slider(
+        "Number of noisy glimpses",
+        min_value=3,
+        max_value=15,
+        value=min(max(variation_value, 3), 15),
+        key="reconstruction_variations",
+        help="How many corrupted observations to blend before predicting the missing pixels.",
+    )
+    noise_sigma = st.slider(
+        "Noise amplitude",
+        min_value=0.05,
+        max_value=0.6,
+        value=float(np.clip(noise_value, 0.05, 0.6)),
+        step=0.05,
+        key="reconstruction_noise",
+        help="Standard deviation of the Gaussian noise added to each variation.",
+    )
+    dropout_probability = st.slider(
+        "Dropout probability",
+        min_value=0.05,
+        max_value=0.8,
+        value=float(np.clip(dropout_value, 0.05, 0.8)),
+        step=0.05,
+        key="reconstruction_dropout",
+        help="Likelihood that a pixel is replaced with unrelated noise in each glimpse.",
+    )
+    sample_rate = st.slider(
+        "Audio sample rate",
+        min_value=16_000,
+        max_value=64_000,
+        step=2_000,
+        value=int(np.clip(sample_rate_value, 16_000, 64_000)),
+        key="reconstruction_sample_rate",
+        help="Encoding rate for the collage-to-audio conversion stage.",
+    )
+
+    run_experiment = st.button(
+        "Run reconstruction experiment",
+        key="reconstruction_run",
+    )
+
+    if run_experiment:
+        try:
+            result = run_reconstruction_cycle(
+                int(seed),
+                resolution=(default_resolution, default_resolution),
+                variation_count=int(variation_count),
+                noise_sigma=float(noise_sigma),
+                dropout_probability=float(dropout_probability),
+                sample_rate=int(sample_rate),
+            )
+        except ValueError as exc:
+            st.error(f"Failed to run reconstruction experiment: {exc}")
+        else:
+            cache.update(
+                {
+                    "seed": int(seed),
+                    "variation_count": int(variation_count),
+                    "noise_sigma": float(noise_sigma),
+                    "dropout_probability": float(dropout_probability),
+                    "sample_rate": int(sample_rate),
+                }
+            )
+            _store_reconstruction_result(state, result)
+            st.success("Reconstruction experiment completed; review the outcomes below.")
+
+    cached_result = cache.get("result")
+    if isinstance(cached_result, ReconstructionResult):
+        _render_reconstruction_result(cached_result)
+    else:
+        st.caption("Run the reconstruction experiment to visualise predictions.")
 
 
 def _update_difficulty(state: st.session_state, latest_overlap: float) -> float:
@@ -1660,6 +1861,13 @@ def run() -> None:
                 st.caption(
                     "Upload a WAV file to derive a scene and compare it against the selected evolution branch."
                 )
+
+        with st.expander("Noise reconstruction lab", expanded=False):
+            _render_reconstruction_lab(
+                state,
+                default_resolution=current_resolution,
+                default_sample_rate=int(state.get("current_sound_sample_rate", 48_000)),
+            )
 
         st.subheader("Generation gallery")
         cols_per_row = min(4, len(generation.candidates))
