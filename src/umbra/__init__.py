@@ -5,6 +5,7 @@ from .encoding import NoisePacket, NoiseStreamEncoder
 from .evolution import EvolutionManager, ParentLineage
 from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
+from .neural import NeuralRewardModel
 from .pipeline import PipelineResult, replay_packet, run_pipeline
 from .reconstruction import (
     GeneratedShape,
@@ -35,6 +36,7 @@ __all__ = [
     "colorize_comparison",
     "normalize_for_display",
     "configure_logging",
+    "NeuralRewardModel",
     "GeneratedShape",
     "ReconstructionResult",
     "blend_predictions",

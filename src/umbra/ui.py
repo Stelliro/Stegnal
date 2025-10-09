@@ -25,6 +25,7 @@ from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, GenerationRecord, compute_image_signature
 from umbra.logging_utils import configure_logging
 from umbra.metrics import compute_metrics
+from umbra.neural import NeuralRewardModel
 from umbra.progress import prepare_trend_chart, sanitize_progress_rows
 from umbra.reconstruction import (
     ReconstructionResult,
@@ -620,6 +621,13 @@ def _ensure_manager(
         population_size=population_size,
         autosave_interval=autosave_interval,
     )
+    engine_mode = state.get("_active_evolution_engine", "Lineage & noise (classic)")
+    if engine_mode == "Neural lineage fusion":
+        advisor = manager.reward_advisor
+        if not isinstance(advisor, NeuralRewardModel):
+            manager.set_advisor(NeuralRewardModel())
+    else:
+        manager.set_advisor(None)
     entry["manager"] = manager
     entry["signature"] = signature
     state["evolution_manager"] = manager
@@ -1231,6 +1239,11 @@ def run() -> None:
     state.setdefault("difficulty_volatility", 0.0)
     state.setdefault("difficulty_reward", 0.0)
     state.setdefault("difficulty_reward_points", 0.0)
+    state.setdefault("latest_generation_reward", 0.0)
+    state.setdefault("latest_generation_peak", 0.0)
+    state.setdefault("latest_generation_difficulty", 0.0)
+    state.setdefault("latest_generation_improvement", 0.0)
+    state.setdefault("latest_lifetime_reward", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
     state.setdefault("evolution_trees", {})
     state.setdefault("active_parent_seeds", [])
@@ -1238,6 +1251,7 @@ def run() -> None:
         state.pop("active_tree_id", None)
     state.setdefault("_active_image_model", next(iter(_IMAGE_MODEL_PRESETS)))
     state.setdefault("_active_sound_model", next(iter(_SOUND_MODEL_PRESETS)))
+    state.setdefault("_active_evolution_engine", "Lineage & noise (classic)")
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
@@ -1303,6 +1317,32 @@ def run() -> None:
         state["sound_target_dwell"] = int(preset["target_dwell"])
         state["last_sound_target_dwell"] = int(preset["target_dwell"])
         state["sound_generations_left"] = int(preset["target_dwell"])
+
+    evolution_engines = [
+        "Lineage & noise (classic)",
+        "Neural lineage fusion",
+    ]
+    current_engine = state.get("_active_evolution_engine", evolution_engines[0])
+    engine_index = evolution_engines.index(current_engine) if current_engine in evolution_engines else 0
+    with model_box:
+        selected_engine = st.selectbox(
+            "Evolution engine",
+            evolution_engines,
+            index=engine_index,
+            key="evolution_engine_select",
+        )
+        if selected_engine == "Neural lineage fusion":
+            st.caption(
+                "Neural advisor boosts high performers while preserving elite lineages for"
+                " deep selective breeding."
+            )
+        else:
+            st.caption(
+                "Classic stochastic evolution that prioritises lineage parents and their"
+                " direct noise descendants."
+            )
+    if state.get("_active_evolution_engine") != selected_engine:
+        state["_active_evolution_engine"] = selected_engine
 
     difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
 
@@ -1562,7 +1602,12 @@ def run() -> None:
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
     max_overlap_so_far = float(state["max_overlap_seen"])
-    reward_points = float(state.get("difficulty_reward_points", 0.0))
+    reward_points = float(
+        max(
+            state.get("difficulty_reward_points", 0.0),
+            state.get("latest_lifetime_reward", 0.0),
+        )
+    )
     if overlap_pct >= 40.0:
         reward_points += float(
             np.interp(overlap_pct, [40.0, 60.0, 100.0], [1.0, 3.0, 5.0])
@@ -1578,8 +1623,19 @@ def run() -> None:
     target_progress, improvement_signal, volatility_signal, reward_signal = _derive_difficulty_metrics(
         history
     )
+    generation_difficulty = float(
+        np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
+    )
+    improvement_signal = max(
+        improvement_signal,
+        float(np.clip(state.get("latest_generation_improvement", 0.0), 0.0, 1.0)),
+    )
+    reward_signal = max(
+        reward_signal,
+        float(np.clip(state.get("latest_generation_peak", 0.0) / 5.0, 0.0, 1.0)),
+    )
     reseed_progress = min(1.0, state.get("sound_reseed_count", 0) / 10.0)
-    blended_target = max(target_progress, reseed_progress)
+    blended_target = max(target_progress, reseed_progress, generation_difficulty)
     previous_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
     updated_progress = float(
         np.clip(0.6 * previous_progress + 0.4 * blended_target, 0.0, 1.0)
@@ -1598,7 +1654,7 @@ def run() -> None:
         trend_cols = st.columns(2)
         trend_cols[0].metric("Difficulty momentum", f"{momentum:.1f} pts")
         trend_cols[1].metric("Difficulty range", f"{variability:.1f} pts")
-        reward_cols = st.columns(2)
+        reward_cols = st.columns(3)
         reward_cols[0].metric(
             "High-overlap reward",
             f"{float(state.get('difficulty_reward', 0.0)) * 100:.0f} pts",
@@ -1608,6 +1664,11 @@ def run() -> None:
             "Lifetime reward",
             f"{state.get('difficulty_reward_points', 0.0):.1f} pts",
             help="Cumulative bonus reflecting consistently strong overlap scores.",
+        )
+        reward_cols[2].metric(
+            "Generation bonus",
+            f"{state.get('latest_generation_reward', 0.0):.2f}",
+            help="Average reward captured across the most recent generation.",
         )
 
     with overview_tab:
@@ -1807,6 +1868,9 @@ def run() -> None:
                     "Generation": entry.origin_generation,
                     "SSIM": f"{entry.metrics.ssim:.3f}",
                     "Overlap (%)": f"{entry.overlap_score:.1f}",
+                    "Appearances": entry.appearances,
+                    "Reward": f"{entry.cumulative_reward:.2f}",
+                    "Peak reward": f"{entry.peak_reward:.2f}",
                     "Active": "★" if entry.seed in active_parent_set else "",
                 }
                 for entry in parent_entries
@@ -1852,6 +1916,17 @@ def run() -> None:
             parent_selection = selection if selection else None
             generation = manager.run_generation(parent_selection=parent_selection)
             _refresh_active_parents(state, manager, generation)
+            state["latest_generation_reward"] = float(generation.reward_summary)
+            state["latest_generation_peak"] = float(generation.reward_peak)
+            state["latest_generation_difficulty"] = float(generation.difficulty_level)
+            state["latest_generation_improvement"] = float(generation.improvement)
+            state["difficulty_reward_points"] = float(manager.lifetime_reward)
+            state["latest_lifetime_reward"] = float(manager.lifetime_reward)
+            reward_signal = float(np.clip(generation.reward_peak / 5.0, 0.0, 1.0))
+            state["difficulty_reward"] = max(
+                float(state.get("difficulty_reward", 0.0)),
+                reward_signal,
+            )
             generations_ran += 1
             if finite_batch:
                 state["pending_generations"] = max(
@@ -1926,6 +2001,10 @@ def run() -> None:
                     "Best SSIM": _finite_or_none(record.best_candidate.metrics.ssim),
                     "Best PSNR": _finite_or_none(record.best_candidate.metrics.psnr),
                     "Best overlap": _finite_or_none(record.best_candidate.overlap_score),
+                    "Avg reward": _finite_or_none(record.reward_summary),
+                    "Peak reward": _finite_or_none(record.reward_peak),
+                    "Difficulty": _finite_or_none(record.difficulty_level),
+                    "Lifetime reward": _finite_or_none(record.cumulative_reward),
                 }
                 for record in manager.generations
             ]
@@ -1975,6 +2054,15 @@ def run() -> None:
             best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
             best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
             st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
+            reward_cols = st.columns(2)
+            reward_cols[0].metric(
+                "Generation reward", f"{generation.reward_summary:.2f}",
+                help="Mean reward achieved across the generation's candidates.",
+            )
+            reward_cols[1].metric(
+                "Difficulty target", f"{generation.difficulty_level * 100:.0f}%",
+                help="Adaptive difficulty derived from reward and overlap performance.",
+            )
 
             st.subheader("Generation gallery")
             cols_per_row = min(4, len(generation.candidates))

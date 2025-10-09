@@ -3,6 +3,7 @@ import numpy as np
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
 from umbra.evolution import EvolutionManager
+from umbra.neural import NeuralRewardModel
 
 
 def test_evolution_manager_runs_multiple_generations() -> None:
@@ -26,6 +27,8 @@ def test_evolution_manager_runs_multiple_generations() -> None:
     best_metrics = [record.best_candidate.metrics for record in manager.generations]
     assert all(np.isfinite(metric.psnr) for metric in best_metrics)
     assert all(0.0 <= metric.ssim <= 1.0 for metric in best_metrics)
+    assert manager.lifetime_reward > 0.0
+    assert all(record.reward_summary >= 0.0 for record in manager.generations)
 
 
 def test_parent_lineage_retains_elites_and_children() -> None:
@@ -52,3 +55,19 @@ def test_parent_lineage_retains_elites_and_children() -> None:
     # ensure at least one parent seed persisted and new offspring were introduced
     assert parent_seeds.intersection(second_seeds)
     assert len(second_seeds) > len(parent_seeds.intersection(second_seeds))
+    lineage_map = {entry.seed: entry for entry in manager.parent_lineage}
+    lineage_entry = lineage_map[second_generation.best_candidate.seed]
+    assert lineage_entry.appearances >= 1
+    assert lineage_entry.cumulative_reward >= 0.0
+
+
+def test_neural_reward_model_learns_signal() -> None:
+    model = NeuralRewardModel(input_dim=5, hidden_layers=(8, 4), learning_rate=0.05, max_epochs=10)
+    rng = np.random.default_rng(5)
+    features = rng.random((32, 5), dtype=np.float32)
+    # Reward emphasises first and third feature components
+    rewards = 0.7 * features[:, 0] + 0.3 * features[:, 2]
+    model.update(features, rewards)
+    prediction = model.predict(features[0])
+    assert np.isfinite(prediction)
+    assert prediction != 0.0

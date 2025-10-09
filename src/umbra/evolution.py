@@ -8,6 +8,7 @@ import pickle
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -15,6 +16,9 @@ from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .metrics import ReconstructionMetrics, compute_metrics
 from .visualization import multiplicative_overlap
+
+if TYPE_CHECKING:  # pragma: no cover - optional neural advisor import
+    from .neural import NeuralRewardModel
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,9 @@ class CandidateResult:
     reconstruction: np.ndarray
     metrics: ReconstructionMetrics
     overlap_score: float
+    reward: float = 0.0
+    predicted_reward: float | None = None
+    feature_vector: tuple[float, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -35,6 +42,11 @@ class GenerationRecord:
 
     index: int
     candidates: list[CandidateResult] = field(default_factory=list)
+    reward_summary: float = 0.0
+    reward_peak: float = 0.0
+    cumulative_reward: float = 0.0
+    difficulty_level: float = 0.0
+    improvement: float = 0.0
 
     @property
     def best_candidate(self) -> CandidateResult:
@@ -55,6 +67,11 @@ class EvolutionSession:
     generations: list[GenerationRecord]
     rng_state: dict
     parent_lineage: list[ParentLineage] = field(default_factory=list)
+    lifetime_reward: float = 0.0
+    reward_trace: list[float] = field(default_factory=list)
+    difficulty_trace: list[float] = field(default_factory=list)
+    elite_seeds: list[int] = field(default_factory=list)
+    advisor_state: dict[str, Any] | None = None
 
 
 @dataclass
@@ -65,6 +82,10 @@ class ParentLineage:
     origin_generation: int
     metrics: ReconstructionMetrics
     overlap_score: float
+    appearances: int = 0
+    cumulative_reward: float = 0.0
+    peak_reward: float = 0.0
+    last_generation: int = -1
 
 
 def compute_image_signature(array: np.ndarray) -> str:
@@ -85,6 +106,7 @@ class EvolutionManager:
         population_size: int,
         base_seed: int,
         autosave_interval: int = 5,
+        advisor: NeuralRewardModel | None = None,
     ) -> None:
         self.original = np.asarray(original, dtype=np.float32)
         self.encoder = encoder
@@ -95,6 +117,12 @@ class EvolutionManager:
         self.generations: list[GenerationRecord] = []
         self.rng = np.random.default_rng(self.base_seed)
         self._parent_lineage: dict[int, ParentLineage] = {}
+        self._carryover_generations = 3
+        self._elite_pool: list[int] = []
+        self._reward_model: NeuralRewardModel | None = advisor
+        self.lifetime_reward: float = 0.0
+        self.reward_trace: list[float] = []
+        self.difficulty_trace: list[float] = []
 
     @property
     def parent_lineage(self) -> list[ParentLineage]:
@@ -105,6 +133,15 @@ class EvolutionManager:
     @property
     def image_signature(self) -> str:
         return compute_image_signature(self.original)
+
+    @property
+    def reward_advisor(self) -> NeuralRewardModel | None:
+        return self._reward_model
+
+    def set_advisor(self, advisor: NeuralRewardModel | None) -> None:
+        """Attach or detach a neural reward advisor."""
+
+        self._reward_model = advisor
 
     def update_settings(
         self,
@@ -147,6 +184,51 @@ class EvolutionManager:
         mutation = int(self.rng.integers(0, np.iinfo(np.int32).max))
         return (combined ^ mutation) & 0x7FFFFFFF
 
+    def _candidate_features(
+        self,
+        candidate: CandidateResult,
+        generation_index: int,
+        previous_best_ssim: float,
+    ) -> np.ndarray:
+        ssim = float(np.clip(candidate.metrics.ssim, 0.0, 1.0))
+        psnr_norm = float(np.clip(candidate.metrics.psnr / 50.0, 0.0, 1.0))
+        overlap_norm = float(np.clip(candidate.overlap_score / 100.0, 0.0, 1.0))
+        improvement = float(np.clip(ssim - previous_best_ssim, -1.0, 1.0))
+        depth = float(np.clip(generation_index / (generation_index + 6.0), 0.0, 1.0))
+        return np.array([ssim, psnr_norm, overlap_norm, improvement, depth], dtype=np.float32)
+
+    def _base_reward(self, features: np.ndarray) -> float:
+        ssim, psnr_norm, overlap_norm, improvement, depth = [float(v) for v in features]
+        positive_improvement = max(improvement, 0.0)
+        high_overlap_bonus = max(overlap_norm - 0.4, 0.0) * 1.6
+        reward = (
+            0.45 * ssim
+            + 0.2 * psnr_norm
+            + 0.25 * overlap_norm
+            + 0.2 * positive_improvement
+            + 0.1 * depth
+            + high_overlap_bonus
+        )
+        return float(np.clip(reward, 0.0, 5.0))
+
+    def _update_elite_pool(self, generation: GenerationRecord) -> None:
+        ranked = sorted(generation.candidates, key=lambda cand: cand.reward, reverse=True)
+        elite_count = max(3, self.population_size // 2)
+        self._elite_pool = [candidate.seed for candidate in ranked[:elite_count]]
+
+    def _difficulty_from_generation(
+        self, generation: GenerationRecord, previous_best_ssim: float
+    ) -> tuple[float, float]:
+        best = generation.best_candidate
+        overlap_norm = float(np.clip(best.overlap_score / 100.0, 0.0, 1.0))
+        ssim = float(np.clip(best.metrics.ssim, 0.0, 1.0))
+        improvement = float(max(ssim - previous_best_ssim, 0.0))
+        reward_signal = float(np.clip(generation.reward_peak / 5.0, 0.0, 1.5))
+        difficulty = 0.3 * overlap_norm + 0.35 * ssim + 0.2 * reward_signal + 0.15 * improvement
+        if overlap_norm >= 0.4:
+            difficulty += 0.2 * (overlap_norm - 0.4)
+        return float(np.clip(difficulty, 0.0, 1.25)), improvement
+
     def run_generation(self, parent_selection: Sequence[int] | None = None) -> GenerationRecord:
         """Evaluate a new generation and append it to the history.
 
@@ -157,11 +239,14 @@ class EvolutionManager:
             this generation. When omitted, the full stored lineage is used.
         """
 
-        anchors = list(
-            dict.fromkeys(
-                int(seed) for seed in (parent_selection or self._parent_lineage.keys())
-            )
-        )
+        lineage_seeds = list(self._parent_lineage.keys())
+        anchors = list(dict.fromkeys(int(seed) for seed in (parent_selection or lineage_seeds)))
+        recent_records = self.generations[-self._carryover_generations :]
+        for record in recent_records:
+            for candidate in record.candidates:
+                anchors.append(int(candidate.seed))
+        anchors.extend(self._elite_pool)
+        anchors = list(dict.fromkeys(anchors))
         target_candidates = self.population_size + len(anchors)
         seen: set[int] = set()
         seeds: list[int] = []
@@ -186,6 +271,12 @@ class EvolutionManager:
             len(seeds) - len(anchors),
         )
 
+        previous_best_ssim = (
+            self.generations[-1].best_candidate.metrics.ssim if self.generations else 0.0
+        )
+        feature_vectors: list[np.ndarray] = []
+        rewards: list[float] = []
+
         for seed in seeds:
             packet = self.encoder.encode(self.original, int(seed))
             reconstruction = self.decoder.decode(packet, int(seed))
@@ -197,18 +288,68 @@ class EvolutionManager:
                 metrics=metrics,
                 overlap_score=float(overlap_score),
             )
+            features = self._candidate_features(candidate, generation.index, previous_best_ssim)
+            base_reward = self._base_reward(features)
+            predicted = None
+            if self._reward_model is not None:
+                try:
+                    predicted = float(self._reward_model.predict(features))
+                except Exception:  # pragma: no cover - advisor failures are non-fatal
+                    logger.debug("Neural reward prediction failed", exc_info=True)
+                    predicted = None
+            reward = base_reward if predicted is None else float(0.65 * base_reward + 0.35 * predicted)
+            reward = float(np.clip(reward, 0.0, 6.0))
+            candidate.reward = reward
+            candidate.predicted_reward = predicted
+            candidate.feature_vector = tuple(float(value) for value in features)
+            feature_vectors.append(features)
+            rewards.append(reward)
             generation.candidates.append(candidate)
 
         self.generations.append(generation)
+        if rewards:
+            generation.reward_summary = float(np.mean(rewards))
+            generation.reward_peak = float(np.max(rewards))
+            self.lifetime_reward += float(generation.reward_summary)
+        generation.cumulative_reward = float(self.lifetime_reward)
+        self.reward_trace.append(float(generation.reward_summary))
+        self._update_elite_pool(generation)
+        difficulty_level, improvement = self._difficulty_from_generation(
+            generation, previous_best_ssim
+        )
+        generation.difficulty_level = difficulty_level
+        generation.improvement = improvement
+        self.difficulty_trace.append(difficulty_level)
+        if self._reward_model is not None and feature_vectors:
+            try:
+                feature_batch = np.vstack(feature_vectors).astype(np.float32)
+                reward_batch = np.asarray(rewards, dtype=np.float32)
+                self._reward_model.update(feature_batch, reward_batch)
+            except Exception:  # pragma: no cover - advisor training is optional
+                logger.debug("Neural reward update failed", exc_info=True)
+
         for candidate in generation.candidates:
             record = self._parent_lineage.get(candidate.seed)
-            if record is None or candidate.metrics.ssim >= record.metrics.ssim:
+            if record is None:
                 self._parent_lineage[candidate.seed] = ParentLineage(
                     seed=candidate.seed,
                     origin_generation=generation.index,
                     metrics=candidate.metrics,
                     overlap_score=candidate.overlap_score,
+                    appearances=1,
+                    cumulative_reward=candidate.reward,
+                    peak_reward=candidate.reward,
+                    last_generation=generation.index,
                 )
+                continue
+
+            if candidate.metrics.ssim >= record.metrics.ssim:
+                record.metrics = candidate.metrics
+                record.overlap_score = candidate.overlap_score
+            record.appearances += 1
+            record.cumulative_reward = float(record.cumulative_reward + candidate.reward)
+            record.peak_reward = float(max(record.peak_reward, candidate.reward))
+            record.last_generation = generation.index
         best = generation.best_candidate
         logger.info(
             "Completed generation %d; best seed %d with SSIM %.3f and overlap %.2f",
@@ -229,12 +370,34 @@ class EvolutionManager:
                 compact_candidates.append(
                     CandidateResult(
                         seed=candidate.seed,
-                        reconstruction=np.asarray(candidate.reconstruction, dtype=np.float16),
+                        reconstruction=np.asarray(
+                            candidate.reconstruction, dtype=np.float16
+                        ),
                         metrics=candidate.metrics,
                         overlap_score=candidate.overlap_score,
+                        reward=float(getattr(candidate, "reward", 0.0)),
+                        predicted_reward=(
+                            None
+                            if getattr(candidate, "predicted_reward", None) is None
+                            else float(candidate.predicted_reward)
+                        ),
+                        feature_vector=tuple(
+                            float(value)
+                            for value in getattr(candidate, "feature_vector", tuple())
+                        ),
                     )
                 )
-            compact_generations.append(GenerationRecord(index=record.index, candidates=compact_candidates))
+            compact_generations.append(
+                GenerationRecord(
+                    index=record.index,
+                    candidates=compact_candidates,
+                    reward_summary=float(getattr(record, "reward_summary", 0.0)),
+                    reward_peak=float(getattr(record, "reward_peak", 0.0)),
+                    cumulative_reward=float(getattr(record, "cumulative_reward", 0.0)),
+                    difficulty_level=float(getattr(record, "difficulty_level", 0.0)),
+                    improvement=float(getattr(record, "improvement", 0.0)),
+                )
+            )
 
         return EvolutionSession(
             image_signature=self.image_signature,
@@ -247,6 +410,13 @@ class EvolutionManager:
             generations=compact_generations,
             rng_state=self.rng.bit_generator.state,
             parent_lineage=list(self._parent_lineage.values()),
+            lifetime_reward=float(self.lifetime_reward),
+            reward_trace=list(self.reward_trace),
+            difficulty_trace=list(self.difficulty_trace),
+            elite_seeds=list(self._elite_pool),
+            advisor_state=(
+                self._reward_model.to_state() if self._reward_model is not None else None
+            ),
         )
 
     def save(self, directory: str | Path) -> Path:
@@ -289,18 +459,50 @@ class EvolutionManager:
                 restored_candidates.append(
                     CandidateResult(
                         seed=candidate.seed,
-                        reconstruction=np.asarray(candidate.reconstruction, dtype=np.float32),
+                        reconstruction=np.asarray(
+                            candidate.reconstruction, dtype=np.float32
+                        ),
                         metrics=candidate.metrics,
                         overlap_score=candidate.overlap_score,
+                        reward=float(getattr(candidate, "reward", 0.0)),
+                        predicted_reward=(
+                            None
+                            if getattr(candidate, "predicted_reward", None) is None
+                            else float(candidate.predicted_reward)
+                        ),
+                        feature_vector=tuple(
+                            float(value)
+                            for value in getattr(candidate, "feature_vector", tuple())
+                        ),
                     )
                 )
-            restored_generations.append(GenerationRecord(index=record.index, candidates=restored_candidates))
+            restored_generations.append(
+                GenerationRecord(
+                    index=record.index,
+                    candidates=restored_candidates,
+                    reward_summary=float(getattr(record, "reward_summary", 0.0)),
+                    reward_peak=float(getattr(record, "reward_peak", 0.0)),
+                    cumulative_reward=float(getattr(record, "cumulative_reward", 0.0)),
+                    difficulty_level=float(getattr(record, "difficulty_level", 0.0)),
+                    improvement=float(getattr(record, "improvement", 0.0)),
+                )
+            )
 
         logger.info(
             "Loaded evolution session from %s with %d generations",
             path,
             len(restored_generations),
         )
+        advisor_state = getattr(session, "advisor_state", None)
+        advisor: NeuralRewardModel | None = None
+        if advisor_state is not None:
+            try:
+                from .neural import NeuralRewardModel
+
+                advisor = NeuralRewardModel.from_state(advisor_state)
+            except Exception:  # pragma: no cover - advisor restoration is optional
+                logger.debug("Failed to restore neural advisor", exc_info=True)
+
         manager = cls(
             original=original,
             encoder=encoder,
@@ -308,11 +510,18 @@ class EvolutionManager:
             population_size=session.population_size,
             base_seed=session.base_seed,
             autosave_interval=session.autosave_interval,
+            advisor=advisor,
         )
         manager.generations = restored_generations
         manager.rng.bit_generator.state = session.rng_state
         lineage = getattr(session, "parent_lineage", [])
         manager._parent_lineage = {entry.seed: entry for entry in lineage}
+        manager.lifetime_reward = float(getattr(session, "lifetime_reward", 0.0))
+        manager.reward_trace = list(getattr(session, "reward_trace", []))
+        manager.difficulty_trace = list(getattr(session, "difficulty_trace", []))
+        manager._elite_pool = list(getattr(session, "elite_seeds", []))
+        if advisor is None and advisor_state is None:
+            manager._reward_model = None
         return manager
 
 
