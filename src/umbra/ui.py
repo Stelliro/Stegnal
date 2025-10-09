@@ -1225,13 +1225,14 @@ def run() -> None:
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
-    st.sidebar.header("Input & Parameters")
-    autosave_input = st.sidebar.text_input(
-        "Autosave directory",
-        value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
-        help="Evolution checkpoints are saved here as evolution_state.pkl.",
-        key="autosave_dir",
-    )
+    session_box = st.sidebar.expander("Session & autosave", expanded=False)
+    with session_box:
+        autosave_input = st.text_input(
+            "Autosave directory",
+            value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
+            help="Evolution checkpoints are saved here as evolution_state.pkl.",
+            key="autosave_dir",
+        )
     autosave_dir = Path(autosave_input).expanduser()
     normalized_autosave_dir = str(autosave_dir)
     if state.get("last_autosave_dir") != normalized_autosave_dir:
@@ -1244,32 +1245,40 @@ def run() -> None:
             _attempt_autoload(autosave_dir)
         state["autosave_checked"] = True
 
-    st.sidebar.subheader("Model presets")
+    with session_box:
+        load_button = st.button("Load autosave")
+        if load_button:
+            _attempt_autoload(autosave_dir)
+
+    model_box = st.sidebar.expander("Model presets", expanded=False)
     image_model_names = list(_IMAGE_MODEL_PRESETS.keys())
     current_image_model = state.get("_active_image_model", image_model_names[0])
     image_model_index = image_model_names.index(current_image_model)
-    selected_image_model = st.sidebar.selectbox(
-        "Image evolution preset",
-        image_model_names,
-        index=image_model_index,
-        key="image_model_select",
-    )
+    with model_box:
+        selected_image_model = st.selectbox(
+            "Image evolution preset",
+            image_model_names,
+            index=image_model_index,
+            key="image_model_select",
+        )
+        st.caption(_IMAGE_MODEL_PRESETS[selected_image_model]["description"])
     if state.get("_active_image_model") != selected_image_model:
         preset = _IMAGE_MODEL_PRESETS[selected_image_model]
         state["_active_image_model"] = selected_image_model
         state["encoder_sigma_base"] = float(preset["encoder_sigma"])
         state["decoder_sigma_base"] = float(preset["decoder_sigma"])
-    st.sidebar.caption(_IMAGE_MODEL_PRESETS[selected_image_model]["description"])
 
     sound_model_names = list(_SOUND_MODEL_PRESETS.keys())
     current_sound_model = state.get("_active_sound_model", sound_model_names[0])
     sound_model_index = sound_model_names.index(current_sound_model)
-    selected_sound_model = st.sidebar.selectbox(
-        "Sound scene preset",
-        sound_model_names,
-        index=sound_model_index,
-        key="sound_model_select",
-    )
+    with model_box:
+        selected_sound_model = st.selectbox(
+            "Sound scene preset",
+            sound_model_names,
+            index=sound_model_index,
+            key="sound_model_select",
+        )
+        st.caption(_SOUND_MODEL_PRESETS[selected_sound_model]["description"])
     if state.get("_active_sound_model") != selected_sound_model:
         preset = _SOUND_MODEL_PRESETS[selected_sound_model]
         state["_active_sound_model"] = selected_sound_model
@@ -1278,25 +1287,25 @@ def run() -> None:
         state["sound_target_dwell"] = int(preset["target_dwell"])
         state["last_sound_target_dwell"] = int(preset["target_dwell"])
         state["sound_generations_left"] = int(preset["target_dwell"])
-    st.sidebar.caption(_SOUND_MODEL_PRESETS[selected_sound_model]["description"])
 
     difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
 
-    st.sidebar.subheader("Sound cadence")
-    target_dwell = int(
-        st.sidebar.number_input(
-            "Generations per sound target",
-            min_value=1,
-            max_value=500,
-            value=int(state.get("sound_target_dwell", 10)),
-            step=1,
-            key="sound_target_dwell",
-            help=(
-                "Number of evolution steps to spend matching the current sound-derived "
-                "image before refreshing it with a new randomised scene."
-            ),
+    sound_box = st.sidebar.expander("Sound cadence", expanded=False)
+    with sound_box:
+        target_dwell = int(
+            st.number_input(
+                "Generations per sound target",
+                min_value=1,
+                max_value=500,
+                value=int(state.get("sound_target_dwell", 10)),
+                step=1,
+                key="sound_target_dwell",
+                help=(
+                    "Number of evolution steps to spend matching the current sound-derived "
+                    "image before refreshing it with a new randomised scene."
+                ),
+            )
         )
-    )
 
     if state.get("last_sound_target_dwell") != target_dwell:
         state["last_sound_target_dwell"] = target_dwell
@@ -1317,55 +1326,61 @@ def run() -> None:
         state["sound_generations_left"] = target_dwell
     remaining_before = int(state.get("sound_generations_left", target_dwell))
 
-    manual_refresh = st.sidebar.button(
-        "Refresh sound scene",
-        key="refresh_sound_scene",
-        help="Force an immediate reseed using the current difficulty profile.",
-    )
-    if manual_refresh:
-        new_seed, new_rate, new_resolution = _refresh_sound_scene(
-            state,
-            difficulty_progress,
-            target_dwell,
-            improvement=float(state.get("difficulty_improvement", 0.0)),
-            volatility=float(state.get("difficulty_volatility", 0.0)),
-            max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
+    with sound_box:
+        manual_refresh = st.button(
+            "Refresh sound scene",
+            key="refresh_sound_scene",
+            help="Force an immediate reseed using the current difficulty profile.",
         )
-        st.sidebar.info(
-            "Forced refresh triggered new scene "
-            f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
-        )
+        if manual_refresh:
+            new_seed, new_rate, new_resolution = _refresh_sound_scene(
+                state,
+                difficulty_progress,
+                target_dwell,
+                improvement=float(state.get("difficulty_improvement", 0.0)),
+                volatility=float(state.get("difficulty_volatility", 0.0)),
+                max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
+            )
+            sound_box.info(
+                "Forced refresh triggered new scene "
+                f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
+            )
 
     forest = state.setdefault("evolution_trees", {})
-    if forest:
-        tree_ids = list(forest.keys())
-        active_tree_id = state.get("active_tree_id", tree_ids[0])
-        if active_tree_id not in forest:
-            active_tree_id = tree_ids[0]
-            _activate_tree(state, active_tree_id)
-        selected_tree_id = st.sidebar.selectbox(
-            "Evolution tree",
-            tree_ids,
-            index=tree_ids.index(active_tree_id),
-            format_func=lambda tid: _format_tree_label(forest[tid]),
+    tree_box = st.sidebar.expander("Evolution trees", expanded=False)
+    with tree_box:
+        if forest:
+            tree_ids = list(forest.keys())
+            active_tree_id = state.get("active_tree_id", tree_ids[0])
+            if active_tree_id not in forest:
+                active_tree_id = tree_ids[0]
+                _activate_tree(state, active_tree_id)
+            selected_tree_id = st.selectbox(
+                "Stored branches",
+                tree_ids,
+                index=tree_ids.index(active_tree_id),
+                format_func=lambda tid: _format_tree_label(forest[tid]),
+            )
+            if selected_tree_id != active_tree_id:
+                _activate_tree(state, selected_tree_id)
+                forest = state.setdefault("evolution_trees", {})
+            st.caption(
+                "Switch between stored evolution branches to revisit previous sound scenes."
+            )
+        else:
+            st.caption("Branches will appear here after your first evolution run.")
+
+        new_tree_requested = st.button(
+            "Create new evolution tree",
+            key="spawn_new_tree",
+            help="Start a fresh branch with the current presets and sound scene.",
         )
-        if selected_tree_id != active_tree_id:
-            _activate_tree(state, selected_tree_id)
-            forest = state.setdefault("evolution_trees", {})
-        st.sidebar.caption(
-            "Switch between stored evolution branches to revisit previous sound scenes."
-        )
-    new_tree_requested = st.sidebar.button(
-        "Create new evolution tree",
-        key="spawn_new_tree",
-        help="Start a fresh branch with the current presets and sound scene.",
-    )
     if new_tree_requested:
         state["_spawn_new_tree_requested"] = True
         state["pending_generations"] = 0
         state["run_infinite"] = False
         _sync_active_tree_state(state)
-        st.sidebar.info("Queued a new tree; it will initialise on the next evolution tick.")
+        tree_box.info("Queued a new tree; it will initialise on the next evolution tick.")
 
     seed = int(state.get("shared_seed", 0))
     sound_seed = int(state.get("active_sound_seed", seed))
@@ -1391,25 +1406,26 @@ def run() -> None:
     state["active_encoder_sigma"] = encoder_sigma
     state["active_decoder_sigma"] = denoise_sigma
 
-    st.sidebar.subheader("Adaptive configuration")
-    st.sidebar.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
-    st.sidebar.metric("Shared seed", str(seed))
-    st.sidebar.metric("Sound seed", str(sound_seed))
-    st.sidebar.metric(
-        "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
-    )
-    st.sidebar.metric(
-        "Image resolution window",
-        f"{resolution_range[0]}–{resolution_range[1]} px",
-    )
+    config_box = st.sidebar.expander("Active configuration", expanded=False)
+    with config_box:
+        st.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
+        st.metric("Shared seed", str(seed))
+        st.metric("Sound seed", str(sound_seed))
+        st.metric(
+            "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
+        )
+        st.metric(
+            "Image resolution window",
+            f"{resolution_range[0]}–{resolution_range[1]} px",
+        )
 
-    noise_cols = st.sidebar.columns(2)
-    noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
-    noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
-    st.sidebar.caption(
-        "Adaptive noise scales increase encoder randomness while tempering decoder blur "
-        "as the system improves."
-    )
+        noise_cols = st.columns(2)
+        noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
+        noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
+        st.caption(
+            "Adaptive noise scales increase encoder randomness while tempering decoder blur "
+            "as the system improves."
+        )
 
     state["sound_generations_left"] = int(
         max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
@@ -1430,11 +1446,12 @@ def run() -> None:
         )
         state["current_sound_resolution"] = current_resolution
 
-    st.sidebar.metric("Active sample rate", f"{current_sample_rate:,} Hz")
-    st.sidebar.metric(
-        "Active image resolution",
-        f"{current_resolution}×{current_resolution} px",
-    )
+    with config_box:
+        st.metric("Active sample rate", f"{current_sample_rate:,} Hz")
+        st.metric(
+            "Active image resolution",
+            f"{current_resolution}×{current_resolution} px",
+        )
     _sync_active_tree_state(state)
 
     original_color, original, sound_clip, shape_specs = generate_sound_art(
@@ -1479,47 +1496,52 @@ def run() -> None:
     sound_metrics = compute_metrics(colored_original, sound_colored)
     ai_sound_alignment = compute_metrics(ai_colored, sound_colored)
 
-    st.subheader("Sound profile")
-    volume_cols = st.columns(3)
-    for idx, color in enumerate(("red", "green", "blue")):
-        volume_cols[idx].metric(
-            f"{color.title()} volume",
-            f"{sound_clip.band_volumes[color]:.2f}",
-            help="Relative energy detected in the sound clip for this colour band.",
-        )
-    st.caption(
-        f"Waveform length: {sound_clip.samples.size} samples @ {sound_clip.sample_rate} Hz."
+    overview_tab, evolution_tab, experiments_tab = st.tabs(
+        ["Scene overview", "Evolution detail", "Experiments"]
     )
 
-    st.subheader("Reconstruction quality")
-    ai_metrics_cols = st.columns(3)
-    ai_metrics_cols[0].metric("AI colour PSNR", f"{metrics.psnr:.2f} dB")
-    ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
-    ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
+    with overview_tab:
+        st.subheader("Sound profile")
+        volume_cols = st.columns(3)
+        for idx, color in enumerate(("red", "green", "blue")):
+            volume_cols[idx].metric(
+                f"{color.title()} volume",
+                f"{sound_clip.band_volumes[color]:.2f}",
+                help="Relative energy detected in the sound clip for this colour band.",
+            )
+        st.caption(
+            f"Waveform length: {sound_clip.samples.size} samples @ {sound_clip.sample_rate} Hz."
+        )
 
-    if state.get("adversarial_enabled", False):
-        adv: AdversarialManager | None = state.get("adversarial")
-        if adv is None:
-            adv = AdversarialManager()
-            state["adversarial"] = adv
-        pred_image = apply_generator(original, adv.state.generator)
-        _, pred_overlap_score = multiplicative_overlap(original, pred_image)
-        gen, best_score, dec_sigma = adv.step(original, reconstructed)
-        state["decoder_sigma_base"] = dec_sigma
-        st.subheader("Adversarial generator")
-        gen_cols = st.columns(4)
-        gen_cols[0].metric("Gen blur σ", f"{gen.blur_sigma:.2f}")
-        gen_cols[1].metric("Gen contrast", f"{gen.contrast:.2f}")
-        gen_cols[2].metric("Gen brightness", f"{gen.brightness:.2f}")
-        gen_cols[3].metric("Gen score", f"{best_score:.3f}")
-        st.metric("Predicted overlap", f"{pred_overlap_score:.1f}%")
+        st.subheader("Reconstruction quality")
+        ai_metrics_cols = st.columns(3)
+        ai_metrics_cols[0].metric("AI colour PSNR", f"{metrics.psnr:.2f} dB")
+        ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
+        ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
 
-    sound_metrics_cols = st.columns(3)
-    sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
-    sound_metrics_cols[1].metric("Sound colour SSIM", f"{sound_metrics.ssim:.3f}")
-    sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
+        if state.get("adversarial_enabled", False):
+            adv: AdversarialManager | None = state.get("adversarial")
+            if adv is None:
+                adv = AdversarialManager()
+                state["adversarial"] = adv
+            pred_image = apply_generator(original, adv.state.generator)
+            _, pred_overlap_score = multiplicative_overlap(original, pred_image)
+            gen, best_score, dec_sigma = adv.step(original, reconstructed)
+            state["decoder_sigma_base"] = dec_sigma
+            st.subheader("Adversarial generator")
+            gen_cols = st.columns(4)
+            gen_cols[0].metric("Gen blur σ", f"{gen.blur_sigma:.2f}")
+            gen_cols[1].metric("Gen contrast", f"{gen.contrast:.2f}")
+            gen_cols[2].metric("Gen brightness", f"{gen.brightness:.2f}")
+            gen_cols[3].metric("Gen score", f"{best_score:.3f}")
+            st.metric("Predicted overlap", f"{pred_overlap_score:.1f}%")
 
-    st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
+        sound_metrics_cols = st.columns(3)
+        sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
+        sound_metrics_cols[1].metric("Sound colour SSIM", f"{sound_metrics.ssim:.3f}")
+        sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
+
+        st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
 
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
@@ -1543,124 +1565,131 @@ def run() -> None:
     state["difficulty_volatility"] = float(volatility_signal)
     difficulty_progress = updated_progress
 
-    st.sidebar.metric("Adaptive difficulty", f"{difficulty_progress * 100:.0f}%")
-    momentum = float(state.get("difficulty_improvement", 0.0)) * 100.0
-    variability = float(state.get("difficulty_volatility", 0.0)) * 100.0
-    trend_cols = st.sidebar.columns(2)
-    trend_cols[0].metric("Difficulty momentum", f"{momentum:.1f} pts")
-    trend_cols[1].metric("Difficulty range", f"{variability:.1f} pts")
+    difficulty_box = st.sidebar.expander("Difficulty signals", expanded=False)
+    with difficulty_box:
+        st.metric("Adaptive difficulty", f"{difficulty_progress * 100:.0f}%")
+        momentum = float(state.get("difficulty_improvement", 0.0)) * 100.0
+        variability = float(state.get("difficulty_volatility", 0.0)) * 100.0
+        trend_cols = st.columns(2)
+        trend_cols[0].metric("Difficulty momentum", f"{momentum:.1f} pts")
+        trend_cols[1].metric("Difficulty range", f"{variability:.1f} pts")
 
-    st.write(
-        "The overlap score multiplies the normalized original and reconstructed pixels," \
-        " providing a quick proxy for how much of the signal is mutually present."
-    )
-
-    st.subheader("Shape guessing AI")
-    ai_guess_map: dict[str, ShapeGuess] = {guess.color: guess for guess in guess_shapes(ai_colored)}
-    sound_guess_map: dict[str, ShapeGuess] = {
-        guess.color: guess for guess in guess_shapes(sound_colored)
-    }
-    guess_rows = []
-    for spec in shape_specs:
-        ai_guess = ai_guess_map.get(spec.color)
-        sound_guess = sound_guess_map.get(spec.color)
-        guess_rows.append(
-            {
-                "Colour": spec.color.title(),
-                "Target shape": spec.shape.title(),
-                "Target volume": f"{spec.volume:.2f}",
-                "Target size (px)": f"{spec.size}",
-                "Target rotation (°)": f"{spec.rotation:.1f}",
-                "Target centre (y, x)": f"({spec.center[0]}, {spec.center[1]})",
-                "AI guess": ai_guess.guess.title() if ai_guess else "None",
-                "AI confidence": f"{ai_guess.confidence:.2f}" if ai_guess else "0.00",
-                "AI match": "✅" if ai_guess and ai_guess.guess == spec.shape else "❌",
-                "Sound guess": sound_guess.guess.title() if sound_guess else "None",
-                "Sound confidence": f"{sound_guess.confidence:.2f}" if sound_guess else "0.00",
-                "Sound match": "✅" if sound_guess and sound_guess.guess == spec.shape else "❌",
-            }
+    with overview_tab:
+        st.write(
+            "The overlap score multiplies the normalized original and reconstructed pixels,"
+            " providing a quick proxy for how much of the signal is mutually present."
         )
-    st.table(guess_rows)
-    st.caption(
-        "Both AIs operate on the colourised reconstructions. Matching guesses indicate that "
-        "the generated patterns retained the intended geometric cues."
-    )
 
-    st.subheader("Visual comparisons")
-    overview_row = [
-        (colored_original, f"Sound-derived image ({source_label})"),
-        (packet_display, "Encoded packet (noise + signal)"),
-        (ai_colored, "AI reconstruction (colourised)"),
-        (sound_colored, "Sound-only reconstruction (colourised)"),
-    ]
-    overlay_row = [
-        (noise_display, "Predicted noise contribution"),
-        (ai_overlap_color, "Colour overlap: AI vs original"),
-        (sound_overlap_color, "Colour overlap: Sound vs original"),
-        (cross_overlap_color, "Colour overlap: AI vs sound"),
-    ]
-
-    for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
-        for col, (image, caption) in zip(columns, content):
-            _render_image(col, image, caption)
-
-    st.caption(
-        "Red highlights information present only in the generated candidate, blue marks"
-        " reference-only structure, and neutral grayscale indicates shared content."
-    )
-
-    st.sidebar.subheader("Evolution settings")
-    population_size = int(
-        st.sidebar.number_input(
-            "AI attempts per generation",
-            min_value=1,
-            max_value=32,
-            value=int(state.get("population_size", 4)),
-            step=1,
-            key="population_size",
+        st.subheader("Shape guessing AI")
+        ai_guess_map: dict[str, ShapeGuess] = {
+            guess.color: guess for guess in guess_shapes(ai_colored)
+        }
+        sound_guess_map: dict[str, ShapeGuess] = {
+            guess.color: guess for guess in guess_shapes(sound_colored)
+        }
+        guess_rows = []
+        for spec in shape_specs:
+            ai_guess = ai_guess_map.get(spec.color)
+            sound_guess = sound_guess_map.get(spec.color)
+            guess_rows.append(
+                {
+                    "Colour": spec.color.title(),
+                    "Target shape": spec.shape.title(),
+                    "Target volume": f"{spec.volume:.2f}",
+                    "Target size (px)": f"{spec.size}",
+                    "Target rotation (°)": f"{spec.rotation:.1f}",
+                    "Target centre (y, x)": f"({spec.center[0]}, {spec.center[1]})",
+                    "AI guess": ai_guess.guess.title() if ai_guess else "None",
+                    "AI confidence": f"{ai_guess.confidence:.2f}" if ai_guess else "0.00",
+                    "AI match": "✅" if ai_guess and ai_guess.guess == spec.shape else "❌",
+                    "Sound guess": sound_guess.guess.title() if sound_guess else "None",
+                    "Sound confidence": f"{sound_guess.confidence:.2f}" if sound_guess else "0.00",
+                    "Sound match": "✅" if sound_guess and sound_guess.guess == spec.shape else "❌",
+                }
+            )
+        st.table(guess_rows)
+        st.caption(
+            "Both AIs operate on the colourised reconstructions. Matching guesses indicate that "
+            "the generated patterns retained the intended geometric cues."
         )
-    )
-    generations_to_queue = int(
-        st.sidebar.number_input(
-            "Generations to queue",
-            min_value=1,
-            value=int(state.get("generations_to_queue", 5)),
-            step=1,
-            key="generations_to_queue",
-        )
-    )
-    evolution_mode = st.sidebar.selectbox(
-        "Evolution length",
-        options=["Finite", "Infinite"],
-        index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
-        key="evolution_mode",
-    )
-    autosave_interval = int(
-        st.sidebar.number_input(
-            "Autosave every N generations",
-            min_value=1,
-            value=int(state.get("autosave_interval", 5)),
-            step=1,
-            key="autosave_interval",
-        )
-    )
 
-    run_button = st.sidebar.button("Start evolution")
-    stop_button = st.sidebar.button("Stop evolution")
-    reset_button = st.sidebar.button("Reset evolution")
-    save_button = st.sidebar.button("Save snapshot now")
-    reload_button = st.sidebar.button("Reload autosave")
+        st.subheader("Visual comparisons")
+        overview_row = [
+            (colored_original, f"Sound-derived image ({source_label})"),
+            (packet_display, "Encoded packet (noise + signal)"),
+            (ai_colored, "AI reconstruction (colourised)"),
+            (sound_colored, "Sound-only reconstruction (colourised)"),
+        ]
+        overlay_row = [
+            (noise_display, "Predicted noise contribution"),
+            (ai_overlap_color, "Colour overlap: AI vs original"),
+            (sound_overlap_color, "Colour overlap: Sound vs original"),
+            (cross_overlap_color, "Colour overlap: AI vs sound"),
+        ]
 
-    st.sidebar.subheader("Adversarial mode (beta)")
-    st.sidebar.checkbox(
-        "Enable generator vs decoder co-evolution",
-        key="adversarial_enabled",
-        value=bool(state.get("adversarial_enabled", False)),
-        help=(
-            "Trains a predictive generator to approximate the decoder's output without passing through"
-            " the channel, while the decoder adapts its denoise level."
-        ),
-    )
+        for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
+            for col, (image, caption) in zip(columns, content):
+                _render_image(col, image, caption)
+
+        st.caption(
+            "Red highlights information present only in the generated candidate, blue marks"
+            " reference-only structure, and neutral grayscale indicates shared content."
+        )
+
+    run_box = st.sidebar.expander("Evolution run controls", expanded=True)
+    with run_box:
+        population_size = int(
+            st.number_input(
+                "AI attempts per generation",
+                min_value=1,
+                max_value=32,
+                value=int(state.get("population_size", 4)),
+                step=1,
+                key="population_size",
+            )
+        )
+        generations_to_queue = int(
+            st.number_input(
+                "Generations to queue",
+                min_value=1,
+                value=int(state.get("generations_to_queue", 5)),
+                step=1,
+                key="generations_to_queue",
+            )
+        )
+        evolution_mode = st.selectbox(
+            "Evolution length",
+            options=["Finite", "Infinite"],
+            index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
+            key="evolution_mode",
+        )
+        autosave_interval = int(
+            st.number_input(
+                "Autosave every N generations",
+                min_value=1,
+                value=int(state.get("autosave_interval", 5)),
+                step=1,
+                key="autosave_interval",
+            )
+        )
+
+        run_button = st.button("Start evolution")
+        stop_button = st.button("Stop evolution")
+        reset_button = st.button("Reset evolution")
+        save_button = st.button("Save snapshot now")
+        reload_button = st.button("Reload autosave")
+
+    adv_box = st.sidebar.expander("Adversarial mode (beta)", expanded=False)
+    with adv_box:
+        st.checkbox(
+            "Enable generator vs decoder co-evolution",
+            key="adversarial_enabled",
+            value=bool(state.get("adversarial_enabled", False)),
+            help=(
+                "Trains a predictive generator to approximate the decoder's output without passing through"
+                " the channel, while the decoder adapts its denoise level."
+            ),
+        )
     if state.get("adversarial_enabled", False) and "adversarial" not in state:
         state["adversarial"] = AdversarialManager()
 
@@ -1701,39 +1730,39 @@ def run() -> None:
     _update_tree_label(state, tree_label)
     _refresh_active_parents(state, manager)
 
-    st.sidebar.subheader("Selective breeding")
-    parent_entries = sorted(
-        manager.parent_lineage,
-        key=lambda entry: (entry.origin_generation, -entry.metrics.ssim),
-    )
-    parent_labels = {
-        entry.seed: (
-            f"Gen {entry.origin_generation} • seed {entry.seed} "
-            f"(SSIM {entry.metrics.ssim:.3f}, overlap {entry.overlap_score:.1f}%)"
+    breed_box = st.sidebar.expander("Selective breeding", expanded=False)
+    with breed_box:
+        parent_entries = sorted(
+            manager.parent_lineage,
+            key=lambda entry: (entry.origin_generation, -entry.metrics.ssim),
         )
-        for entry in parent_entries
-    }
-    parent_options = list(parent_labels.keys())
-    default_selection = [
-        seed for seed in state.get("active_parent_seeds", []) if seed in parent_labels
-    ]
-    if not default_selection and parent_options:
-        default_selection = [parent_options[-1]]
-    parent_selection = st.sidebar.multiselect(
-        "Active parent seeds",
-        parent_options,
-        default=default_selection,
-        key="parent_seed_select",
-        format_func=lambda seed: parent_labels.get(seed, f"Seed {seed}"),
-        help=(
-            "Selected parent seeds remain in every generation and act as anchors for "
-            "new child mutations. Leave the selection empty to use the full lineage."
-        ),
-    )
-    state["active_parent_seeds"] = [int(seed) for seed in parent_selection]
-    _sync_active_tree_state(state)
+        parent_labels = {
+            entry.seed: (
+                f"Gen {entry.origin_generation} • seed {entry.seed} "
+                f"(SSIM {entry.metrics.ssim:.3f}, overlap {entry.overlap_score:.1f}%)"
+            )
+            for entry in parent_entries
+        }
+        parent_options = list(parent_labels.keys())
+        default_selection = [
+            seed for seed in state.get("active_parent_seeds", []) if seed in parent_labels
+        ]
+        if not default_selection and parent_options:
+            default_selection = [parent_options[-1]]
+        parent_selection = st.multiselect(
+            "Active parent seeds",
+            parent_options,
+            default=default_selection,
+            key="parent_seed_select",
+            format_func=lambda seed: parent_labels.get(seed, f"Seed {seed}"),
+            help=(
+                "Selected parent seeds remain in every generation and act as anchors for "
+                "new child mutations. Leave the selection empty to use the full lineage."
+            ),
+        )
+        state["active_parent_seeds"] = [int(seed) for seed in parent_selection]
+        _sync_active_tree_state(state)
 
-    with st.expander("Lineage library", expanded=False):
         if parent_entries:
             active_parent_set = {int(seed) for seed in state.get("active_parent_seeds", [])}
             summary_rows = [
@@ -1853,62 +1882,144 @@ def run() -> None:
     best_candidate_summary: dict[str, Any] | None = None
 
     if manager.generations:
-        st.header("Evolution progress")
-        generation_progress_rows = [
-            {
-                "Generation": int(record.index),
-                "Best SSIM": _finite_or_none(record.best_candidate.metrics.ssim),
-                "Best PSNR": _finite_or_none(record.best_candidate.metrics.psnr),
-                "Best overlap": _finite_or_none(record.best_candidate.overlap_score),
-            }
-            for record in manager.generations
-        ]
+        with evolution_tab:
+            st.subheader("Evolution progress")
+            generation_progress_rows = [
+                {
+                    "Generation": int(record.index),
+                    "Best SSIM": _finite_or_none(record.best_candidate.metrics.ssim),
+                    "Best PSNR": _finite_or_none(record.best_candidate.metrics.psnr),
+                    "Best overlap": _finite_or_none(record.best_candidate.overlap_score),
+                }
+                for record in manager.generations
+            ]
 
-        if generation_progress_rows:
-            sanitized_rows, dropped_values = sanitize_progress_rows(generation_progress_rows)
-            st.subheader("Best-of-generation trend")
-
-            spec, message = prepare_trend_chart(sanitized_rows, had_non_finite=dropped_values)
-            if spec:
-                st.vega_lite_chart(spec, use_container_width=True)
-                logger.debug(
-                    "Rendered trend chart with %d records", len(sanitized_rows)
+            if generation_progress_rows:
+                sanitized_rows, dropped_values = sanitize_progress_rows(
+                    generation_progress_rows
                 )
-            if message:
-                st.caption(message)
+                spec, message = prepare_trend_chart(
+                    sanitized_rows, had_non_finite=dropped_values
+                )
+                if spec:
+                    st.vega_lite_chart(spec, use_container_width=True)
+                    logger.debug(
+                        "Rendered trend chart with %d records", len(sanitized_rows)
+                    )
+                if message:
+                    st.caption(message)
 
-        gen_indices = [record.index for record in manager.generations]
-        default_gen = gen_indices[-1]
-        if len(gen_indices) > 1:
-            selected_generation = st.select_slider(
-                "Select generation",
-                options=gen_indices,
-                value=default_gen,
-                key="selected_generation",
-                format_func=lambda idx: f"Generation {idx}",
+            gen_indices = [record.index for record in manager.generations]
+            default_gen = gen_indices[-1]
+            if len(gen_indices) > 1:
+                selected_generation = st.select_slider(
+                    "Select generation",
+                    options=gen_indices,
+                    value=default_gen,
+                    key="selected_generation",
+                    format_func=lambda idx: f"Generation {idx}",
+                )
+            else:
+                selected_generation = default_gen
+                st.caption("Only one generation so far; displaying the latest results.")
+            generation = manager.generations[selected_generation]
+            best_candidate = generation.best_candidate
+
+            best_candidate_summary = {
+                "generation": generation.index,
+                "seed": best_candidate.seed,
+                "psnr": best_candidate.metrics.psnr,
+                "ssim": best_candidate.metrics.ssim,
+                "overlap": best_candidate.overlap_score,
+            }
+
+            st.subheader("Best candidate metrics")
+            best_cols = st.columns(3)
+            best_cols[0].metric("Seed", str(best_candidate.seed))
+            best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
+            best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
+            st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
+
+            st.subheader("Generation gallery")
+            cols_per_row = min(4, len(generation.candidates))
+            for offset in range(0, len(generation.candidates), cols_per_row):
+                row = st.columns(cols_per_row)
+                for col, candidate in zip(
+                    row, generation.candidates[offset : offset + cols_per_row]
+                ):
+                    caption = (
+                        f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
+                    )
+                    candidate_image = _apply_color_template(
+                        candidate.reconstruction, color_template
+                    )
+                    _render_image(col, candidate_image, caption)
+
+            st.subheader("Candidate inspector")
+            option_labels = [
+                f"AI {idx + 1}: Seed {cand.seed} – SSIM {cand.metrics.ssim:.3f}"
+                for idx, cand in enumerate(generation.candidates)
+            ]
+            candidate_indices = list(range(len(generation.candidates)))
+            default_candidate = next(
+                (
+                    i
+                    for i, cand in enumerate(generation.candidates)
+                    if cand.seed == best_candidate.seed
+                ),
+                0,
             )
-        else:
-            selected_generation = default_gen
-            st.caption("Only one generation so far; displaying the latest results.")
-        generation = manager.generations[selected_generation]
-        best_candidate = generation.best_candidate
+            selected_index = st.selectbox(
+                "Choose a candidate to inspect",
+                options=candidate_indices,
+                index=default_candidate,
+                format_func=lambda idx: option_labels[idx],
+                key="candidate_selector",
+            )
+            inspected = generation.candidates[selected_index]
+            inspect_overlap_map, inspect_overlap_score = multiplicative_overlap(
+                manager.original, inspected.reconstruction
+            )
+            inspected_color = colorize_comparison(
+                manager.original, inspected.reconstruction
+            )
 
-        best_candidate_summary = {
-            "generation": generation.index,
-            "seed": best_candidate.seed,
-            "psnr": best_candidate.metrics.psnr,
-            "ssim": best_candidate.metrics.ssim,
-            "overlap": best_candidate.overlap_score,
-        }
+            inspect_cols = st.columns(4)
+            _render_image(inspect_cols[0], colored_original, "Evolution reference")
+            inspected_reconstruction = _apply_color_template(
+                inspected.reconstruction, color_template
+            )
+            _render_image(
+                inspect_cols[1],
+                inspected_reconstruction,
+                f"Candidate seed {inspected.seed}",
+            )
+            _render_image(
+                inspect_cols[2],
+                inspect_overlap_map,
+                f"Overlap map ({inspect_overlap_score:.1f}%)",
+            )
+            _render_image(
+                inspect_cols[3],
+                inspected_color,
+                "Colour overlap vs reference",
+            )
 
-        st.subheader("Best candidate metrics")
-        best_cols = st.columns(3)
-        best_cols[0].metric("Seed", str(best_candidate.seed))
-        best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
-        best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
-        st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
+            st.subheader("Generation summary")
+            summary_rows = [
+                {
+                    "AI": idx + 1,
+                    "Seed": cand.seed,
+                    "PSNR (dB)": f"{cand.metrics.psnr:.2f}",
+                    "SSIM": f"{cand.metrics.ssim:.3f}",
+                    "Overlap (%)": f"{cand.overlap_score:.1f}",
+                }
+                for idx, cand in enumerate(generation.candidates)
+            ]
+            st.table(summary_rows)
 
-        with st.expander("Sound-to-image synthesizer", expanded=False):
+        with experiments_tab:
+            st.subheader("Sound-to-image synthesizer")
             uploaded_sound_file = st.file_uploader(
                 "Upload WAV audio",
                 type=("wav", "wave"),
@@ -1951,78 +2062,17 @@ def run() -> None:
                     "Upload a WAV file to derive a scene and compare it against the selected evolution branch."
                 )
 
-        with st.expander("Noise reconstruction lab", expanded=False):
+            st.subheader("Noise reconstruction lab")
             _render_reconstruction_lab(
                 state,
                 default_resolution=current_resolution,
                 default_sample_rate=int(state.get("current_sound_sample_rate", 48_000)),
             )
-
-        st.subheader("Generation gallery")
-        cols_per_row = min(4, len(generation.candidates))
-        for offset in range(0, len(generation.candidates), cols_per_row):
-            row = st.columns(cols_per_row)
-            for col, candidate in zip(row, generation.candidates[offset : offset + cols_per_row]):
-                caption = (
-                    f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
-                )
-                candidate_image = _apply_color_template(candidate.reconstruction, color_template)
-                _render_image(col, candidate_image, caption)
-
-        st.subheader("Candidate inspector")
-        option_labels = [
-            f"AI {idx + 1}: Seed {cand.seed} – SSIM {cand.metrics.ssim:.3f}"
-            for idx, cand in enumerate(generation.candidates)
-        ]
-        candidate_indices = list(range(len(generation.candidates)))
-        default_candidate = next(
-            (i for i, cand in enumerate(generation.candidates) if cand.seed == best_candidate.seed),
-            0,
-        )
-        selected_index = st.selectbox(
-            "Choose a candidate to inspect",
-            options=candidate_indices,
-            index=default_candidate,
-            format_func=lambda idx: option_labels[idx],
-            key="candidate_selector",
-        )
-        inspected = generation.candidates[selected_index]
-        inspect_overlap_map, inspect_overlap_score = multiplicative_overlap(
-            manager.original, inspected.reconstruction
-        )
-        inspected_color = colorize_comparison(manager.original, inspected.reconstruction)
-
-        inspect_cols = st.columns(4)
-        _render_image(inspect_cols[0], colored_original, "Evolution reference")
-        inspected_reconstruction = _apply_color_template(inspected.reconstruction, color_template)
-        _render_image(
-            inspect_cols[1],
-            inspected_reconstruction,
-            f"Candidate seed {inspected.seed}",
-        )
-        _render_image(
-            inspect_cols[2],
-            inspect_overlap_map,
-            f"Overlap map ({inspect_overlap_score:.1f}%)",
-        )
-        _render_image(
-            inspect_cols[3],
-            inspected_color,
-            "Colour overlap vs reference",
-        )
-
-        st.subheader("Generation summary")
-        summary_rows = [
-            {
-                "AI": idx + 1,
-                "Seed": cand.seed,
-                "PSNR (dB)": f"{cand.metrics.psnr:.2f}",
-                "SSIM": f"{cand.metrics.ssim:.3f}",
-                "Overlap (%)": f"{cand.overlap_score:.1f}",
-            }
-            for idx, cand in enumerate(generation.candidates)
-        ]
-        st.table(summary_rows)
+    else:
+        with evolution_tab:
+            st.info("Run at least one generation to visualise evolution progress.")
+        with experiments_tab:
+            st.info("Experiments unlock after the first generation completes.")
 
     export_payload = {
         "hardware_backend": state.get("hardware_backend", "CPU (NumPy)"),
