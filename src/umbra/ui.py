@@ -1058,11 +1058,11 @@ def _record_performance_history(
 
 def _derive_difficulty_metrics(
     history: list[dict[str, float]]
-) -> tuple[float, float, float]:
-    """Compute difficulty progress, improvement, and volatility signals."""
+) -> tuple[float, float, float, float]:
+    """Compute difficulty progress, improvement, volatility, and reward signals."""
 
     if not history:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     overlaps = np.asarray([entry["ai_overlap"] for entry in history], dtype=np.float32)
     recent_window = int(min(len(history), _RECENT_PERFORMANCE))
@@ -1073,11 +1073,25 @@ def _derive_difficulty_metrics(
     improvement = float(np.clip(recent_mean - long_term, 0.0, 1.0))
     volatility = float(np.std(recent) / 100.0)
 
+    normalized = np.clip(overlaps / 100.0, 0.0, 1.0)
+    reward_curve = np.clip((normalized - 0.4) / 0.6, 0.0, 1.0)
+    reward_recent = float(np.mean(reward_curve[-recent_window:])) if recent_window else 0.0
+    reward_peak = float(np.max(reward_curve)) if reward_curve.size else 0.0
+    reward_signal = float(np.clip(0.65 * reward_recent + 0.35 * reward_peak, 0.0, 1.0))
+
     coverage = float(min(len(history) / _PERFORMANCE_HISTORY, 1.0))
     difficulty_target = float(
-        np.clip(0.45 * best + 0.35 * recent_mean + 0.2 * coverage + 0.4 * improvement, 0.0, 1.0)
+        np.clip(
+            0.35 * best
+            + 0.3 * recent_mean
+            + 0.15 * coverage
+            + 0.3 * improvement
+            + 0.25 * reward_signal,
+            0.0,
+            1.0,
+        )
     )
-    return difficulty_target, improvement, float(np.clip(volatility, 0.0, 1.0))
+    return difficulty_target, improvement, float(np.clip(volatility, 0.0, 1.0)), reward_signal
 
 
 def _refresh_sound_scene(
@@ -1215,6 +1229,8 @@ def run() -> None:
     state.setdefault("performance_history", [])
     state.setdefault("difficulty_improvement", 0.0)
     state.setdefault("difficulty_volatility", 0.0)
+    state.setdefault("difficulty_reward", 0.0)
+    state.setdefault("difficulty_reward_points", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
     state.setdefault("evolution_trees", {})
     state.setdefault("active_parent_seeds", [])
@@ -1546,6 +1562,12 @@ def run() -> None:
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
     max_overlap_so_far = float(state["max_overlap_seen"])
+    reward_points = float(state.get("difficulty_reward_points", 0.0))
+    if overlap_pct >= 40.0:
+        reward_points += float(
+            np.interp(overlap_pct, [40.0, 60.0, 100.0], [1.0, 3.0, 5.0])
+        )
+    state["difficulty_reward_points"] = reward_points
     history = _record_performance_history(
         state,
         overlap_pct,
@@ -1553,7 +1575,9 @@ def run() -> None:
         float(metrics.psnr),
         float(sound_overlap_score),
     )
-    target_progress, improvement_signal, volatility_signal = _derive_difficulty_metrics(history)
+    target_progress, improvement_signal, volatility_signal, reward_signal = _derive_difficulty_metrics(
+        history
+    )
     reseed_progress = min(1.0, state.get("sound_reseed_count", 0) / 10.0)
     blended_target = max(target_progress, reseed_progress)
     previous_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
@@ -1563,6 +1587,7 @@ def run() -> None:
     state["difficulty_progress"] = updated_progress
     state["difficulty_improvement"] = float(improvement_signal)
     state["difficulty_volatility"] = float(volatility_signal)
+    state["difficulty_reward"] = float(reward_signal)
     difficulty_progress = updated_progress
 
     difficulty_box = st.sidebar.expander("Difficulty signals", expanded=False)
@@ -1573,6 +1598,17 @@ def run() -> None:
         trend_cols = st.columns(2)
         trend_cols[0].metric("Difficulty momentum", f"{momentum:.1f} pts")
         trend_cols[1].metric("Difficulty range", f"{variability:.1f} pts")
+        reward_cols = st.columns(2)
+        reward_cols[0].metric(
+            "High-overlap reward",
+            f"{float(state.get('difficulty_reward', 0.0)) * 100:.0f} pts",
+            help="Boost awarded when overlap exceeds 40%, encouraging harder scenarios.",
+        )
+        reward_cols[1].metric(
+            "Lifetime reward",
+            f"{state.get('difficulty_reward_points', 0.0):.1f} pts",
+            help="Cumulative bonus reflecting consistently strong overlap scores.",
+        )
 
     with overview_tab:
         st.write(
