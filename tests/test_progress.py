@@ -43,3 +43,26 @@ def test_prepare_trend_chart_returns_spec_when_data_varies() -> None:
     modifiers = spec["usermeta"]["embedOptions"]["tooltip"]["modifiers"]
     names = [item["name"] for item in modifiers]
     assert names == ["offset", "preventOverflow", "hide", "flip"]
+
+
+def test_sanitize_progress_rows_preserves_additional_columns() -> None:
+    rows = [
+        {
+            "Generation": 0,
+            "reward_total": 1.0,
+            "difficulty_raw": 0.8,
+            "checkpoint_tag": "plateau_kick",
+        },
+        {
+            "Generation": 1,
+            "reward_total": 1.2,
+            "difficulty_raw": 0.82,
+        },
+    ]
+
+    sanitized, discarded = sanitize_progress_rows(rows)
+
+    assert discarded is True
+    assert sanitized[0]["reward_total"] == 1.0
+    assert sanitized[0]["difficulty_raw"] == 0.8
+    assert "checkpoint_tag" not in sanitized[0]

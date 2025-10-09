@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -22,9 +23,14 @@ from PIL import Image
 from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
-from umbra.evolution import EvolutionManager, GenerationRecord, compute_image_signature
-from umbra.logging_utils import configure_logging
-from umbra.metrics import compute_metrics
+from umbra.evolution import (
+    EvolutionManager,
+    GenerationRecord,
+    compute_image_signature,
+    normalize_difficulty,
+)
+from umbra.logging_utils import collect_provenance, configure_logging
+from umbra.metrics import ReconstructionMetrics, compute_metrics
 from umbra.neural import NeuralRewardModel
 from umbra.progress import prepare_trend_chart, sanitize_progress_rows
 from umbra.reconstruction import (
@@ -71,6 +77,47 @@ def _quantize_slider_value(
     # Guard against floating point drift so Streamlit accepts the default value.
     decimals = max(0, -int(math.floor(math.log10(step))) if step < 1 else 0)
     return round(quantized, decimals)
+
+
+def _metric_badge_html(label: str, psnr: float, ssim: float) -> str:
+    """Return a styled HTML badge summarising PSNR/SSIM metrics."""
+
+    safe_label = html.escape(label)
+    return (
+        "<div style=\"background-color: var(--secondary-background-color,#f0f2f6);"
+        "padding:0.5rem 0.75rem;border-radius:0.5rem;font-size:0.85rem;"
+        "line-height:1.4;\">"
+        f"<strong>{safe_label}</strong><br>"
+        f"PSNR {psnr:.2f} dB · SSIM {ssim:.3f}"
+        "</div>"
+    )
+
+
+def _aggregate_reward_components(record: GenerationRecord) -> dict[str, float | None]:
+    """Average reward component contributions for ``record``."""
+
+    def _mean(values: list[float | None]) -> float | None:
+        finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+        if not finite:
+            return None
+        return float(np.mean(finite))
+
+    overlap_vals = [
+        candidate.reward_components.get("overlap") for candidate in record.candidates
+    ]
+    msssim_vals = [
+        candidate.reward_components.get("msssim") for candidate in record.candidates
+    ]
+    dct_vals = [
+        candidate.reward_components.get("dct_corr") for candidate in record.candidates
+    ]
+
+    return {
+        "overlap": _mean(overlap_vals),
+        "msssim": _mean(msssim_vals),
+        "dct_corr": _mean(dct_vals),
+    }
+
 
 _IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
     "Geometric Echo (balanced)": {
@@ -1199,6 +1246,138 @@ def _refresh_sound_scene(
     return new_sound_seed, int(sample_rate), int(resolution)
 
 
+def _session_export_payload(
+    *,
+    state: st.session_state,
+    manager: EvolutionManager,
+    metrics: ReconstructionMetrics,
+    sound_metrics: ReconstructionMetrics,
+    ai_sound_alignment: ReconstructionMetrics,
+    ai_overlap_score: float,
+    sound_overlap_score: float,
+    sound_clip: Any,
+    base_encoder_sigma: float,
+    base_decoder_sigma: float,
+    encoder_sigma: float,
+    denoise_sigma: float,
+    current_sample_rate: int,
+    current_resolution: int,
+    sample_rate_range: tuple[int, int],
+    resolution_range: tuple[int, int],
+    seed: int,
+    sound_seed: int,
+    target_dwell: int,
+    best_candidate_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Assemble the export payload used by the session snapshot."""
+
+    hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
+
+    if manager.generations:
+        last_generation = manager.generations[-1]
+        difficulty_raw = float(last_generation.difficulty_raw)
+        difficulty_target = float(np.clip(last_generation.difficulty_level, 0.0, 1.0))
+    else:
+        difficulty_raw = float(state.get("latest_generation_difficulty_raw", 0.0))
+        difficulty_target = float(
+            np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
+        )
+    difficulty_normalized = normalize_difficulty(difficulty_raw)
+
+    config_snapshot = {
+        "population_size": manager.population_size,
+        "autosave_interval": manager.autosave_interval,
+        "encoder_sigma": float(encoder_sigma),
+        "decoder_sigma": float(denoise_sigma),
+        "base_encoder_sigma": float(base_encoder_sigma),
+        "base_decoder_sigma": float(base_decoder_sigma),
+        "sample_rate": int(current_sample_rate),
+        "resolution": int(current_resolution),
+        "difficulty_target": difficulty_target,
+        "shared_seed": int(seed),
+        "sound_seed": int(sound_seed),
+    }
+
+    config_hash_value = hashlib.sha256(
+        json.dumps(config_snapshot, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    provenance = collect_provenance(config_hash=f"sha256:{config_hash_value}")
+    provenance["random_seeds"] = {"session": int(seed), "sound": int(sound_seed)}
+
+    best_psnr = float(metrics.psnr)
+    best_ssim = float(metrics.ssim)
+    if best_candidate_summary is not None:
+        best_psnr = float(best_candidate_summary.get("psnr", best_psnr))
+        best_ssim = float(best_candidate_summary.get("ssim", best_ssim))
+
+    metrics_block = {
+        "ai_vs_reference": metrics.as_dict(),
+        "sound_vs_reference": sound_metrics.as_dict(),
+        "ai_vs_sound": ai_sound_alignment.as_dict(),
+        "overlap": {
+            "ai_vs_reference": float(ai_overlap_score),
+            "sound_vs_reference": float(sound_overlap_score),
+        },
+        "global_pooled": {
+            "psnr": float(metrics.psnr),
+            "ssim": float(metrics.ssim),
+            "desc": "pooled/global comparator",
+        },
+        "per_candidate_strict": {
+            "psnr": best_psnr,
+            "ssim": best_ssim,
+            "desc": "gallery/best-candidate strict comparator",
+        },
+    }
+
+    payload = {
+        "hardware_backend": hardware_backend,
+        "difficulty": {
+            "current": float(state.get("difficulty_progress", 0.0)),
+            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
+            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
+            "dwell_generations": int(target_dwell),
+            "momentum": float(state.get("difficulty_improvement", 0.0)),
+            "volatility": float(state.get("difficulty_volatility", 0.0)),
+            "raw": difficulty_raw,
+            "normalized": difficulty_normalized,
+            "target": difficulty_target,
+        },
+        "seeds": {
+            "shared": int(seed),
+            "sound": int(sound_seed),
+        },
+        "noise": {
+            "base_encoder_sigma": float(base_encoder_sigma),
+            "base_decoder_sigma": float(base_decoder_sigma),
+            "active_encoder_sigma": float(encoder_sigma),
+            "active_decoder_sigma": float(denoise_sigma),
+        },
+        "sound": {
+            "current_sample_rate": int(current_sample_rate),
+            "current_resolution": int(current_resolution),
+            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
+            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
+            "band_volumes": dict(getattr(sound_clip, "band_volumes", {})),
+            "generator_seed": int(getattr(sound_clip, "seed", sound_seed)),
+            "generator_sample_rate": int(
+                getattr(sound_clip, "sample_rate", current_sample_rate)
+            ),
+        },
+        "metrics": metrics_block,
+        "performance_history": list(state.get("performance_history", [])),
+        "manager": {
+            "population_size": int(manager.population_size),
+            "autosave_interval": int(manager.autosave_interval),
+            "generation_count": len(manager.generations),
+            "best_candidate": best_candidate_summary,
+            "mutation_boost": int(manager.mutation_boost),
+        },
+        "provenance": provenance,
+    }
+    return payload
+
+
 def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, Any]]) -> bytes:
     """Create a zipped export containing session metrics and progress curves.
 
@@ -1278,6 +1457,7 @@ def run() -> None:
     state.setdefault("latest_generation_reward", 0.0)
     state.setdefault("latest_generation_peak", 0.0)
     state.setdefault("latest_generation_difficulty", 0.0)
+    state.setdefault("latest_generation_difficulty_raw", 0.0)
     state.setdefault("latest_generation_improvement", 0.0)
     state.setdefault("latest_lifetime_reward", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
@@ -1956,6 +2136,7 @@ def run() -> None:
             state["latest_generation_reward"] = float(generation.reward_summary)
             state["latest_generation_peak"] = float(generation.reward_peak)
             state["latest_generation_difficulty"] = float(generation.difficulty_level)
+            state["latest_generation_difficulty_raw"] = float(generation.difficulty_raw)
             state["latest_generation_improvement"] = float(generation.improvement)
             state["difficulty_reward_points"] = float(manager.lifetime_reward)
             state["latest_lifetime_reward"] = float(manager.lifetime_reward)
@@ -2032,8 +2213,10 @@ def run() -> None:
     if manager.generations:
         with evolution_tab:
             st.subheader("Evolution progress")
-            generation_progress_rows = [
-                {
+            generation_progress_rows = []
+            for record in manager.generations:
+                components = _aggregate_reward_components(record)
+                row: dict[str, Any] = {
                     "Generation": int(record.index),
                     "Best SSIM": _finite_or_none(record.best_candidate.metrics.ssim),
                     "Best PSNR": _finite_or_none(record.best_candidate.metrics.psnr),
@@ -2042,9 +2225,18 @@ def run() -> None:
                     "Peak reward": _finite_or_none(record.reward_peak),
                     "Difficulty": _finite_or_none(record.difficulty_level),
                     "Lifetime reward": _finite_or_none(record.cumulative_reward),
+                    "reward_total": _finite_or_none(record.reward_summary),
+                    "reward_overlap": _finite_or_none(components.get("overlap")),
+                    "reward_msssim": _finite_or_none(components.get("msssim")),
+                    "reward_dct_corr": _finite_or_none(components.get("dct_corr")),
+                    "difficulty_raw": _finite_or_none(record.difficulty_raw),
+                    "difficulty_normalized": _finite_or_none(
+                        record.difficulty_normalized
+                    ),
                 }
-                for record in manager.generations
-            ]
+                if record.checkpoint_tag:
+                    row["checkpoint_tag"] = record.checkpoint_tag
+                generation_progress_rows.append(row)
 
             if generation_progress_rows:
                 sanitized_rows, dropped_values = sanitize_progress_rows(
@@ -2099,6 +2291,24 @@ def run() -> None:
             reward_cols[1].metric(
                 "Difficulty target", f"{generation.difficulty_level * 100:.0f}%",
                 help="Adaptive difficulty derived from reward and overlap performance.",
+            )
+
+            badge_cols = st.columns(2)
+            badge_cols[0].markdown(
+                _metric_badge_html(
+                    "Global pooled metrics (PSNR/SSIM)",
+                    metrics.psnr,
+                    metrics.ssim,
+                ),
+                unsafe_allow_html=True,
+            )
+            badge_cols[1].markdown(
+                _metric_badge_html(
+                    "Per-candidate strict metrics (PSNR/SSIM)",
+                    best_candidate.metrics.psnr,
+                    best_candidate.metrics.ssim,
+                ),
+                unsafe_allow_html=True,
             )
 
             st.subheader("Generation gallery")
@@ -2235,52 +2445,28 @@ def run() -> None:
         with experiments_tab:
             st.info("Experiments unlock after the first generation completes.")
 
-    export_payload = {
-        "hardware_backend": state.get("hardware_backend", "CPU (NumPy)"),
-        "difficulty": {
-            "current": float(state.get("difficulty_progress", 0.0)),
-            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
-            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
-            "dwell_generations": int(target_dwell),
-            "momentum": float(state.get("difficulty_improvement", 0.0)),
-            "volatility": float(state.get("difficulty_volatility", 0.0)),
-        },
-        "seeds": {
-            "shared": int(seed),
-            "sound": int(sound_seed),
-        },
-        "noise": {
-            "base_encoder_sigma": float(base_encoder_sigma),
-            "base_decoder_sigma": float(base_decoder_sigma),
-            "active_encoder_sigma": float(encoder_sigma),
-            "active_decoder_sigma": float(denoise_sigma),
-        },
-        "sound": {
-            "current_sample_rate": int(current_sample_rate),
-            "current_resolution": int(current_resolution),
-            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
-            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
-            "band_volumes": sound_clip.band_volumes,
-            "generator_seed": int(sound_clip.seed),
-            "generator_sample_rate": int(sound_clip.sample_rate),
-        },
-        "metrics": {
-            "ai_vs_reference": metrics.as_dict(),
-            "sound_vs_reference": sound_metrics.as_dict(),
-            "ai_vs_sound": ai_sound_alignment.as_dict(),
-            "overlap": {
-                "ai_vs_reference": float(ai_overlap_score),
-                "sound_vs_reference": float(sound_overlap_score),
-            },
-        },
-        "performance_history": list(state.get("performance_history", [])),
-        "manager": {
-            "population_size": int(manager.population_size),
-            "autosave_interval": int(manager.autosave_interval),
-            "generation_count": len(manager.generations),
-            "best_candidate": best_candidate_summary,
-        },
-    }
+    export_payload = _session_export_payload(
+        state=state,
+        manager=manager,
+        metrics=metrics,
+        sound_metrics=sound_metrics,
+        ai_sound_alignment=ai_sound_alignment,
+        ai_overlap_score=ai_overlap_score,
+        sound_overlap_score=sound_overlap_score,
+        sound_clip=sound_clip,
+        base_encoder_sigma=base_encoder_sigma,
+        base_decoder_sigma=base_decoder_sigma,
+        encoder_sigma=encoder_sigma,
+        denoise_sigma=denoise_sigma,
+        current_sample_rate=current_sample_rate,
+        current_resolution=current_resolution,
+        sample_rate_range=sample_rate_range,
+        resolution_range=resolution_range,
+        seed=int(seed),
+        sound_seed=int(sound_seed),
+        target_dwell=target_dwell,
+        best_candidate_summary=best_candidate_summary,
+    )
 
     export_bytes = _build_export_bundle(export_payload, generation_progress_rows)
     export_b64 = base64.b64encode(export_bytes).decode("ascii")

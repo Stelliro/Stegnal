@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import pickle
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -14,13 +15,100 @@ import numpy as np
 
 from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
-from .metrics import ReconstructionMetrics, compute_metrics
+from .metrics import (
+    ReconstructionMetrics,
+    compute_metrics,
+    compute_ms_ssim,
+    dct_band_correlation,
+)
 from .visualization import multiplicative_overlap
 
 if TYPE_CHECKING:  # pragma: no cover - optional neural advisor import
     from .neural import NeuralRewardModel
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+PLATEAU_CFG_DEFAULTS = {
+    "window": 6,
+    "delta_threshold": 0.002,
+    "boost_step": 2,
+    "boost_cap_factor": 3,
+    "log": True,
+}
+
+PLATEAU_CFG = {
+    "window": _env_int("UMBRA_PLATEAU_WINDOW", PLATEAU_CFG_DEFAULTS["window"]),
+    "delta_threshold": _env_float(
+        "UMBRA_PLATEAU_DELTA_THRESHOLD", PLATEAU_CFG_DEFAULTS["delta_threshold"]
+    ),
+    "boost_step": _env_int("UMBRA_PLATEAU_BOOST_STEP", PLATEAU_CFG_DEFAULTS["boost_step"]),
+    "boost_cap_factor": _env_int(
+        "UMBRA_PLATEAU_BOOST_CAP_FACTOR", PLATEAU_CFG_DEFAULTS["boost_cap_factor"]
+    ),
+    "log": os.getenv("UMBRA_PLATEAU_LOG", "1") not in {"0", "false", "False"},
+}
+
+
+DIFFICULTY_LADDER_DEFAULTS = {
+    "enabled": False,
+    "base": 0.48,
+    "spike": 0.60,
+    "period_gens": 12,
+    "spike_len_gens": 2,
+}
+
+DIFFICULTY_LADDER = {
+    "enabled": os.getenv("UMBRA_DIFFICULTY_LADDER_ENABLED", "0")
+    not in {"0", "false", "False"},
+    "base": _env_float("UMBRA_DIFFICULTY_LADDER_BASE", DIFFICULTY_LADDER_DEFAULTS["base"]),
+    "spike": _env_float(
+        "UMBRA_DIFFICULTY_LADDER_SPIKE", DIFFICULTY_LADDER_DEFAULTS["spike"]
+    ),
+    "period_gens": _env_int(
+        "UMBRA_DIFFICULTY_LADDER_PERIOD", DIFFICULTY_LADDER_DEFAULTS["period_gens"]
+    ),
+    "spike_len_gens": _env_int(
+        "UMBRA_DIFFICULTY_LADDER_SPIKE_LEN",
+        DIFFICULTY_LADDER_DEFAULTS["spike_len_gens"],
+    ),
+}
+
+
+REWARD_MODE = os.getenv("UMBRA_REWARD_MODE", "strict").strip().lower()
+if REWARD_MODE not in {"strict", "perceptual_mix"}:
+    REWARD_MODE = "strict"
+
+REWARD_CFG = {
+    "strict": {"alpha_overlap": 0.25, "beta_msssim": 0.0, "gamma_dct_corr": 0.0},
+    "perceptual_mix": {"alpha_overlap": 0.8, "beta_msssim": 0.15, "gamma_dct_corr": 0.05},
+}
+
+
+def normalize_difficulty(raw_value: float) -> float:
+    """Map the internal difficulty score to the [0, 1] display scale."""
+
+    return float(np.clip(raw_value, 0.0, 1.0))
 
 
 @dataclass
@@ -34,6 +122,7 @@ class CandidateResult:
     reward: float = 0.0
     predicted_reward: float | None = None
     feature_vector: tuple[float, ...] = field(default_factory=tuple)
+    reward_components: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -46,7 +135,9 @@ class GenerationRecord:
     reward_peak: float = 0.0
     cumulative_reward: float = 0.0
     difficulty_level: float = 0.0
+    difficulty_raw: float = 0.0
     improvement: float = 0.0
+    checkpoint_tag: str | None = None
 
     @property
     def best_candidate(self) -> CandidateResult:
@@ -54,6 +145,11 @@ class GenerationRecord:
             self.candidates,
             key=lambda cand: (cand.overlap_score, cand.metrics.ssim, cand.reward),
         )
+
+    @property
+    def difficulty_normalized(self) -> float:
+        base = self.difficulty_level if self.difficulty_level else self.difficulty_raw
+        return normalize_difficulty(base)
 
 
 @dataclass
@@ -212,19 +308,44 @@ class EvolutionManager:
         depth = float(np.clip(generation_index / (generation_index + 6.0), 0.0, 1.0))
         return np.array([ssim, psnr_norm, overlap_norm, improvement, depth], dtype=np.float32)
 
-    def _base_reward(self, features: np.ndarray) -> float:
-        ssim, psnr_norm, overlap_norm, improvement, depth = [float(v) for v in features]
+    def _compute_reward(
+        self,
+        features: np.ndarray,
+        *,
+        overlap_norm: float,
+        msssim: float | None = None,
+        dct_corr: float | None = None,
+    ) -> tuple[float, dict[str, float]]:
+        ssim, psnr_norm, overlap_feature, improvement, depth = [float(v) for v in features]
+        overlap_norm = float(np.clip(overlap_norm, 0.0, 1.0))
+        overlap_feature = float(np.clip(overlap_feature, 0.0, 1.0))
         positive_improvement = max(improvement, 0.0)
         high_overlap_bonus = max(overlap_norm - 0.4, 0.0) * 1.6
-        reward = (
+        base_terms = (
             0.45 * ssim
             + 0.2 * psnr_norm
-            + 0.25 * overlap_norm
             + 0.2 * positive_improvement
             + 0.1 * depth
-            + high_overlap_bonus
         )
-        return float(np.clip(reward, 0.0, 5.0))
+
+        if REWARD_MODE == "perceptual_mix":
+            cfg = REWARD_CFG["perceptual_mix"]
+            overlap_component = cfg["alpha_overlap"] * overlap_norm + high_overlap_bonus
+            msssim_component = cfg["beta_msssim"] * float(np.clip(msssim or 0.0, 0.0, 1.0))
+            dct_component = cfg["gamma_dct_corr"] * float(np.clip(dct_corr or 0.0, 0.0, 1.0))
+            reward = base_terms + overlap_component + msssim_component + dct_component
+            components = {
+                "overlap": overlap_component,
+                "msssim": msssim_component,
+                "dct_corr": dct_component,
+            }
+        else:
+            cfg = REWARD_CFG["strict"]
+            overlap_component = cfg["alpha_overlap"] * overlap_feature + high_overlap_bonus
+            reward = base_terms + overlap_component
+            components = {"overlap": overlap_component}
+
+        return float(np.clip(reward, 0.0, 5.0)), components
 
     def _update_elite_pool(self, generation: GenerationRecord) -> None:
         ranked = sorted(generation.candidates, key=lambda cand: cand.reward, reverse=True)
@@ -319,6 +440,8 @@ class EvolutionManager:
         feature_vectors: list[np.ndarray] = []
         rewards: list[float] = []
 
+        channel_axis = -1 if self.original.ndim == 3 else None
+
         for seed in seeds:
             packet = self.encoder.encode(self.original, int(seed))
             reconstruction = self.decoder.decode(packet, int(seed))
@@ -331,7 +454,22 @@ class EvolutionManager:
                 overlap_score=float(overlap_score),
             )
             features = self._candidate_features(candidate, generation.index, previous_best_ssim)
-            base_reward = self._base_reward(features)
+            overlap_norm = float(np.clip(candidate.overlap_score / 100.0, 0.0, 1.0))
+            msssim_value: float | None = None
+            dct_corr_value: float | None = None
+            if REWARD_MODE == "perceptual_mix":
+                msssim_value = compute_ms_ssim(
+                    self.original,
+                    reconstruction,
+                    channel_axis=channel_axis,
+                )
+                dct_corr_value = dct_band_correlation(self.original, reconstruction)
+            base_reward, components = self._compute_reward(
+                features,
+                overlap_norm=overlap_norm,
+                msssim=msssim_value,
+                dct_corr=dct_corr_value,
+            )
             predicted = None
             if self._reward_model is not None:
                 try:
@@ -344,6 +482,7 @@ class EvolutionManager:
             candidate.reward = reward
             candidate.predicted_reward = predicted
             candidate.feature_vector = tuple(float(value) for value in features)
+            candidate.reward_components = components
             feature_vectors.append(features)
             rewards.append(reward)
             generation.candidates.append(candidate)
@@ -356,12 +495,22 @@ class EvolutionManager:
         generation.cumulative_reward = float(self.lifetime_reward)
         self.reward_trace.append(float(generation.reward_summary))
         self._update_elite_pool(generation)
-        difficulty_level, improvement = self._difficulty_from_generation(
+        difficulty_raw, improvement = self._difficulty_from_generation(
             generation, previous_best_ssim, previous_best_overlap
         )
-        generation.difficulty_level = difficulty_level
+        normalized_difficulty = normalize_difficulty(difficulty_raw)
+        scheduled = normalized_difficulty
+        if DIFFICULTY_LADDER["enabled"]:
+            period = max(1, int(DIFFICULTY_LADDER["period_gens"]))
+            spike_len = max(1, int(DIFFICULTY_LADDER["spike_len_gens"]))
+            if generation.index % period < spike_len:
+                scheduled = float(np.clip(DIFFICULTY_LADDER["spike"], 0.0, 1.0))
+            else:
+                scheduled = float(np.clip(DIFFICULTY_LADDER["base"], 0.0, 1.0))
+        generation.difficulty_raw = difficulty_raw
+        generation.difficulty_level = scheduled
         generation.improvement = improvement
-        self.difficulty_trace.append(difficulty_level)
+        self.difficulty_trace.append(scheduled)
         if self._reward_model is not None and feature_vectors:
             try:
                 feature_batch = np.vstack(feature_vectors).astype(np.float32)
@@ -418,23 +567,40 @@ class EvolutionManager:
             )
             return
 
-        self._plateau_generations += 1
-        logger.debug(
-            "Plateau counter incremented to %d (overlap %.3f)",
-            self._plateau_generations,
-            best_overlap,
-        )
-        plateau_limit = self._carryover_generations + 2
-        if self._plateau_generations < plateau_limit:
-            return
+        recent = self.generations[-max(1, PLATEAU_CFG["window"]) :]
+        overlaps = [
+            float(record.best_candidate.overlap_score)
+            for record in recent
+            if record.candidates
+        ]
+        overlap_range = 0.0
+        if overlaps:
+            overlap_range = (max(overlaps) - min(overlaps)) / 100.0
 
-        self._plateau_generations = 0
-        self._mutation_boost = min(self._mutation_boost + 2, self.population_size * 3)
-        logger.info(
-            "Plateau detected; increasing mutation boost to %d and tightening precision",
-            self._mutation_boost,
-        )
-        self._apply_precision_ramp()
+        self._plateau_generations += 1
+        plateau_limit = self._carryover_generations + 2
+        if (
+            overlap_range < PLATEAU_CFG["delta_threshold"]
+            and self._plateau_generations >= plateau_limit
+        ):
+            self._plateau_generations = 0
+            cap = PLATEAU_CFG["boost_cap_factor"] * self.population_size
+            self._mutation_boost = min(self._mutation_boost + PLATEAU_CFG["boost_step"], cap)
+            if PLATEAU_CFG["log"]:
+                logger.info(
+                    "[plateau] range=%.4f -> mutation_boost=%d; precision ramp applied",
+                    overlap_range,
+                    self._mutation_boost,
+                )
+            generation.checkpoint_tag = "plateau_kick"
+            self._apply_precision_ramp()
+        else:
+            logger.debug(
+                "Plateau range %.4f with counter %d (overlap %.3f)",
+                overlap_range,
+                self._plateau_generations,
+                best_overlap,
+            )
 
     def _apply_precision_ramp(self) -> None:
         """Reduce encode/decode noise to approach full reconstruction."""
@@ -496,6 +662,9 @@ class EvolutionManager:
                             float(value)
                             for value in getattr(candidate, "feature_vector", tuple())
                         ),
+                        reward_components=dict(
+                            getattr(candidate, "reward_components", {})
+                        ),
                     )
                 )
             compact_generations.append(
@@ -506,7 +675,11 @@ class EvolutionManager:
                     reward_peak=float(getattr(record, "reward_peak", 0.0)),
                     cumulative_reward=float(getattr(record, "cumulative_reward", 0.0)),
                     difficulty_level=float(getattr(record, "difficulty_level", 0.0)),
+                    difficulty_raw=float(
+                        getattr(record, "difficulty_raw", getattr(record, "difficulty_level", 0.0))
+                    ),
                     improvement=float(getattr(record, "improvement", 0.0)),
+                    checkpoint_tag=getattr(record, "checkpoint_tag", None),
                 )
             )
 
@@ -588,6 +761,9 @@ class EvolutionManager:
                             float(value)
                             for value in getattr(candidate, "feature_vector", tuple())
                         ),
+                        reward_components=dict(
+                            getattr(candidate, "reward_components", {})
+                        ),
                     )
                 )
             restored_generations.append(
@@ -598,7 +774,11 @@ class EvolutionManager:
                     reward_peak=float(getattr(record, "reward_peak", 0.0)),
                     cumulative_reward=float(getattr(record, "cumulative_reward", 0.0)),
                     difficulty_level=float(getattr(record, "difficulty_level", 0.0)),
+                    difficulty_raw=float(
+                        getattr(record, "difficulty_raw", getattr(record, "difficulty_level", 0.0))
+                    ),
                     improvement=float(getattr(record, "improvement", 0.0)),
+                    checkpoint_tag=getattr(record, "checkpoint_tag", None),
                 )
             )
 
@@ -647,6 +827,7 @@ __all__ = [
     "EvolutionManager",
     "EvolutionSession",
     "GenerationRecord",
+    "normalize_difficulty",
     "compute_image_signature",
     "ParentLineage",
 ]
