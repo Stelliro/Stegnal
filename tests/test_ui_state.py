@@ -8,7 +8,14 @@ import numpy as np
 
 
 def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:
-    stub_state: dict[str, object] = {"run_infinite": False}
+    stub_state: dict[str, object] = {
+        "run_infinite": False,
+        "evolution_trees": {},
+        "shared_seed": 123,
+        "active_sound_seed": 99,
+        "current_sound_sample_rate": 48_000,
+        "current_sound_resolution": 128,
+    }
     class _StubFrame:
         def __init__(self, data: object) -> None:
             self._data = list(data) if data is not None else []
@@ -58,6 +65,8 @@ def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:
         assert stub_state["run_infinite"] is False
 
         stub_state["run_infinite"] = True
+        stub_state["shared_seed"] = 456
+        stub_state["active_sound_seed"] = 456
 
         ui._ensure_manager(
             original,

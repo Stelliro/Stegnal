@@ -7,10 +7,12 @@ import html
 import json
 import logging
 import math
+import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -24,7 +26,13 @@ from umbra.evolution import EvolutionManager, compute_image_signature
 from umbra.logging_utils import configure_logging
 from umbra.metrics import compute_metrics
 from umbra.progress import prepare_trend_chart, sanitize_progress_rows
-from umbra.sound import ShapeGuess, generate_sound_art, guess_shapes
+from umbra.sound import (
+    ShapeGuess,
+    generate_sound_art,
+    generate_sound_art_from_waveform,
+    guess_shapes,
+    load_waveform_from_wav,
+)
 from umbra.visualization import (
     colorize_comparison,
     multiplicative_overlap,
@@ -36,6 +44,161 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
+
+_IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "Geometric Echo (balanced)": {
+        "encoder_sigma": 0.2,
+        "decoder_sigma": 1.0,
+        "description": "Balanced encoder/decoder pair tuned for the classic Umbra evolution flow.",
+    },
+    "Nocturne Bloom (soft focus)": {
+        "encoder_sigma": 0.28,
+        "decoder_sigma": 0.85,
+        "description": "Higher encoder variance with a softer decoder for painterly reconstructions.",
+    },
+    "Solar Cascade (high contrast)": {
+        "encoder_sigma": 0.38,
+        "decoder_sigma": 0.65,
+        "description": "Aggressive noise for vivid contrasts balanced by a sharper decoder output.",
+    },
+}
+
+_SOUND_MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "Ambient Skyline": {
+        "sample_rate": (20_000, 48_000),
+        "resolution": (160, 224),
+        "target_dwell": 12,
+        "description": "Mid-range rates with generous dwell time for slow evolving ambient textures.",
+    },
+    "Pulse Forge": {
+        "sample_rate": (28_000, 64_000),
+        "resolution": (192, 256),
+        "target_dwell": 8,
+        "description": "Higher sample rates and resolutions for rhythmic, fast-changing scenes.",
+    },
+    "Aurora Sweep": {
+        "sample_rate": (16_000, 56_000),
+        "resolution": (128, 224),
+        "target_dwell": 16,
+        "description": "Wide spectrum exploration with longer dwell for evolving harmonic washes.",
+    },
+}
+
+
+def _generate_tree_id() -> str:
+    return uuid4().hex
+
+
+def _default_tree_label(sound_seed: int, resolution: int, sample_rate: int) -> str:
+    rate_khz = sample_rate / 1000.0
+    return f"Seed {sound_seed} • {resolution}px @ {rate_khz:.1f} kHz"
+
+
+def _format_tree_label(entry: dict[str, Any]) -> str:
+    label = entry.get("label") or "Evolution tree"
+    manager: EvolutionManager | None = entry.get("manager")
+    generation_count = len(manager.generations) if manager is not None else 0
+    suffix = "s" if generation_count != 1 else ""
+    return f"{label} ({generation_count} generation{suffix})"
+
+
+def _activate_tree(state: st.session_state, tree_id: str) -> None:
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    entry = forest.get(tree_id)
+    if entry is None:
+        return
+    state["active_tree_id"] = tree_id
+    state["evolution_manager"] = entry["manager"]
+    state["evolution_signature"] = entry["signature"]
+    state["run_infinite"] = entry.get("run_infinite", False)
+    state["pending_generations"] = entry.get("pending", 0)
+    state["active_tree_select"] = tree_id
+    meta = dict(entry.get("metadata", {}))
+    if "shared_seed" in meta:
+        state["shared_seed"] = int(meta["shared_seed"])
+    else:
+        state["shared_seed"] = int(entry["manager"].base_seed)
+    if "sound_seed" in meta:
+        state["active_sound_seed"] = int(meta["sound_seed"])
+    if "sample_rate" in meta:
+        state["current_sound_sample_rate"] = int(meta["sample_rate"])
+    if "resolution" in meta:
+        state["current_sound_resolution"] = int(meta["resolution"])
+
+
+def _register_tree(
+    state: st.session_state,
+    manager: EvolutionManager,
+    *,
+    label: str,
+    run_infinite: bool,
+    pending: int = 0,
+    activate: bool = True,
+    unique: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    signature = (manager.image_signature, int(manager.base_seed))
+
+    if not unique:
+        for existing_id, entry in forest.items():
+            if entry.get("signature") == signature:
+                entry["manager"] = manager
+                entry["label"] = label
+                entry["run_infinite"] = bool(run_infinite)
+                entry["pending"] = int(pending)
+                entry["metadata"] = dict(metadata or entry.get("metadata", {}))
+                if activate or state.get("active_tree_id") is None:
+                    _activate_tree(state, existing_id)
+                return existing_id
+
+    tree_id = _generate_tree_id()
+    forest[tree_id] = {
+        "manager": manager,
+        "signature": signature,
+        "label": label,
+        "created": time.time(),
+        "run_infinite": bool(run_infinite),
+        "pending": int(pending),
+        "metadata": dict(metadata or {}),
+    }
+
+    if activate or state.get("active_tree_id") is None:
+        _activate_tree(state, tree_id)
+    return tree_id
+
+
+def _sync_active_tree_state(state: st.session_state) -> None:
+    forest: dict[str, dict[str, Any]] | None = state.get("evolution_trees")
+    tree_id = state.get("active_tree_id")
+    if not forest or tree_id not in forest:
+        return
+    entry = forest[tree_id]
+    entry["run_infinite"] = bool(state.get("run_infinite", False))
+    entry["pending"] = int(state.get("pending_generations", 0))
+    entry["signature"] = tuple(state.get("evolution_signature", entry["signature"]))
+    meta = dict(entry.get("metadata", {}))
+    meta.update(
+        {
+            "shared_seed": int(state.get("shared_seed", meta.get("shared_seed", 0))),
+            "sound_seed": int(state.get("active_sound_seed", meta.get("sound_seed", 0))),
+            "sample_rate": int(
+                state.get("current_sound_sample_rate", meta.get("sample_rate", 48_000))
+            ),
+            "resolution": int(
+                state.get("current_sound_resolution", meta.get("resolution", 192))
+            ),
+        }
+    )
+    entry["metadata"] = meta
+
+
+def _update_tree_label(state: st.session_state, label: str) -> None:
+    forest: dict[str, dict[str, Any]] | None = state.get("evolution_trees")
+    tree_id = state.get("active_tree_id")
+    if not forest or tree_id not in forest:
+        return
+    forest[tree_id]["label"] = label
 
 
 def _update_difficulty(state: st.session_state, latest_overlap: float) -> float:
@@ -74,14 +237,6 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         st.sidebar.warning(f"Failed to load autosave: {exc}")
         return
 
-    state["evolution_manager"] = manager
-    state["evolution_signature"] = (
-        manager.image_signature,
-        float(manager.encoder.sigma),
-        float(manager.decoder.denoise_sigma or 0.0),
-        int(manager.base_seed),
-    )
-
     previous_scene = state.get("adaptive_scene")
     scene = dict(previous_scene) if isinstance(previous_scene, dict) else {}
     rng = np.random.default_rng()
@@ -98,9 +253,34 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         }
     )
     state["adaptive_scene"] = scene
+    state["active_sound_seed"] = int(scene["sound_seed"])
+    state["current_sound_sample_rate"] = int(scene["sample_rate"])
+    state["current_sound_resolution"] = int(scene["resolution"])
+    state["shared_seed"] = int(scene["base_seed"])
     state["sound_generations_left"] = int(scene["target_dwell"])
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
+    label = f"Autosave • {time.strftime('%H:%M:%S')}"
+    metadata = {
+        "shared_seed": int(scene["base_seed"]),
+        "sound_seed": int(scene["sound_seed"]),
+        "sample_rate": int(scene["sample_rate"]),
+        "resolution": int(scene["resolution"]),
+    }
+    tree_id = _register_tree(
+        state,
+        manager,
+        label=label,
+        run_infinite=False,
+        pending=0,
+        activate=True,
+        metadata=metadata,
+    )
+    state["evolution_signature"] = (manager.image_signature, int(manager.base_seed))
+    state["pending_generations"] = 0
+    state["run_infinite"] = False
+    _sync_active_tree_state(state)
+    st.session_state["active_tree_select"] = tree_id
     st.sidebar.success("Loaded autosaved evolution session.")
     logger.info(
         "Restored autosave from %s with %d generations",
@@ -116,20 +296,32 @@ def _ensure_manager(
     population_size: int,
     seed: int,
     autosave_interval: int,
+    *,
+    force_new_tree: bool = False,
+    tree_label: str | None = None,
 ) -> EvolutionManager:
     state = st.session_state
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
     was_running_infinite = bool(state.get("run_infinite", False))
-    signature = (
-        compute_image_signature(original),
-        float(encoder.sigma),
-        float(decoder.denoise_sigma or 0.0),
-        int(seed),
-    )
+    signature = (compute_image_signature(original), int(seed))
+    metadata = {
+        "shared_seed": int(state.get("shared_seed", seed)),
+        "sound_seed": int(state.get("active_sound_seed", seed)),
+        "sample_rate": int(state.get("current_sound_sample_rate", 48_000)),
+        "resolution": int(
+            state.get(
+                "current_sound_resolution",
+                original.shape[0] if original.ndim >= 2 else int(np.sqrt(original.size)),
+            )
+        ),
+    }
 
-    manager: EvolutionManager | None = state.get("evolution_manager")
-    if manager is None or state.get("evolution_signature") != signature:
-        if manager is not None:
-            logger.info("Reinitialising evolution manager due to signature change")
+    active_id = state.get("active_tree_id")
+    entry = forest.get(active_id)
+
+    if force_new_tree or entry is None:
+        if force_new_tree:
+            was_running_infinite = False
         manager = EvolutionManager(
             original=original,
             encoder=encoder,
@@ -138,20 +330,71 @@ def _ensure_manager(
             base_seed=seed,
             autosave_interval=autosave_interval,
         )
-        state["evolution_manager"] = manager
+        label = tree_label or _default_tree_label(
+            int(state.get("active_sound_seed", seed)),
+            int(original.shape[0] if original.ndim >= 2 else np.sqrt(original.size)),
+            int(state.get("current_sound_sample_rate", 48_000)),
+        )
+        _register_tree(
+            state,
+            manager,
+            label=label,
+            run_infinite=was_running_infinite,
+            pending=0,
+            activate=True,
+            unique=force_new_tree,
+            metadata=metadata,
+        )
         state["evolution_signature"] = signature
         state["pending_generations"] = 0
         state["run_infinite"] = was_running_infinite
-        if was_running_infinite:
-            logger.debug("Preserved infinite evolution run state after manager reset")
-    else:
-        manager.update_settings(
+        logger.info("Initialised evolution tree %s", label)
+        return manager
+
+    manager = entry["manager"]
+    if entry.get("signature") != signature:
+        manager = EvolutionManager(
             original=original,
             encoder=encoder,
             decoder=decoder,
             population_size=population_size,
+            base_seed=seed,
             autosave_interval=autosave_interval,
         )
+        label = tree_label or entry.get("label") or _default_tree_label(
+            int(state.get("active_sound_seed", seed)),
+            int(original.shape[0] if original.ndim >= 2 else np.sqrt(original.size)),
+            int(state.get("current_sound_sample_rate", 48_000)),
+        )
+        _register_tree(
+            state,
+            manager,
+            label=label,
+            run_infinite=was_running_infinite,
+            pending=0,
+            activate=True,
+            unique=True,
+            metadata=metadata,
+        )
+        state["evolution_signature"] = signature
+        state["pending_generations"] = 0
+        logger.info("Reinitialised evolution manager for new scene: %s", label)
+        return manager
+
+    manager.update_settings(
+        original=original,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=population_size,
+        autosave_interval=autosave_interval,
+    )
+    entry["manager"] = manager
+    entry["signature"] = signature
+    state["evolution_manager"] = manager
+    state["evolution_signature"] = signature
+    if tree_label:
+        _update_tree_label(state, tree_label)
+    _sync_active_tree_state(state)
     return manager
 
 
@@ -741,6 +984,11 @@ def run() -> None:
     state.setdefault("difficulty_improvement", 0.0)
     state.setdefault("difficulty_volatility", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
+    state.setdefault("evolution_trees", {})
+    if state.get("active_tree_id") not in state["evolution_trees"]:
+        state.pop("active_tree_id", None)
+    state.setdefault("_active_image_model", next(iter(_IMAGE_MODEL_PRESETS)))
+    state.setdefault("_active_sound_model", next(iter(_SOUND_MODEL_PRESETS)))
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
@@ -762,6 +1010,42 @@ def run() -> None:
         if autosave_path.exists():
             _attempt_autoload(autosave_dir)
         state["autosave_checked"] = True
+
+    st.sidebar.subheader("Model presets")
+    image_model_names = list(_IMAGE_MODEL_PRESETS.keys())
+    current_image_model = state.get("_active_image_model", image_model_names[0])
+    image_model_index = image_model_names.index(current_image_model)
+    selected_image_model = st.sidebar.selectbox(
+        "Image evolution preset",
+        image_model_names,
+        index=image_model_index,
+        key="image_model_select",
+    )
+    if state.get("_active_image_model") != selected_image_model:
+        preset = _IMAGE_MODEL_PRESETS[selected_image_model]
+        state["_active_image_model"] = selected_image_model
+        state["encoder_sigma_base"] = float(preset["encoder_sigma"])
+        state["decoder_sigma_base"] = float(preset["decoder_sigma"])
+    st.sidebar.caption(_IMAGE_MODEL_PRESETS[selected_image_model]["description"])
+
+    sound_model_names = list(_SOUND_MODEL_PRESETS.keys())
+    current_sound_model = state.get("_active_sound_model", sound_model_names[0])
+    sound_model_index = sound_model_names.index(current_sound_model)
+    selected_sound_model = st.sidebar.selectbox(
+        "Sound scene preset",
+        sound_model_names,
+        index=sound_model_index,
+        key="sound_model_select",
+    )
+    if state.get("_active_sound_model") != selected_sound_model:
+        preset = _SOUND_MODEL_PRESETS[selected_sound_model]
+        state["_active_sound_model"] = selected_sound_model
+        state["sound_sample_rate_bounds"] = tuple(int(v) for v in preset["sample_rate"])
+        state["sound_resolution_bounds"] = tuple(int(v) for v in preset["resolution"])
+        state["sound_target_dwell"] = int(preset["target_dwell"])
+        state["last_sound_target_dwell"] = int(preset["target_dwell"])
+        state["sound_generations_left"] = int(preset["target_dwell"])
+    st.sidebar.caption(_SOUND_MODEL_PRESETS[selected_sound_model]["description"])
 
     difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
 
@@ -818,6 +1102,42 @@ def run() -> None:
             "Forced refresh triggered new scene "
             f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
         )
+
+    forest = state.setdefault("evolution_trees", {})
+    if forest:
+        tree_ids = list(forest.keys())
+        active_tree_id = state.get("active_tree_id", tree_ids[0])
+        if active_tree_id not in forest:
+            active_tree_id = tree_ids[0]
+            _activate_tree(state, active_tree_id)
+        state.setdefault("active_tree_select", active_tree_id)
+        selected_tree_id = st.sidebar.selectbox(
+            "Evolution tree",
+            tree_ids,
+            index=tree_ids.index(active_tree_id),
+            format_func=lambda tid: _format_tree_label(forest[tid]),
+            key="active_tree_select",
+        )
+        if selected_tree_id != active_tree_id:
+            _activate_tree(state, selected_tree_id)
+            forest = state.setdefault("evolution_trees", {})
+        st.sidebar.caption(
+            "Switch between stored evolution branches to revisit previous sound scenes."
+        )
+    else:
+        state.pop("active_tree_select", None)
+
+    new_tree_requested = st.sidebar.button(
+        "Create new evolution tree",
+        key="spawn_new_tree",
+        help="Start a fresh branch with the current presets and sound scene.",
+    )
+    if new_tree_requested:
+        state["_spawn_new_tree_requested"] = True
+        state["pending_generations"] = 0
+        state["run_infinite"] = False
+        _sync_active_tree_state(state)
+        st.sidebar.info("Queued a new tree; it will initialise on the next evolution tick.")
 
     seed = int(state.get("shared_seed", 0))
     sound_seed = int(state.get("active_sound_seed", seed))
@@ -887,6 +1207,7 @@ def run() -> None:
         "Active image resolution",
         f"{current_resolution}×{current_resolution} px",
     )
+    _sync_active_tree_state(state)
 
     original_color, original, sound_clip, shape_specs = generate_sound_art(
         seed=sound_seed,
@@ -1123,6 +1444,9 @@ def run() -> None:
         state.pop("adaptive_scene", None)
         state["sound_generations_left"] = 0
         state["difficulty"] = 0.0
+        state["evolution_trees"] = {}
+        state.pop("active_tree_id", None)
+        state.pop("active_tree_select", None)
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
@@ -1130,7 +1454,12 @@ def run() -> None:
         state.pop("evolution_signature", None)
         state["autosave_checked"] = False
         state.pop("adaptive_scene", None)
+        state["evolution_trees"] = {}
+        state.pop("active_tree_id", None)
+        state.pop("active_tree_select", None)
 
+    tree_label = _default_tree_label(sound_seed, current_resolution, current_sample_rate)
+    force_new_tree = bool(state.pop("_spawn_new_tree_requested", False))
     manager = _ensure_manager(
         original=original,
         encoder=encoder,
@@ -1138,7 +1467,10 @@ def run() -> None:
         population_size=population_size,
         seed=seed,
         autosave_interval=autosave_interval,
+        force_new_tree=force_new_tree,
+        tree_label=tree_label,
     )
+    _update_tree_label(state, tree_label)
 
     if save_button:
         save_path = manager.save(autosave_dir)
@@ -1152,11 +1484,13 @@ def run() -> None:
         else:
             state["run_infinite"] = True
             logger.info("Activated infinite evolution mode")
+        _sync_active_tree_state(state)
 
     if stop_button:
         state["run_infinite"] = False
         state["pending_generations"] = 0
         logger.info("Requested evolution stop")
+        _sync_active_tree_state(state)
 
     pending_generations = int(state.get("pending_generations", 0))
     runs_to_execute = 0
@@ -1184,6 +1518,7 @@ def run() -> None:
             int(state.get("pending_generations", 0)),
             state.get("run_infinite", False),
         )
+        _sync_active_tree_state(state)
 
     trigger_rerun = False
     if generations_ran:
@@ -1291,6 +1626,49 @@ def run() -> None:
         best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
         best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
         st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
+
+        with st.expander("Sound-to-image synthesizer", expanded=False):
+            uploaded_sound_file = st.file_uploader(
+                "Upload WAV audio",
+                type=("wav", "wave"),
+                key="uploaded_sound_file",
+            )
+            if uploaded_sound_file is not None:
+                try:
+                    uploaded_sound_file.seek(0)
+                    audio_bytes = uploaded_sound_file.read()
+                    waveform, uploaded_rate = load_waveform_from_wav(audio_bytes)
+                    uploaded_color, uploaded_gray, uploaded_sound, _ = (
+                        generate_sound_art_from_waveform(
+                            waveform,
+                            uploaded_rate,
+                            image_size=(current_resolution, current_resolution),
+                        )
+                    )
+                    st.markdown(
+                        f"**Uploaded sound clip** — {uploaded_rate:,} Hz, {waveform.size} samples"
+                    )
+                    st.image(
+                        to_uint8_image(uploaded_color),
+                        caption="Sound-derived target from upload",
+                        use_column_width=True,
+                    )
+                    candidate_image = np.asarray(best_candidate.reconstruction, dtype=np.float32)
+                    upload_template = _build_color_template(uploaded_color, uploaded_gray)
+                    interpreted = _apply_color_template(candidate_image, upload_template)
+                    st.image(
+                        to_uint8_image(interpreted),
+                        caption=(
+                            "Evolution interpretation using the selected generation's best candidate"
+                        ),
+                        use_column_width=True,
+                    )
+                except ValueError as exc:
+                    st.error(f"Failed to process audio: {exc}")
+            else:
+                st.caption(
+                    "Upload a WAV file to derive a scene and compare it against the selected evolution branch."
+                )
 
         st.subheader("Generation gallery")
         cols_per_row = min(4, len(generation.candidates))
