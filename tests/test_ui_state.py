@@ -15,6 +15,7 @@ def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:
         "active_sound_seed": 99,
         "current_sound_sample_rate": 48_000,
         "current_sound_resolution": 128,
+        "active_parent_seeds": [],
     }
     class _StubFrame:
         def __init__(self, data: object) -> None:

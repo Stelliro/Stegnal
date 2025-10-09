@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import pickle
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +54,17 @@ class EvolutionSession:
     autosave_interval: int
     generations: list[GenerationRecord]
     rng_state: dict
+    parent_lineage: list[ParentLineage] = field(default_factory=list)
+
+
+@dataclass
+class ParentLineage:
+    """History entry recording a seed's performance within the lineage."""
+
+    seed: int
+    origin_generation: int
+    metrics: ReconstructionMetrics
+    overlap_score: float
 
 
 def compute_image_signature(array: np.ndarray) -> str:
@@ -82,6 +94,13 @@ class EvolutionManager:
         self.autosave_interval = max(1, int(autosave_interval))
         self.generations: list[GenerationRecord] = []
         self.rng = np.random.default_rng(self.base_seed)
+        self._parent_lineage: dict[int, ParentLineage] = {}
+
+    @property
+    def parent_lineage(self) -> list[ParentLineage]:
+        """Return a snapshot of the current parent lineage."""
+
+        return list(self._parent_lineage.values())
 
     @property
     def image_signature(self) -> str:
@@ -114,16 +133,60 @@ class EvolutionManager:
             self.autosave_interval,
         )
 
-    def run_generation(self) -> GenerationRecord:
-        """Evaluate a new generation and append it to the history."""
+    def _spawn_child_seed(self, anchors: Sequence[int]) -> int:
+        """Combine anchor seeds with fresh noise to produce a child seed."""
 
-        seeds = self.rng.integers(0, np.iinfo(np.int32).max, size=self.population_size, dtype=np.int64)
+        if not anchors:
+            return int(self.rng.integers(0, np.iinfo(np.int32).max))
+
+        choices = self.rng.choice(anchors, size=min(3, len(anchors)), replace=False)
+        combined = 0
+        for idx, parent_seed in enumerate(np.asarray(choices, dtype=np.int64)):
+            shift = (idx * 17) % 31
+            combined ^= (int(parent_seed) << shift) & 0x7FFFFFFF
+        mutation = int(self.rng.integers(0, np.iinfo(np.int32).max))
+        return (combined ^ mutation) & 0x7FFFFFFF
+
+    def run_generation(self, parent_selection: Sequence[int] | None = None) -> GenerationRecord:
+        """Evaluate a new generation and append it to the history.
+
+        Parameters
+        ----------
+        parent_selection:
+            Optional iterable of seed values that should persist as parents for
+            this generation. When omitted, the full stored lineage is used.
+        """
+
+        anchors = list(
+            dict.fromkeys(
+                int(seed) for seed in (parent_selection or self._parent_lineage.keys())
+            )
+        )
+        target_candidates = self.population_size + len(anchors)
+        seen: set[int] = set()
+        seeds: list[int] = []
+
+        def _add_seed(raw: int) -> None:
+            candidate_seed = int(raw) & 0x7FFFFFFF
+            if candidate_seed not in seen:
+                seen.add(candidate_seed)
+                seeds.append(candidate_seed)
+
+        for parent_seed in anchors:
+            _add_seed(parent_seed)
+
+        while len(seeds) < target_candidates:
+            _add_seed(self._spawn_child_seed(anchors or seeds))
+
         generation = GenerationRecord(index=len(self.generations))
         logger.info(
-            "Running generation %d with %d candidates", generation.index, self.population_size
+            "Running generation %d with %d parents and %d children",
+            generation.index,
+            len(anchors),
+            len(seeds) - len(anchors),
         )
 
-        for seed in seeds.tolist():
+        for seed in seeds:
             packet = self.encoder.encode(self.original, int(seed))
             reconstruction = self.decoder.decode(packet, int(seed))
             metrics = compute_metrics(self.original, reconstruction)
@@ -137,6 +200,15 @@ class EvolutionManager:
             generation.candidates.append(candidate)
 
         self.generations.append(generation)
+        for candidate in generation.candidates:
+            record = self._parent_lineage.get(candidate.seed)
+            if record is None or candidate.metrics.ssim >= record.metrics.ssim:
+                self._parent_lineage[candidate.seed] = ParentLineage(
+                    seed=candidate.seed,
+                    origin_generation=generation.index,
+                    metrics=candidate.metrics,
+                    overlap_score=candidate.overlap_score,
+                )
         best = generation.best_candidate
         logger.info(
             "Completed generation %d; best seed %d with SSIM %.3f and overlap %.2f",
@@ -174,6 +246,7 @@ class EvolutionManager:
             autosave_interval=self.autosave_interval,
             generations=compact_generations,
             rng_state=self.rng.bit_generator.state,
+            parent_lineage=list(self._parent_lineage.values()),
         )
 
     def save(self, directory: str | Path) -> Path:
@@ -238,6 +311,8 @@ class EvolutionManager:
         )
         manager.generations = restored_generations
         manager.rng.bit_generator.state = session.rng_state
+        lineage = getattr(session, "parent_lineage", [])
+        manager._parent_lineage = {entry.seed: entry for entry in lineage}
         return manager
 
 
@@ -247,4 +322,5 @@ __all__ = [
     "EvolutionSession",
     "GenerationRecord",
     "compute_image_signature",
+    "ParentLineage",
 ]

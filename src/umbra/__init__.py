@@ -2,7 +2,7 @@
 
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
-from .evolution import EvolutionManager
+from .evolution import EvolutionManager, ParentLineage
 from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
 from .pipeline import PipelineResult, replay_packet, run_pipeline
@@ -25,6 +25,7 @@ __all__ = [
     "NoiseStreamEncoder",
     "NoiseStreamDecoder",
     "EvolutionManager",
+    "ParentLineage",
     "compute_metrics",
     "ReconstructionMetrics",
     "run_pipeline",

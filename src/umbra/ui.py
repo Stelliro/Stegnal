@@ -22,7 +22,7 @@ from PIL import Image
 from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
-from umbra.evolution import EvolutionManager, compute_image_signature
+from umbra.evolution import EvolutionManager, GenerationRecord, compute_image_signature
 from umbra.logging_utils import configure_logging
 from umbra.metrics import compute_metrics
 from umbra.progress import prepare_trend_chart, sanitize_progress_rows
@@ -128,6 +128,10 @@ def _activate_tree(state: st.session_state, tree_id: str) -> None:
         state["current_sound_sample_rate"] = int(meta["sample_rate"])
     if "resolution" in meta:
         state["current_sound_resolution"] = int(meta["resolution"])
+    if "parent_seeds" in meta:
+        parent_meta = meta.get("parent_seeds", [])
+        if isinstance(parent_meta, (list, tuple)):
+            state["active_parent_seeds"] = [int(seed) for seed in parent_meta]
 
 
 def _register_tree(
@@ -192,6 +196,12 @@ def _sync_active_tree_state(state: st.session_state) -> None:
             "resolution": int(
                 state.get("current_sound_resolution", meta.get("resolution", 192))
             ),
+            "parent_seeds": [
+                int(seed)
+                for seed in state.get(
+                    "active_parent_seeds", meta.get("parent_seeds", [])
+                )
+            ],
         }
     )
     entry["metadata"] = meta
@@ -203,6 +213,27 @@ def _update_tree_label(state: st.session_state, label: str) -> None:
     if not forest or tree_id not in forest:
         return
     forest[tree_id]["label"] = label
+
+
+def _refresh_active_parents(
+    state: st.session_state,
+    manager: EvolutionManager,
+    generation: GenerationRecord | None = None,
+) -> None:
+    """Ensure the session tracks lineage seeds for selective breeding."""
+
+    available = {entry.seed for entry in manager.parent_lineage}
+    selection = [
+        int(seed)
+        for seed in state.get("active_parent_seeds", [])
+        if int(seed) in available
+    ]
+    if generation is not None and generation.candidates:
+        selection.append(generation.best_candidate.seed)
+    elif not selection and available:
+        best_entry = max(manager.parent_lineage, key=lambda entry: entry.metrics.ssim)
+        selection.append(best_entry.seed)
+    state["active_parent_seeds"] = list(dict.fromkeys(selection))
 
 
 def _get_reconstruction_cache(state: st.session_state) -> dict[str, Any]:
@@ -466,6 +497,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         "sound_seed": int(scene["sound_seed"]),
         "sample_rate": int(scene["sample_rate"]),
         "resolution": int(scene["resolution"]),
+        "parent_seeds": [entry.seed for entry in manager.parent_lineage],
     }
     _register_tree(
         state,
@@ -513,6 +545,7 @@ def _ensure_manager(
                 original.shape[0] if original.ndim >= 2 else int(np.sqrt(original.size)),
             )
         ),
+        "parent_seeds": [int(seed) for seed in state.get("active_parent_seeds", [])],
     }
 
     active_id = state.get("active_tree_id")
@@ -1184,6 +1217,7 @@ def run() -> None:
     state.setdefault("difficulty_volatility", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
     state.setdefault("evolution_trees", {})
+    state.setdefault("active_parent_seeds", [])
     if state.get("active_tree_id") not in state["evolution_trees"]:
         state.pop("active_tree_id", None)
     state.setdefault("_active_image_model", next(iter(_IMAGE_MODEL_PRESETS)))
@@ -1640,6 +1674,7 @@ def run() -> None:
         state["difficulty"] = 0.0
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
+        state["active_parent_seeds"] = []
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
@@ -1649,6 +1684,7 @@ def run() -> None:
         state.pop("adaptive_scene", None)
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
+        state["active_parent_seeds"] = []
 
     tree_label = _default_tree_label(sound_seed, current_resolution, current_sample_rate)
     force_new_tree = bool(state.pop("_spawn_new_tree_requested", False))
@@ -1663,6 +1699,56 @@ def run() -> None:
         tree_label=tree_label,
     )
     _update_tree_label(state, tree_label)
+    _refresh_active_parents(state, manager)
+
+    st.sidebar.subheader("Selective breeding")
+    parent_entries = sorted(
+        manager.parent_lineage,
+        key=lambda entry: (entry.origin_generation, -entry.metrics.ssim),
+    )
+    parent_labels = {
+        entry.seed: (
+            f"Gen {entry.origin_generation} • seed {entry.seed} "
+            f"(SSIM {entry.metrics.ssim:.3f}, overlap {entry.overlap_score:.1f}%)"
+        )
+        for entry in parent_entries
+    }
+    parent_options = list(parent_labels.keys())
+    default_selection = [
+        seed for seed in state.get("active_parent_seeds", []) if seed in parent_labels
+    ]
+    if not default_selection and parent_options:
+        default_selection = [parent_options[-1]]
+    parent_selection = st.sidebar.multiselect(
+        "Active parent seeds",
+        parent_options,
+        default=default_selection,
+        key="parent_seed_select",
+        format_func=lambda seed: parent_labels.get(seed, f"Seed {seed}"),
+        help=(
+            "Selected parent seeds remain in every generation and act as anchors for "
+            "new child mutations. Leave the selection empty to use the full lineage."
+        ),
+    )
+    state["active_parent_seeds"] = [int(seed) for seed in parent_selection]
+    _sync_active_tree_state(state)
+
+    with st.expander("Lineage library", expanded=False):
+        if parent_entries:
+            active_parent_set = {int(seed) for seed in state.get("active_parent_seeds", [])}
+            summary_rows = [
+                {
+                    "Seed": entry.seed,
+                    "Generation": entry.origin_generation,
+                    "SSIM": f"{entry.metrics.ssim:.3f}",
+                    "Overlap (%)": f"{entry.overlap_score:.1f}",
+                    "Active": "★" if entry.seed in active_parent_set else "",
+                }
+                for entry in parent_entries
+            ]
+            st.table(summary_rows)
+        else:
+            st.info("Run at least one generation to populate the parent lineage.")
 
     if save_button:
         save_path = manager.save(autosave_dir)
@@ -1697,7 +1783,10 @@ def run() -> None:
     reseeded = False
     if runs_to_execute:
         for _ in range(runs_to_execute):
-            manager.run_generation()
+            selection = state.get("active_parent_seeds", [])
+            parent_selection = selection if selection else None
+            generation = manager.run_generation(parent_selection=parent_selection)
+            _refresh_active_parents(state, manager, generation)
             generations_ran += 1
             if finite_batch:
                 state["pending_generations"] = max(
