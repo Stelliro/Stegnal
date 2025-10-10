@@ -21,6 +21,7 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from umbra.chart_export import export_chart_png
 from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
@@ -34,12 +35,17 @@ from umbra.evolution import (
 from umbra.logging_utils import collect_provenance, configure_logging
 from umbra.metrics import ReconstructionMetrics, compute_metrics
 from umbra.neural import NeuralRewardModel
-from umbra.progress import prepare_trend_chart, sanitize_progress_rows
+from umbra.progress import (
+    prepare_metrics_chart,
+    prepare_trend_chart,
+    sanitize_progress_rows,
+)
 from umbra.reconstruction import (
     ReconstructionResult,
     run_reconstruction_cycle,
     waveform_to_wav_bytes,
 )
+from umbra.run_helpers import ensure_run_paths
 from umbra.sound import (
     ShapeGuess,
     generate_sound_art,
@@ -1812,6 +1818,18 @@ def run() -> None:
         state["_umbra_log_directory"] = str(log_dir)
         logger.info("Logging configured; writing UI diagnostics to %s", log_dir)
 
+    run_id = state.get("_umbra_run_id")
+    if not isinstance(run_id, str) or not run_id:
+        run_id = uuid4().hex
+        state["_umbra_run_id"] = run_id
+    run_paths = ensure_run_paths(run_id)
+    state["_umbra_run_directory"] = str(run_paths.root)
+    state["_umbra_charts_directory"] = str(run_paths.charts)
+    chart_files = state.get("_umbra_chart_files")
+    if not isinstance(chart_files, dict):
+        chart_files = {}
+        state["_umbra_chart_files"] = chart_files
+
     st.title("Project Umbra · Compact evolution console")
     st.caption(
         "Difficulty steers every setting automatically—press start and let the system tune itself."
@@ -2307,6 +2325,18 @@ def run() -> None:
         float(metrics.psnr),
         float(sound_overlap_score),
     )
+    metrics_spec = prepare_metrics_chart(history)
+    if metrics_spec:
+        try:
+            metrics_path = run_paths.charts / "metrics.png"
+            export_chart_png(metrics_spec, metrics_path)
+        except Exception:  # pragma: no cover - defensive
+            chart_files.pop("metrics", None)
+            logger.exception("Failed to export metrics chart")
+        else:
+            chart_files["metrics"] = str(metrics_path)
+    else:
+        chart_files.pop("metrics", None)
     target_progress, improvement_signal, volatility_signal, reward_signal = _derive_difficulty_metrics(
         history
     )
@@ -2786,6 +2816,16 @@ def run() -> None:
                     logger.debug(
                         "Rendered trend chart with %d records", len(sanitized_rows)
                     )
+                    try:
+                        trend_path = run_paths.charts / "trend.png"
+                        export_chart_png(spec, trend_path)
+                    except Exception:  # pragma: no cover - defensive
+                        chart_files.pop("trend", None)
+                        logger.exception("Failed to export trend chart")
+                    else:
+                        chart_files["trend"] = str(trend_path)
+                else:
+                    chart_files.pop("trend", None)
                 if message:
                     st.caption(message)
 
@@ -2980,6 +3020,34 @@ def run() -> None:
             st.info("Run at least one generation to visualise evolution progress.")
         with experiments_tab:
             st.info("Experiments unlock after the first generation completes.")
+
+    available_charts: list[tuple[str, Path]] = []
+    for key, path_str in chart_files.items():
+        if not isinstance(path_str, str):
+            continue
+        chart_path = Path(path_str)
+        if chart_path.exists():
+            available_charts.append((key, chart_path))
+
+    with st.sidebar.expander("Chart exports", expanded=False):
+        if available_charts:
+            label_map = {"trend": "Trend chart", "metrics": "Metrics chart"}
+            for key, chart_path in sorted(available_charts, key=lambda item: item[0]):
+                try:
+                    chart_bytes = chart_path.read_bytes()
+                except OSError:  # pragma: no cover - filesystem guard
+                    logger.exception("Failed to load chart %s for download", chart_path)
+                    continue
+                label = label_map.get(key, chart_path.stem.replace("_", " ").title())
+                st.download_button(
+                    label=f"Download {label}",
+                    data=chart_bytes,
+                    file_name=chart_path.name,
+                    mime="image/png",
+                    key=f"download_{key}_chart",
+                )
+        else:
+            st.caption("Charts will appear once evolution has enough history to plot.")
 
     export_payload = _session_export_payload(
         state=state,
