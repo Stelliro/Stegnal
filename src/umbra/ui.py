@@ -10,6 +10,7 @@ import logging
 import math
 import time
 import zipfile
+from datetime import datetime
 from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +23,11 @@ import streamlit as st
 from PIL import Image
 
 from umbra.adversarial import AdversarialManager, apply_generator
+from umbra.codec import (
+    decode_waveform_to_image,
+    encode_image_to_waveform,
+    encode_image_to_wav_bytes,
+)
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import (
@@ -34,6 +40,7 @@ from umbra.evolution import (
 from umbra.logging_utils import collect_provenance, configure_logging
 from umbra.metrics import ReconstructionMetrics, compute_metrics
 from umbra.neural import NeuralRewardModel
+from umbra.predictor import predict_image_from_waveform
 from umbra.progress import prepare_trend_chart, sanitize_progress_rows
 from umbra.reconstruction import (
     ReconstructionResult,
@@ -43,7 +50,6 @@ from umbra.reconstruction import (
 from umbra.sound import (
     ShapeGuess,
     generate_sound_art,
-    generate_sound_art_from_waveform,
     guess_shapes,
     load_waveform_from_wav,
 )
@@ -91,6 +97,83 @@ _DARK_STYLE = """
 }
 </style>
 """
+
+
+class RunStore:
+    """Persist run-specific artifacts to disk."""
+
+    def __init__(self, root: Path | str) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def start_run(self) -> str:
+        """Create a new run folder and return its identifier."""
+
+        base = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        counter = 0
+        while True:
+            run_id = base if counter == 0 else f"{base}-{counter:02d}"
+            run_dir = self.root / run_id
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+                (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+                return run_id
+            except FileExistsError:
+                counter += 1
+
+    def artifacts_directory(self, run_id: str) -> Path:
+        path = self.root / run_id / "artifacts"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_bytes(self, run_id: str, filename: str, data: bytes) -> Path:
+        path = self.artifacts_directory(run_id) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def save_image(self, run_id: str, filename: str, image: np.ndarray) -> Path:
+        png_bytes = _image_to_png_bytes(image)
+        return self.save_bytes(run_id, filename, png_bytes)
+
+
+def _sanitize_filename(label: str, suffix: str) -> str:
+    safe = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_"
+        for ch in label.strip().lower()
+    )
+    safe = safe.strip("._") or "artifact"
+    return f"{safe}{suffix}"
+
+
+def _image_to_png_bytes(image: np.ndarray) -> bytes:
+    array = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    with BytesIO() as buffer:
+        Image.fromarray((array * 255.0).astype(np.uint8), mode="RGB").save(
+            buffer, format="PNG"
+        )
+        return buffer.getvalue()
+
+
+def _resize_image(image: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
+    rows, cols = resolution
+    if rows <= 0 or cols <= 0:
+        raise ValueError("resolution must contain positive dimensions")
+    array = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    if array.shape[0] == rows and array.shape[1] == cols:
+        return array
+    pil_image = Image.fromarray((array * 255.0).astype(np.uint8), mode="RGB")
+    resized = pil_image.resize((cols, rows), Image.BILINEAR)
+    return np.asarray(resized, dtype=np.float32) / 255.0
+
+
+def _load_uploaded_image(file) -> np.ndarray:
+    try:
+        with Image.open(file) as uploaded:
+            array = np.asarray(uploaded.convert("RGB"), dtype=np.float32) / 255.0
+        return np.clip(array, 0.0, 1.0)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError(f"Unable to read image: {exc}") from exc
 
 
 def _ensure_page_config() -> None:
@@ -1827,6 +1910,9 @@ def run() -> None:
     state.setdefault("autosave_interval", 5)
     state.setdefault("generations_to_queue", 5)
     state.setdefault("evolution_mode", "Finite")
+    if "run_store" not in state:
+        state["run_store"] = RunStore(Path("runs"))
+    state.setdefault("active_run_id", None)
     if "shared_seed" not in state:
         state["shared_seed"] = int(np.random.default_rng().integers(0, np.iinfo(np.int32).max))
     state.setdefault("encoder_sigma_base", 0.2)
@@ -2525,6 +2611,7 @@ def run() -> None:
         state.pop("evolution_signature", None)
         state["pending_generations"] = 0
         state["run_infinite"] = False
+        state["active_run_id"] = None
         state.pop("adaptive_scene", None)
         state["sound_generations_left"] = 0
         state["difficulty"] = 0.0
@@ -2541,6 +2628,7 @@ def run() -> None:
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
         state["active_parent_seeds"] = []
+        state["active_run_id"] = None
 
     tree_label = _default_tree_label(sound_seed, current_resolution, current_sample_rate)
     force_new_tree = bool(state.pop("_spawn_new_tree_requested", False))
@@ -2613,6 +2701,8 @@ def run() -> None:
         save_path = manager.save(autosave_dir)
         st.sidebar.success(f"Saved evolution session to {save_path}")
 
+    run_store: RunStore = state["run_store"]
+
     if run_button:
         if evolution_mode == "Finite":
             state["pending_generations"] = generations_to_queue
@@ -2622,12 +2712,17 @@ def run() -> None:
             state["run_infinite"] = True
             logger.info("Activated infinite evolution mode")
         _sync_active_tree_state(state)
+        if not state.get("active_run_id"):
+            new_run_id = run_store.start_run()
+            state["active_run_id"] = new_run_id
+            logger.info("Started run %s", new_run_id)
 
     if stop_button:
         state["run_infinite"] = False
         state["pending_generations"] = 0
         logger.info("Requested evolution stop")
         _sync_active_tree_state(state)
+        state["active_run_id"] = None
 
     pending_generations = int(state.get("pending_generations", 0))
     runs_to_execute = 0
@@ -2804,6 +2899,9 @@ def run() -> None:
                 st.caption("Only one generation so far; displaying the latest results.")
             generation = manager.generations[selected_generation]
             best_candidate = generation.best_candidate
+            best_candidate_image = _apply_color_template(
+                best_candidate.reconstruction, color_template
+            )
 
             best_candidate_summary = {
                 "generation": generation.index,
@@ -2926,60 +3024,215 @@ def run() -> None:
             st.table(summary_rows)
 
         with experiments_tab:
-            st.subheader("Sound-to-image synthesizer")
-            uploaded_sound_file = st.file_uploader(
-                "Upload WAV audio",
-                type=("wav", "wave"),
-                key="uploaded_sound_file",
-            )
-            if uploaded_sound_file is not None:
-                try:
-                    uploaded_sound_file.seek(0)
-                    audio_bytes = uploaded_sound_file.read()
-                    waveform, uploaded_rate = load_waveform_from_wav(audio_bytes)
-                    uploaded_color, uploaded_gray, uploaded_sound, _ = (
-                        generate_sound_art_from_waveform(
-                            waveform,
-                            uploaded_rate,
-                            image_size=(current_resolution, current_resolution),
-                        )
+            st.subheader("Signal codec laboratory")
+            run_id = state.get("active_run_id")
+            if run_id:
+                artifact_dir = run_store.artifacts_directory(run_id)
+                st.caption(
+                    "Active run {run_id} — artifacts stored in {path}".format(
+                        run_id=run_id,
+                        path=artifact_dir,
                     )
-                    st.markdown(
-                        f"**Uploaded sound clip** — {uploaded_rate:,} Hz, {waveform.size} samples"
-                    )
-                    st.image(
-                        to_uint8_image(uploaded_color),
-                        caption="Sound-derived target from upload",
-                        use_column_width=True,
-                    )
-                    candidate_image = np.asarray(best_candidate.reconstruction, dtype=np.float32)
-                    upload_template = _build_color_template(uploaded_color, uploaded_gray)
-                    interpreted = _apply_color_template(candidate_image, upload_template)
-                    st.image(
-                        to_uint8_image(interpreted),
-                        caption=(
-                            "Evolution interpretation using the selected generation's best candidate"
-                        ),
-                        use_column_width=True,
-                    )
-                except ValueError as exc:
-                    st.error(f"Failed to process audio: {exc}")
+                )
             else:
                 st.caption(
-                    "Upload a WAV file to derive a scene and compare it against the selected evolution branch."
+                    "Start an evolution run to automatically save generated artifacts."
                 )
 
-            st.subheader("Noise reconstruction lab")
-            _render_reconstruction_lab(
-                state,
-                default_resolution=current_resolution,
-                default_sample_rate=int(state.get("current_sound_sample_rate", 48_000)),
-            )
+            image_lane, audio_lane = st.columns(2)
+
+            with image_lane:
+                st.markdown("#### Image → WAV")
+                sample_rate_choice = int(
+                    st.slider(
+                        "Sample rate (Hz)",
+                        min_value=8_000,
+                        max_value=96_000,
+                        value=int(np.clip(current_sample_rate, 8_000, 96_000)),
+                        step=1_000,
+                        key="codec_sample_rate",
+                    )
+                )
+                source_options: list[str] = []
+                if best_candidate is not None:
+                    source_options.append("Evolution best")
+                source_options.append("Upload")
+                source_choice = st.radio(
+                    "Source image",
+                    options=source_options,
+                    index=0,
+                    key="codec_image_source",
+                )
+
+                source_image: np.ndarray | None = None
+                source_label = ""
+                if source_choice == "Evolution best" and best_candidate is not None:
+                    source_image = np.asarray(best_candidate_image, dtype=np.float32)
+                    source_label = f"seed-{best_candidate.seed}"
+                else:
+                    uploaded_image = st.file_uploader(
+                        "Upload image",
+                        type=("png", "jpg", "jpeg", "bmp"),
+                        key="codec_image_upload",
+                    )
+                    if uploaded_image is not None:
+                        try:
+                            uploaded_image.seek(0)
+                            source_image = _load_uploaded_image(uploaded_image)
+                            source_label = uploaded_image.name or "upload"
+                        except ValueError as exc:
+                            st.error(str(exc))
+
+                if source_image is not None:
+                    st.image(
+                        to_uint8_image(source_image),
+                        caption=f"Source · {source_label}" if source_label else "Source image",
+                        use_column_width=True,
+                    )
+                    waveform = encode_image_to_waveform(
+                        source_image,
+                        sample_rate=sample_rate_choice,
+                    )
+                    wav_bytes = encode_image_to_wav_bytes(
+                        source_image,
+                        sample_rate=sample_rate_choice,
+                    )
+                    roundtrip = decode_waveform_to_image(
+                        waveform,
+                        sample_rate=sample_rate_choice,
+                        resolution=source_image.shape[:2],
+                    )
+                    st.image(
+                        to_uint8_image(roundtrip),
+                        caption="Heuristic round-trip",
+                        use_column_width=True,
+                    )
+                    metrics_roundtrip = compute_metrics(source_image, roundtrip)
+                    st.markdown(
+                        _metric_badge_html(
+                            "Round-trip vs source",
+                            metrics_roundtrip.psnr,
+                            metrics_roundtrip.ssim,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    st.audio(wav_bytes, format="audio/wav")
+                    download_name = _sanitize_filename(
+                        source_label or "image",
+                        f"_{sample_rate_choice}hz.wav",
+                    )
+                    st.download_button(
+                        "Download waveform",
+                        data=wav_bytes,
+                        file_name=download_name,
+                        mime="audio/wav",
+                        key="download_waveform_bytes",
+                    )
+                    if run_id:
+                        if st.button("Save waveform artifact", key="save_waveform_artifact"):
+                            saved_path = run_store.save_bytes(run_id, download_name, wav_bytes)
+                            st.success(f"Saved waveform artifact to {saved_path}")
+                    else:
+                        st.caption("Artifacts will be persisted once a run is active.")
+                else:
+                    st.caption("Provide an image to encode it into audio.")
+
+            with audio_lane:
+                st.markdown("#### WAV → Image")
+                uploaded_wav = st.file_uploader(
+                    "Upload WAV audio",
+                    type=("wav", "wave"),
+                    key="codec_wav_upload",
+                )
+                target_resolution = int(
+                    st.number_input(
+                        "Target resolution",
+                        min_value=32,
+                        max_value=512,
+                        value=int(current_resolution),
+                        step=8,
+                        key="codec_target_resolution",
+                    )
+                )
+                if uploaded_wav is not None:
+                    try:
+                        uploaded_wav.seek(0)
+                        wav_bytes = uploaded_wav.read()
+                        waveform, detected_rate = load_waveform_from_wav(wav_bytes)
+                        prediction = predict_image_from_waveform(
+                            waveform,
+                            sample_rate=detected_rate,
+                            resolution=(target_resolution, target_resolution),
+                        )
+                        st.audio(wav_bytes, format="audio/wav")
+                        st.markdown(
+                            f"**Detected sample rate** — {detected_rate:,} Hz, {waveform.size} samples"
+                        )
+                        st.image(
+                            to_uint8_image(prediction),
+                            caption="Predicted image",
+                            use_column_width=True,
+                        )
+                        reference_original = colored_original
+                        if reference_original.shape[:2] != prediction.shape[:2]:
+                            reference_original = _resize_image(
+                                reference_original, prediction.shape[:2]
+                            )
+                        original_metrics = compute_metrics(
+                            reference_original, prediction
+                        )
+                        reference_best = best_candidate_image
+                        if reference_best.shape[:2] != prediction.shape[:2]:
+                            reference_best = _resize_image(
+                                reference_best, prediction.shape[:2]
+                            )
+                        best_metrics = compute_metrics(reference_best, prediction)
+                        metric_cols = st.columns(2)
+                        metric_cols[0].markdown(
+                            _metric_badge_html(
+                                "Vs original reference",
+                                original_metrics.psnr,
+                                original_metrics.ssim,
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        metric_cols[1].markdown(
+                            _metric_badge_html(
+                                "Vs evolution best",
+                                best_metrics.psnr,
+                                best_metrics.ssim,
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        png_bytes = _image_to_png_bytes(prediction)
+                        download_png = _sanitize_filename(
+                            (uploaded_wav.name or "waveform"),
+                            "_prediction.png",
+                        )
+                        st.download_button(
+                            "Download predicted image",
+                            data=png_bytes,
+                            file_name=download_png,
+                            mime="image/png",
+                            key="download_predicted_image",
+                        )
+                        if run_id:
+                            if st.button("Save image artifact", key="save_prediction_artifact"):
+                                saved = run_store.save_image(run_id, download_png, prediction)
+                                st.success(f"Saved image artifact to {saved}")
+                        else:
+                            st.caption("Artifacts will be persisted once a run is active.")
+                    except ValueError as exc:
+                        st.error(f"Failed to decode audio: {exc}")
+                else:
+                    st.caption("Upload a WAV file to reconstruct an image.")
     else:
         with evolution_tab:
             st.info("Run at least one generation to visualise evolution progress.")
         with experiments_tab:
-            st.info("Experiments unlock after the first generation completes.")
+            st.info(
+                "Run at least one evolution cycle to unlock the signal codec workflow."
+            )
 
     export_payload = _session_export_payload(
         state=state,
