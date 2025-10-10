@@ -43,6 +43,20 @@ def test_prepare_trend_chart_returns_spec_when_data_varies() -> None:
     modifiers = spec["usermeta"]["embedOptions"]["tooltip"]["modifiers"]
     names = [item["name"] for item in modifiers]
     assert names == ["offset", "preventOverflow", "hide", "flip"]
+    assert spec["encoding"]["x"]["scale"]["domain"] == [0.0, 1.0]
+    assert spec["encoding"]["y"]["scale"]["domain"] == [0.8, 21.5]
+
+
+def test_prepare_trend_chart_handles_none_values() -> None:
+    rows = [
+        {"Generation": 0.0, "Best SSIM": None},
+        {"Generation": 1.0, "Best SSIM": 0.5},
+    ]
+
+    spec, message = prepare_trend_chart(rows, had_non_finite=True)
+
+    assert spec is None
+    assert message is not None
 
 
 def test_sanitize_progress_rows_preserves_additional_columns() -> None:

@@ -69,25 +69,19 @@ def prepare_trend_chart(
 ) -> tuple[dict[str, object] | None, str | None]:
     """Create a Vega-Lite spec from sanitized rows or a user-facing message."""
 
-    if not rows:
-        message = (
+    def _empty_message() -> str:
+        return (
             "Trend chart hidden until generations contain finite metric values."
             if had_non_finite
             else "Trend chart will appear once generations contain finite metric values."
         )
-        return None, message
+
+    if not rows:
+        return None, _empty_message()
 
     metrics = _metric_names(rows)
     if not metrics:
         return None, "Trend chart requires metric columns to display."
-
-    unique_generations = len({row["Generation"] for row in rows})
-    metric_variations = []
-    for metric in metrics:
-        values = {row[metric] for row in rows if metric in row}
-        metric_variations.append(len(values) > 1)
-
-    has_variation = unique_generations > 1 and any(metric_variations)
 
     values: list[dict[str, float]] = []
     for row in rows:
@@ -102,22 +96,51 @@ def prepare_trend_chart(
                     }
                 )
 
-    if not values:
+    filtered_values = []
+    for entry in values:
+        generation = entry["Generation"]
+        value = entry["Value"]
+        if value is None or not math.isfinite(value):
+            logger.debug(
+                "Skipping non-finite metric value for generation %s metric %s",
+                generation,
+                entry["Metric"],
+            )
+            continue
+        if not math.isfinite(generation):
+            logger.debug("Skipping non-finite generation value: %s", generation)
+            continue
+        filtered_values.append(entry)
+
+    if not filtered_values:
+        return None, _empty_message()
+
+    metrics_with_data = sorted({entry["Metric"] for entry in filtered_values})
+    if not metrics_with_data:
         return None, "Trend chart requires metric columns to display."
 
-    for entry in values:
-        if not math.isfinite(entry["Generation"]) or not math.isfinite(entry["Value"]):
-            logger.warning(
-                "Discarding trend chart due to non-finite values after sanitization"
-            )
-            return None, "Trend chart hidden until generations contain finite metric values."
+    generation_values = [entry["Generation"] for entry in filtered_values]
+    unique_generations = len(set(generation_values))
 
-    if not has_variation:
+    metric_variations = [
+        len({entry["Value"] for entry in filtered_values if entry["Metric"] == metric}) > 1
+        for metric in metrics_with_data
+    ]
+
+    if unique_generations <= 1 or not any(metric_variations):
+        return None, "Trend chart will appear once multiple non-identical generations are available."
+
+    score_values = [entry["Value"] for entry in filtered_values]
+    x_domain = [min(generation_values), max(generation_values)]
+    y_min = min(score_values)
+    y_max = max(score_values)
+
+    if y_min == y_max:
         return None, "Trend chart will appear once multiple non-identical generations are available."
 
     spec = {
         "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
-        "data": {"values": values},
+        "data": {"values": filtered_values},
         "autosize": {"type": "fit", "contains": "padding"},
         "mark": {"type": "line", "point": True},
         "encoding": {
@@ -145,10 +168,13 @@ def prepare_trend_chart(
         },
     }
 
+    spec["encoding"]["x"]["scale"] = {"domain": x_domain}
+    spec["encoding"]["y"]["scale"] = {"domain": [y_min, y_max]}
+
     logger.debug(
         "Prepared trend chart spec with %d records and metrics %s",
-        len(values),
-        metrics,
+        len(filtered_values),
+        metrics_with_data,
     )
     return spec, None
 
