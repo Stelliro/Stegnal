@@ -10,6 +10,7 @@ import logging
 import math
 import time
 import zipfile
+from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,54 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
 
+_PAGE_CONFIGURED = False
+
+_DARK_STYLE = """
+<style>
+:root {
+    color-scheme: dark;
+}
+.stApp, .block-container {
+    background: #0d1017 !important;
+    color: #f5f6fa !important;
+}
+.stMarkdown, .stMetric, .stSelectbox, .stButton, .stSlider, .stTabs {
+    color: #f5f6fa !important;
+}
+.stButton>button, .stSlider>div>div>div>button {
+    background: #1f2937 !important;
+    color: #f5f6fa !important;
+    border: 1px solid #374151 !important;
+}
+.stSelectbox>div>div>button, .stSelectbox>div>div>div {
+    background: #111827 !important;
+    color: #f5f6fa !important;
+}
+.stExpander, .stTextInput, .stNumberInput, .stMultiSelect, .stFileUploader {
+    background: transparent !important;
+    color: #f5f6fa !important;
+}
+.stTable, .stDataFrame {
+    color: #f5f6fa !important;
+}
+</style>
+"""
+
+
+def _ensure_page_config() -> None:
+    """Apply a compact dark configuration once for the Streamlit page."""
+
+    global _PAGE_CONFIGURED
+    if _PAGE_CONFIGURED:
+        return
+    st.set_page_config(
+        page_title="Project Umbra",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    st.markdown(_DARK_STYLE, unsafe_allow_html=True)
+    _PAGE_CONFIGURED = True
+
 
 def _quantize_slider_value(
     value: float,
@@ -94,6 +143,50 @@ def _metric_badge_html(label: str, psnr: float, ssim: float) -> str:
     )
 
 
+def _blend_range(bounds: tuple[int, int], weight: float) -> int:
+    """Interpolate ``bounds`` using ``weight`` in ``[0, 1]`` and return an int."""
+
+    low, high = bounds
+    return int(round(np.interp(np.clip(weight, 0.0, 1.0), [0.0, 1.0], [low, high])))
+
+
+def _auto_run_parameters(
+    *,
+    difficulty_progress: float,
+    profile: dict[str, Any],
+    hyper_profile: HyperPerformanceProfile | None,
+) -> dict[str, int]:
+    """Derive compact run parameters from the chosen difficulty profile."""
+
+    base_target = float(profile.get("target", 0.5))
+    weight = float(np.clip(0.35 * difficulty_progress + 0.65 * base_target, 0.0, 1.0))
+
+    subjects_goal = int(profile.get("subjects", 120))
+    if hyper_profile is not None and hyper_profile.target_subjects:
+        subjects_goal = int(max(subjects_goal, hyper_profile.target_subjects))
+    else:
+        subjects_goal = int(round(subjects_goal * (0.85 + 0.3 * weight)))
+
+    dwell = _blend_range(tuple(profile.get("dwell", (12, 20))), weight)
+    population = _blend_range(tuple(profile.get("population", (4, 8))), weight)
+    if dwell > 0:
+        ideal_population = max(3, int(round(subjects_goal / dwell)))
+        population = int(np.clip(ideal_population, profile["population"][0], profile["population"][1]))
+
+    queue = _blend_range(tuple(profile.get("queue", (4, 8))), weight)
+    autosave = _blend_range(tuple(profile.get("autosave", (6, 10))), weight)
+
+    return {
+        "population_size": max(1, population),
+        "generations_to_queue": max(1, queue),
+        "autosave_interval": max(1, autosave),
+        "target_dwell": max(1, dwell),
+        "subjects_goal": max(1, subjects_goal),
+        "pause_threshold": float(profile.get("pause_threshold", 0.9)),
+        "difficulty_target": base_target,
+    }
+
+
 def _aggregate_reward_components(record: GenerationRecord) -> dict[str, float | None]:
     """Average reward component contributions for ``record``."""
 
@@ -118,6 +211,81 @@ def _aggregate_reward_components(record: GenerationRecord) -> dict[str, float | 
         "msssim": _mean(msssim_vals),
         "dct_corr": _mean(dct_vals),
     }
+
+
+def _render_quick_controls(
+    state: st.session_state,
+    *,
+    difficulty_progress: float,
+    hyper_profile: HyperPerformanceProfile | None,
+) -> tuple[bool, bool, bool, bool, bool, dict[str, int]]:
+    """Render the compact sidebar controls and return control actions."""
+
+    st.sidebar.header("Quick experiment controls")
+    mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
+    default_mode = state.get("difficulty_mode")
+    if default_mode not in mode_names:
+        default_mode = mode_names[1] if len(mode_names) > 1 else mode_names[0]
+    difficulty_mode = st.sidebar.select_slider(
+        "Difficulty focus",
+        options=mode_names,
+        value=default_mode,
+        help="Single dial that steers all modelling settings and adaptive tuning.",
+    )
+    state["difficulty_mode"] = difficulty_mode
+    profile = _DIFFICULTY_MODE_PRESETS[difficulty_mode]
+    auto_settings = _auto_run_parameters(
+        difficulty_progress=difficulty_progress,
+        profile=profile,
+        hyper_profile=hyper_profile,
+    )
+
+    if not state.get("show_advanced_controls", False) and hyper_profile is None:
+        state["population_size"] = auto_settings["population_size"]
+        state["generations_to_queue"] = auto_settings["generations_to_queue"]
+        state["autosave_interval"] = auto_settings["autosave_interval"]
+        state["sound_target_dwell"] = auto_settings["target_dwell"]
+        state["last_sound_target_dwell"] = auto_settings["target_dwell"]
+
+    desired_target = auto_settings["difficulty_target"]
+    state["difficulty_target_override"] = desired_target
+
+    metrics_cols = st.sidebar.columns(2)
+    metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
+    metrics_cols[1].metric("Difficulty target", f"{desired_target * 100:.0f}%")
+    st.sidebar.caption(
+        f"Auto-tuned for about {auto_settings['subjects_goal']} subjects with "
+        f"{auto_settings['population_size']} evolving in parallel."
+    )
+
+    controls_row = st.sidebar.columns(2)
+    run_button = controls_row[0].button("Start", use_container_width=True)
+    stop_button = controls_row[1].button("Pause", use_container_width=True)
+
+    secondary_row = st.sidebar.columns(2)
+    reset_button = secondary_row[0].button("Reset", use_container_width=True)
+    save_button = secondary_row[1].button("Save", use_container_width=True)
+    reload_button = st.sidebar.button("Reload autosave", use_container_width=True)
+
+    toggle_label = (
+        "Show advanced settings" if not state.get("show_advanced_controls", False) else "Hide advanced settings"
+    )
+    if st.sidebar.button(toggle_label, use_container_width=True):
+        state["show_advanced_controls"] = not state.get("show_advanced_controls", False)
+
+    pause_threshold = auto_settings.get("pause_threshold", 0.9)
+    if difficulty_progress >= pause_threshold:
+        if not state.get("auto_pause_acknowledged", False):
+            state["run_infinite"] = False
+            state["pending_generations"] = 0
+            state["auto_pause_acknowledged"] = True
+            st.sidebar.info(
+                "Difficulty spike reached – evolution paused so a new scene can be prepared."
+            )
+    else:
+        state["auto_pause_acknowledged"] = False
+
+    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
 
 
 _IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
@@ -158,6 +326,59 @@ _SOUND_MODEL_PRESETS: dict[str, dict[str, Any]] = {
         "description": "Wide spectrum exploration with longer dwell for evolving harmonic washes.",
     },
 }
+
+_DIFFICULTY_MODE_PRESETS: OrderedDict[str, dict[str, Any]] = OrderedDict(
+    [
+        (
+            "Calm focus",
+            {
+                "target": 0.3,
+                "subjects": 90,
+                "population": (3, 6),
+                "queue": (3, 6),
+                "autosave": (5, 8),
+                "dwell": (12, 18),
+                "pause_threshold": 0.82,
+            },
+        ),
+        (
+            "Balanced climb",
+            {
+                "target": 0.5,
+                "subjects": 120,
+                "population": (4, 8),
+                "queue": (4, 9),
+                "autosave": (6, 10),
+                "dwell": (14, 22),
+                "pause_threshold": 0.86,
+            },
+        ),
+        (
+            "Edge runner",
+            {
+                "target": 0.68,
+                "subjects": 150,
+                "population": (5, 9),
+                "queue": (5, 10),
+                "autosave": (6, 11),
+                "dwell": (18, 28),
+                "pause_threshold": 0.9,
+            },
+        ),
+        (
+            "Apex trial",
+            {
+                "target": 0.82,
+                "subjects": 180,
+                "population": (6, 12),
+                "queue": (6, 12),
+                "autosave": (7, 12),
+                "dwell": (20, 34),
+                "pause_threshold": 0.92,
+            },
+        ),
+    ]
+)
 
 
 def _generate_tree_id() -> str:
@@ -1424,7 +1645,7 @@ def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, 
 
 def run() -> None:
     """Entry-point for the Streamlit application."""
-    st.set_page_config(page_title="Project Umbra Visual Explorer", layout="wide")
+    _ensure_page_config()
     # Streamlit options: show detailed errors and reduce external telemetry
     try:
         st.set_option("client.showErrorDetails", True)
@@ -1438,14 +1659,9 @@ def run() -> None:
         state["_umbra_log_directory"] = str(log_dir)
         logger.info("Logging configured; writing UI diagnostics to %s", log_dir)
 
-    st.title("Project Umbra Visual Explorer")
-    st.markdown(
-        """
-        Use this dashboard to inspect how the Project Umbra toy pipeline encodes
-        images into apparent noise and reconstructs them. Adjust the parameters to
-        explore how the stochastic encoder and decoder behave, and inspect the
-        overlap score that multiplies the generated and detected imagery.
-        """
+    st.title("Project Umbra · Compact evolution console")
+    st.caption(
+        "Difficulty steers every setting automatically—press start and let the system tune itself."
     )
 
     _migrate_legacy_state(state)
@@ -1477,6 +1693,7 @@ def run() -> None:
     state.setdefault("difficulty_volatility", 0.0)
     state.setdefault("difficulty_reward", 0.0)
     state.setdefault("difficulty_reward_points", 0.0)
+    state.setdefault("show_advanced_controls", False)
     state.setdefault("latest_generation_reward", 0.0)
     state.setdefault("latest_generation_peak", 0.0)
     state.setdefault("latest_generation_difficulty", 0.0)
@@ -1526,17 +1743,43 @@ def run() -> None:
     else:
         hyper_profile = None
 
+    difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    (
+        run_button,
+        stop_button,
+        reset_button,
+        save_button,
+        reload_button,
+        auto_settings,
+    ) = _render_quick_controls(
+        state,
+        difficulty_progress=difficulty_progress,
+        hyper_profile=hyper_profile,
+    )
+    state["_latest_auto_settings"] = auto_settings
+
+    population_size = int(state.get("population_size", auto_settings["population_size"]))
+    generations_to_queue = int(
+        state.get("generations_to_queue", auto_settings["generations_to_queue"])
+    )
+    autosave_interval = int(state.get("autosave_interval", auto_settings["autosave_interval"]))
+    evolution_mode = state.get("evolution_mode", "Finite")
+
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
-    session_box = st.sidebar.expander("Session & autosave", expanded=False)
-    with session_box:
-        autosave_input = st.text_input(
-            "Autosave directory",
-            value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
-            help="Evolution checkpoints are saved here as evolution_state.pkl.",
-            key="autosave_dir",
-        )
-    autosave_dir = Path(autosave_input).expanduser()
+    show_advanced = bool(state.get("show_advanced_controls", False))
+    load_button = False
+    if show_advanced:
+        with st.sidebar.expander("Session & autosave", expanded=False):
+            st.text_input(
+                "Autosave directory",
+                value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
+                help="Evolution checkpoints are saved here as evolution_state.pkl.",
+                key="autosave_dir",
+            )
+            load_button = st.button("Load autosave")
+
+    autosave_dir = Path(state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))).expanduser()
     normalized_autosave_dir = str(autosave_dir)
     if state.get("last_autosave_dir") != normalized_autosave_dir:
         state["last_autosave_dir"] = normalized_autosave_dir
@@ -1548,40 +1791,60 @@ def run() -> None:
             _attempt_autoload(autosave_dir)
         state["autosave_checked"] = True
 
-    with session_box:
-        load_button = st.button("Load autosave")
-        if load_button:
-            _attempt_autoload(autosave_dir)
+    if load_button:
+        _attempt_autoload(autosave_dir)
 
-    model_box = st.sidebar.expander("Model presets", expanded=False)
     image_model_names = list(_IMAGE_MODEL_PRESETS.keys())
     current_image_model = state.get("_active_image_model", image_model_names[0])
-    image_model_index = image_model_names.index(current_image_model)
-    with model_box:
-        selected_image_model = st.selectbox(
-            "Image evolution preset",
-            image_model_names,
-            index=image_model_index,
-            key="image_model_select",
-        )
-        st.caption(_IMAGE_MODEL_PRESETS[selected_image_model]["description"])
+    selected_image_model = current_image_model
+    sound_model_names = list(_SOUND_MODEL_PRESETS.keys())
+    current_sound_model = state.get("_active_sound_model", sound_model_names[0])
+    selected_sound_model = current_sound_model
+    evolution_engines = ["Lineage & noise (classic)", "Neural lineage fusion"]
+    selected_engine = state.get("_active_evolution_engine", evolution_engines[0])
+
+    if show_advanced:
+        with st.sidebar.expander("Model presets", expanded=False):
+            engine_index = (
+                evolution_engines.index(selected_engine)
+                if selected_engine in evolution_engines
+                else 0
+            )
+            selected_image_model = st.selectbox(
+                "Image evolution preset",
+                image_model_names,
+                index=image_model_names.index(current_image_model),
+                key="image_model_select",
+            )
+            st.caption(_IMAGE_MODEL_PRESETS[selected_image_model]["description"])
+            selected_sound_model = st.selectbox(
+                "Sound scene preset",
+                sound_model_names,
+                index=sound_model_names.index(current_sound_model),
+                key="sound_model_select",
+            )
+            st.caption(_SOUND_MODEL_PRESETS[selected_sound_model]["description"])
+            selected_engine = st.selectbox(
+                "Evolution engine",
+                evolution_engines,
+                index=engine_index,
+                key="evolution_engine_select",
+            )
+            if selected_engine == "Neural lineage fusion":
+                st.caption(
+                    "Neural advisor boosts high performers while preserving elite lineages for deep selective breeding."
+                )
+            else:
+                st.caption(
+                    "Classic stochastic evolution that prioritises lineage parents and their direct noise descendants."
+                )
+
     if state.get("_active_image_model") != selected_image_model:
         preset = _IMAGE_MODEL_PRESETS[selected_image_model]
         state["_active_image_model"] = selected_image_model
         state["encoder_sigma_base"] = float(preset["encoder_sigma"])
         state["decoder_sigma_base"] = float(preset["decoder_sigma"])
 
-    sound_model_names = list(_SOUND_MODEL_PRESETS.keys())
-    current_sound_model = state.get("_active_sound_model", sound_model_names[0])
-    sound_model_index = sound_model_names.index(current_sound_model)
-    with model_box:
-        selected_sound_model = st.selectbox(
-            "Sound scene preset",
-            sound_model_names,
-            index=sound_model_index,
-            key="sound_model_select",
-        )
-        st.caption(_SOUND_MODEL_PRESETS[selected_sound_model]["description"])
     if state.get("_active_sound_model") != selected_sound_model:
         preset = _SOUND_MODEL_PRESETS[selected_sound_model]
         state["_active_sound_model"] = selected_sound_model
@@ -1591,69 +1854,69 @@ def run() -> None:
         state["last_sound_target_dwell"] = int(preset["target_dwell"])
         state["sound_generations_left"] = int(preset["target_dwell"])
 
-    evolution_engines = [
-        "Lineage & noise (classic)",
-        "Neural lineage fusion",
-    ]
-    current_engine = state.get("_active_evolution_engine", evolution_engines[0])
-    engine_index = evolution_engines.index(current_engine) if current_engine in evolution_engines else 0
-    with model_box:
-        selected_engine = st.selectbox(
-            "Evolution engine",
-            evolution_engines,
-            index=engine_index,
-            key="evolution_engine_select",
-        )
-        if selected_engine == "Neural lineage fusion":
-            st.caption(
-                "Neural advisor boosts high performers while preserving elite lineages for"
-                " deep selective breeding."
-            )
-        else:
-            st.caption(
-                "Classic stochastic evolution that prioritises lineage parents and their"
-                " direct noise descendants."
-            )
     if state.get("_active_evolution_engine") != selected_engine:
         state["_active_evolution_engine"] = selected_engine
 
-    difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    target_dwell = int(state.get("sound_target_dwell", auto_settings["target_dwell"]))
+    manual_refresh = False
+    if hyper_enabled and hyper_profile is not None:
+        target_dwell = int(
+            max(1, hyper_profile.dwell_generations or target_dwell)
+        )
+        state["sound_target_dwell"] = target_dwell
+        state["last_sound_target_dwell"] = target_dwell
+    elif not show_advanced:
+        target_dwell = int(auto_settings["target_dwell"])
+        state["sound_target_dwell"] = target_dwell
+        state["last_sound_target_dwell"] = target_dwell
 
-    sound_box = st.sidebar.expander("Sound cadence", expanded=False)
-    with sound_box:
-        if hyper_enabled and hyper_profile is not None:
-            target_dwell = int(
-                max(1, hyper_profile.dwell_generations or state.get("sound_target_dwell", 10))
-            )
-            state["sound_target_dwell"] = target_dwell
-            state["last_sound_target_dwell"] = target_dwell
-            subjects_per_cycle = int(
-                max(
-                    hyper_profile.target_subjects,
-                    target_dwell * max(state.get("population_size", 1), 1),
+    if show_advanced:
+        with st.sidebar.expander("Sound cadence", expanded=False):
+            if hyper_enabled and hyper_profile is not None:
+                subjects_per_cycle = int(
+                    max(
+                        hyper_profile.target_subjects,
+                        target_dwell * max(state.get("population_size", 1), 1),
+                    )
                 )
-            )
-            st.metric("Generations per sound target", target_dwell)
-            st.metric("Subjects scheduled this cycle", subjects_per_cycle)
-            st.caption(
-                "Hyper performance mode rotates the sound scene automatically once the "
-                "dwell window completes."
-            )
-        else:
-            target_dwell = int(
-                st.number_input(
-                    "Generations per sound target",
-                    min_value=1,
-                    max_value=500,
-                    value=int(state.get("sound_target_dwell", 10)),
-                    step=1,
-                    key="sound_target_dwell",
-                    help=(
-                        "Number of evolution steps to spend matching the current sound-derived "
-                        "image before refreshing it with a new randomised scene."
-                    ),
+                st.metric("Generations per sound target", target_dwell)
+                st.metric("Subjects scheduled this cycle", subjects_per_cycle)
+                st.caption(
+                    "Hyper performance mode rotates the sound scene automatically once the dwell window completes."
                 )
+            else:
+                target_dwell = int(
+                    st.number_input(
+                        "Generations per sound target",
+                        min_value=1,
+                        max_value=500,
+                        value=int(state.get("sound_target_dwell", target_dwell)),
+                        step=1,
+                        key="sound_target_dwell",
+                        help=(
+                            "Number of evolution steps to spend matching the current sound-derived image before refreshing it with a new randomised scene."
+                        ),
+                    )
+                )
+                state["sound_target_dwell"] = target_dwell
+            manual_refresh = st.button(
+                "Refresh sound scene",
+                key="refresh_sound_scene",
+                help="Force an immediate reseed using the current difficulty profile.",
             )
+            if manual_refresh:
+                new_seed, new_rate, new_resolution = _refresh_sound_scene(
+                    state,
+                    difficulty_progress,
+                    target_dwell,
+                    improvement=float(state.get("difficulty_improvement", 0.0)),
+                    volatility=float(state.get("difficulty_volatility", 0.0)),
+                    max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
+                )
+                st.info(
+                    "Forced refresh triggered new scene "
+                    f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
+                )
 
     if state.get("last_sound_target_dwell") != target_dwell:
         state["last_sound_target_dwell"] = target_dwell
@@ -1674,61 +1937,43 @@ def run() -> None:
         state["sound_generations_left"] = target_dwell
     remaining_before = int(state.get("sound_generations_left", target_dwell))
 
-    with sound_box:
-        manual_refresh = st.button(
-            "Refresh sound scene",
-            key="refresh_sound_scene",
-            help="Force an immediate reseed using the current difficulty profile.",
-        )
-        if manual_refresh:
-            new_seed, new_rate, new_resolution = _refresh_sound_scene(
-                state,
-                difficulty_progress,
-                target_dwell,
-                improvement=float(state.get("difficulty_improvement", 0.0)),
-                volatility=float(state.get("difficulty_volatility", 0.0)),
-                max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
-            )
-            sound_box.info(
-                "Forced refresh triggered new scene "
-                f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
-            )
-
     forest = state.setdefault("evolution_trees", {})
-    tree_box = st.sidebar.expander("Evolution trees", expanded=False)
-    with tree_box:
-        if forest:
-            tree_ids = list(forest.keys())
-            active_tree_id = state.get("active_tree_id", tree_ids[0])
-            if active_tree_id not in forest:
-                active_tree_id = tree_ids[0]
-                _activate_tree(state, active_tree_id)
-            selected_tree_id = st.selectbox(
-                "Stored branches",
-                tree_ids,
-                index=tree_ids.index(active_tree_id),
-                format_func=lambda tid: _format_tree_label(forest[tid]),
-            )
-            if selected_tree_id != active_tree_id:
-                _activate_tree(state, selected_tree_id)
-                forest = state.setdefault("evolution_trees", {})
-            st.caption(
-                "Switch between stored evolution branches to revisit previous sound scenes."
-            )
-        else:
-            st.caption("Branches will appear here after your first evolution run.")
+    new_tree_requested = False
+    if show_advanced:
+        with st.sidebar.expander("Evolution trees", expanded=False):
+            if forest:
+                tree_ids = list(forest.keys())
+                active_tree_id = state.get("active_tree_id", tree_ids[0])
+                if active_tree_id not in forest:
+                    active_tree_id = tree_ids[0]
+                    _activate_tree(state, active_tree_id)
+                selected_tree_id = st.selectbox(
+                    "Stored branches",
+                    tree_ids,
+                    index=tree_ids.index(active_tree_id),
+                    format_func=lambda tid: _format_tree_label(forest[tid]),
+                )
+                if selected_tree_id != active_tree_id:
+                    _activate_tree(state, selected_tree_id)
+                    forest = state.setdefault("evolution_trees", {})
+                st.caption(
+                    "Switch between stored evolution branches to revisit previous sound scenes."
+                )
+            else:
+                st.caption("Branches will appear here after your first evolution run.")
 
-        new_tree_requested = st.button(
-            "Create new evolution tree",
-            key="spawn_new_tree",
-            help="Start a fresh branch with the current presets and sound scene.",
-        )
+            new_tree_requested = st.button(
+                "Create new evolution tree",
+                key="spawn_new_tree",
+                help="Start a fresh branch with the current presets and sound scene.",
+            )
     if new_tree_requested:
         state["_spawn_new_tree_requested"] = True
         state["pending_generations"] = 0
         state["run_infinite"] = False
         _sync_active_tree_state(state)
-        tree_box.info("Queued a new tree; it will initialise on the next evolution tick.")
+        if show_advanced:
+            st.sidebar.info("Queued a new tree; it will initialise on the next evolution tick.")
 
     seed = int(state.get("shared_seed", 0))
     sound_seed = int(state.get("active_sound_seed", seed))
@@ -1754,27 +1999,6 @@ def run() -> None:
     state["active_encoder_sigma"] = encoder_sigma
     state["active_decoder_sigma"] = denoise_sigma
 
-    config_box = st.sidebar.expander("Active configuration", expanded=False)
-    with config_box:
-        st.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
-        st.metric("Shared seed", str(seed))
-        st.metric("Sound seed", str(sound_seed))
-        st.metric(
-            "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
-        )
-        st.metric(
-            "Image resolution window",
-            f"{resolution_range[0]}–{resolution_range[1]} px",
-        )
-
-        noise_cols = st.columns(2)
-        noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
-        noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
-        st.caption(
-            "Adaptive noise scales increase encoder randomness while tempering decoder blur "
-            "as the system improves."
-        )
-
     state["sound_generations_left"] = int(
         max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
     )
@@ -1794,12 +2018,30 @@ def run() -> None:
         )
         state["current_sound_resolution"] = current_resolution
 
-    with config_box:
-        st.metric("Active sample rate", f"{current_sample_rate:,} Hz")
-        st.metric(
-            "Active image resolution",
-            f"{current_resolution}×{current_resolution} px",
-        )
+    if show_advanced:
+        with st.sidebar.expander("Active configuration", expanded=False):
+            st.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
+            st.metric("Shared seed", str(seed))
+            st.metric("Sound seed", str(sound_seed))
+            st.metric(
+                "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
+            )
+            st.metric(
+                "Image resolution window",
+                f"{resolution_range[0]}–{resolution_range[1]} px",
+            )
+            st.metric("Active sample rate", f"{current_sample_rate:,} Hz")
+            st.metric(
+                "Active image resolution",
+                f"{current_resolution}×{current_resolution} px",
+            )
+
+            noise_cols = st.columns(2)
+            noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
+            noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
+            st.caption(
+                "Adaptive noise scales increase encoder randomness while tempering decoder blur as the system improves."
+            )
     _sync_active_tree_state(state)
 
     original_color, original, sound_clip, shape_specs = generate_sound_art(
@@ -2026,105 +2268,102 @@ def run() -> None:
             " reference-only structure, and neutral grayscale indicates shared content."
         )
 
-    run_box = st.sidebar.expander("Evolution run controls", expanded=True)
-    with run_box:
-        if hyper_enabled and hyper_profile is not None:
-            population_size = int(
-                max(1, hyper_profile.batch_size or state.get("population_size", 5))
-            )
-            generations_to_queue = int(
-                max(
-                    1,
-                    hyper_profile.queue_generations
-                    or hyper_profile.dwell_generations
-                    or state.get("generations_to_queue", 5),
+    if show_advanced:
+        with st.sidebar.expander("Evolution run controls", expanded=True):
+            if hyper_enabled and hyper_profile is not None:
+                population_size = int(
+                    max(1, hyper_profile.batch_size or population_size)
                 )
-            )
-            autosave_interval = int(
-                max(1, hyper_profile.autosave_interval or state.get("autosave_interval", 5))
-            )
-            target_subjects = int(
-                max(
-                    hyper_profile.target_subjects,
-                    population_size * max(hyper_profile.dwell_generations, 1),
+                generations_to_queue = int(
+                    max(
+                        1,
+                        hyper_profile.queue_generations
+                        or hyper_profile.dwell_generations
+                        or generations_to_queue,
+                    )
                 )
-            )
-            state["population_size"] = population_size
-            state["generations_to_queue"] = generations_to_queue
-            state["autosave_interval"] = autosave_interval
-            state["evolution_mode"] = "Finite"
+                autosave_interval = int(
+                    max(1, hyper_profile.autosave_interval or autosave_interval)
+                )
+                target_subjects = int(
+                    max(
+                        hyper_profile.target_subjects,
+                        population_size * max(hyper_profile.dwell_generations, 1),
+                    )
+                )
+                state["population_size"] = population_size
+                state["generations_to_queue"] = generations_to_queue
+                state["autosave_interval"] = autosave_interval
+                state["evolution_mode"] = "Finite"
 
-            col_top, col_bottom = st.columns(2)
-            col_top.metric("Subjects per generation", population_size)
-            col_top.metric("Queued generations", generations_to_queue)
-            col_bottom.metric("Subjects per sound cycle", target_subjects)
-            col_bottom.metric("Autosave interval", autosave_interval)
-            if hyper_profile.mean_duration > 0.0:
-                throughput = hyper_profile.throughput
-                timing_text = (
-                    f"Avg generation {hyper_profile.mean_duration:.2f}s • {throughput:.1f} subjects/s"
-                    if throughput > 0.0
-                    else f"Avg generation {hyper_profile.mean_duration:.2f}s"
+                col_top, col_bottom = st.columns(2)
+                col_top.metric("Subjects per generation", population_size)
+                col_top.metric("Queued generations", generations_to_queue)
+                col_bottom.metric("Subjects per sound cycle", target_subjects)
+                col_bottom.metric("Autosave interval", autosave_interval)
+                if hyper_profile.mean_duration > 0.0:
+                    throughput = hyper_profile.throughput
+                    timing_text = (
+                        f"Avg generation {hyper_profile.mean_duration:.2f}s • {throughput:.1f} subjects/s"
+                        if throughput > 0.0
+                        else f"Avg generation {hyper_profile.mean_duration:.2f}s"
+                    )
+                    st.caption(timing_text)
+                st.caption(
+                    "Hyper performance mode tunes these parameters from runtime throughput and the current difficulty so you can focus on results."
                 )
-                st.caption(timing_text)
-            st.caption(
-                "Hyper performance mode tunes these parameters from runtime throughput "
-                "and the current difficulty so you can focus on results."
-            )
-            evolution_mode = "Finite"
-        else:
-            population_size = int(
-                st.number_input(
-                    "AI attempts per generation",
-                    min_value=1,
-                    max_value=32,
-                    value=int(state.get("population_size", 4)),
-                    step=1,
-                    key="population_size",
+                evolution_mode = "Finite"
+            else:
+                population_size = int(
+                    st.number_input(
+                        "AI attempts per generation",
+                        min_value=1,
+                        max_value=32,
+                        value=population_size,
+                        step=1,
+                        key="population_size",
+                    )
                 )
-            )
-            generations_to_queue = int(
-                st.number_input(
-                    "Generations to queue",
-                    min_value=1,
-                    value=int(state.get("generations_to_queue", 5)),
-                    step=1,
-                    key="generations_to_queue",
+                generations_to_queue = int(
+                    st.number_input(
+                        "Generations to queue",
+                        min_value=1,
+                        value=generations_to_queue,
+                        step=1,
+                        key="generations_to_queue",
+                    )
                 )
-            )
-            evolution_mode = st.selectbox(
-                "Evolution length",
-                options=["Finite", "Infinite"],
-                index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
-                key="evolution_mode",
-            )
-            autosave_interval = int(
-                st.number_input(
-                    "Autosave every N generations",
-                    min_value=1,
-                    value=int(state.get("autosave_interval", 5)),
-                    step=1,
-                    key="autosave_interval",
+                evolution_mode = st.selectbox(
+                    "Evolution length",
+                    options=["Finite", "Infinite"],
+                    index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
+                    key="evolution_mode",
                 )
-            )
+                autosave_interval = int(
+                    st.number_input(
+                        "Autosave every N generations",
+                        min_value=1,
+                        value=autosave_interval,
+                        step=1,
+                        key="autosave_interval",
+                    )
+                )
+                state["population_size"] = population_size
+                state["generations_to_queue"] = generations_to_queue
+                state["autosave_interval"] = autosave_interval
+                state["evolution_mode"] = evolution_mode
 
-        run_button = st.button("Start evolution")
-        stop_button = st.button("Stop evolution")
-        reset_button = st.button("Reset evolution")
-        save_button = st.button("Save snapshot now")
-        reload_button = st.button("Reload autosave")
-
-    adv_box = st.sidebar.expander("Adversarial mode (beta)", expanded=False)
-    with adv_box:
-        st.checkbox(
-            "Enable generator vs decoder co-evolution",
-            key="adversarial_enabled",
-            value=bool(state.get("adversarial_enabled", False)),
-            help=(
-                "Trains a predictive generator to approximate the decoder's output without passing through"
-                " the channel, while the decoder adapts its denoise level."
-            ),
-        )
+    if show_advanced:
+        with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
+            st.checkbox(
+                "Enable generator vs decoder co-evolution",
+                key="adversarial_enabled",
+                value=bool(state.get("adversarial_enabled", False)),
+                help=(
+                    "Trains a predictive generator to approximate the decoder's output without passing through"
+                    " the channel, while the decoder adapts its denoise level."
+                ),
+            )
     if state.get("adversarial_enabled", False) and "adversarial" not in state:
         state["adversarial"] = AdversarialManager()
 
@@ -2165,57 +2404,57 @@ def run() -> None:
     _update_tree_label(state, tree_label)
     _refresh_active_parents(state, manager)
 
-    breed_box = st.sidebar.expander("Selective breeding", expanded=False)
-    with breed_box:
-        parent_entries = sorted(
-            manager.parent_lineage,
-            key=lambda entry: (entry.origin_generation, -entry.metrics.ssim),
-        )
-        parent_labels = {
-            entry.seed: (
-                f"Gen {entry.origin_generation} • seed {entry.seed} "
-                f"(SSIM {entry.metrics.ssim:.3f}, overlap {entry.overlap_score:.1f}%)"
+    if show_advanced:
+        with st.sidebar.expander("Selective breeding", expanded=False):
+            parent_entries = sorted(
+                manager.parent_lineage,
+                key=lambda entry: (entry.origin_generation, -entry.metrics.ssim),
             )
-            for entry in parent_entries
-        }
-        parent_options = list(parent_labels.keys())
-        default_selection = [
-            seed for seed in state.get("active_parent_seeds", []) if seed in parent_labels
-        ]
-        if not default_selection and parent_options:
-            default_selection = [parent_options[-1]]
-        parent_selection = st.multiselect(
-            "Active parent seeds",
-            parent_options,
-            default=default_selection,
-            key="parent_seed_select",
-            format_func=lambda seed: parent_labels.get(seed, f"Seed {seed}"),
-            help=(
-                "Selected parent seeds remain in every generation and act as anchors for "
-                "new child mutations. Leave the selection empty to use the full lineage."
-            ),
-        )
-        state["active_parent_seeds"] = [int(seed) for seed in parent_selection]
-        _sync_active_tree_state(state)
-
-        if parent_entries:
-            active_parent_set = {int(seed) for seed in state.get("active_parent_seeds", [])}
-            summary_rows = [
-                {
-                    "Seed": entry.seed,
-                    "Generation": entry.origin_generation,
-                    "SSIM": f"{entry.metrics.ssim:.3f}",
-                    "Overlap (%)": f"{entry.overlap_score:.1f}",
-                    "Appearances": entry.appearances,
-                    "Reward": f"{entry.cumulative_reward:.2f}",
-                    "Peak reward": f"{entry.peak_reward:.2f}",
-                    "Active": "★" if entry.seed in active_parent_set else "",
-                }
+            parent_labels = {
+                entry.seed: (
+                    f"Gen {entry.origin_generation} • seed {entry.seed} "
+                    f"(SSIM {entry.metrics.ssim:.3f}, overlap {entry.overlap_score:.1f}%)"
+                )
                 for entry in parent_entries
+            }
+            parent_options = list(parent_labels.keys())
+            default_selection = [
+                seed for seed in state.get("active_parent_seeds", []) if seed in parent_labels
             ]
-            st.table(summary_rows)
-        else:
-            st.info("Run at least one generation to populate the parent lineage.")
+            if not default_selection and parent_options:
+                default_selection = [parent_options[-1]]
+            parent_selection = st.multiselect(
+                "Active parent seeds",
+                parent_options,
+                default=default_selection,
+                key="parent_seed_select",
+                format_func=lambda seed: parent_labels.get(seed, f"Seed {seed}"),
+                help=(
+                    "Selected parent seeds remain in every generation and act as anchors for "
+                    "new child mutations. Leave the selection empty to use the full lineage."
+                ),
+            )
+            state["active_parent_seeds"] = [int(seed) for seed in parent_selection]
+            _sync_active_tree_state(state)
+
+            if parent_entries:
+                active_parent_set = {int(seed) for seed in state.get("active_parent_seeds", [])}
+                summary_rows = [
+                    {
+                        "Seed": entry.seed,
+                        "Generation": entry.origin_generation,
+                        "SSIM": f"{entry.metrics.ssim:.3f}",
+                        "Overlap (%)": f"{entry.overlap_score:.1f}",
+                        "Appearances": entry.appearances,
+                        "Reward": f"{entry.cumulative_reward:.2f}",
+                        "Peak reward": f"{entry.peak_reward:.2f}",
+                        "Active": "★" if entry.seed in active_parent_set else "",
+                    }
+                    for entry in parent_entries
+                ]
+                st.table(summary_rows)
+            else:
+                st.info("Run at least one generation to populate the parent lineage.")
 
     if save_button:
         save_path = manager.save(autosave_dir)
