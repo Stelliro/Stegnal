@@ -1,5 +1,6 @@
-import numpy as np
 from pathlib import Path
+
+import numpy as np
 from PIL import Image
 
 from umbra.pipeline import run_pipeline
