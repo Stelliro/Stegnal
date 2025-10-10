@@ -274,41 +274,18 @@ def _render_quick_controls(
         state["show_advanced_controls"] = not state.get("show_advanced_controls", False)
 
     pause_threshold = auto_settings.get("pause_threshold", 0.9)
-    _handle_auto_pause(
-        state,
-        difficulty_progress=difficulty_progress,
-        pause_threshold=pause_threshold,
-    )
-
-    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
-
-
-def _handle_auto_pause(
-    state: st.session_state,
-    *,
-    difficulty_progress: float,
-    pause_threshold: float,
-) -> None:
-    """Pause finite runs at a difficulty spike while letting infinite runs continue."""
-
     if difficulty_progress >= pause_threshold:
-        if state.get("auto_pause_acknowledged", False):
-            return
-
-        if state.get("run_infinite", False):
-            st.sidebar.info(
-                "Difficulty spike reached – infinite evolution continues while settings retune."
-            )
-        else:
+        if not state.get("auto_pause_acknowledged", False):
             state["run_infinite"] = False
             state["pending_generations"] = 0
+            state["auto_pause_acknowledged"] = True
             st.sidebar.info(
                 "Difficulty spike reached – evolution paused so a new scene can be prepared."
             )
-        state["auto_pause_acknowledged"] = True
-        return
+    else:
+        state["auto_pause_acknowledged"] = False
 
-    state["auto_pause_acknowledged"] = False
+    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
 
 
 _IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
@@ -872,7 +849,7 @@ def _ensure_manager(
     tree_label: str | None = None,
 ) -> EvolutionManager:
     state = st.session_state
-    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {}) 
     was_running_infinite = bool(state.get("run_infinite", False))
     signature = (compute_image_signature(original), int(seed))
     metadata = {
@@ -1680,6 +1657,130 @@ def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, 
     Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
     """
 
+    hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
+
+    if manager.generations:
+        last_generation = manager.generations[-1]
+        difficulty_raw = float(last_generation.difficulty_raw)
+        difficulty_target = float(np.clip(last_generation.difficulty_level, 0.0, 1.0))
+    else:
+        difficulty_raw = float(state.get("latest_generation_difficulty_raw", 0.0))
+        difficulty_target = float(
+            np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
+        )
+    difficulty_normalized = normalize_difficulty(difficulty_raw)
+
+    config_snapshot = {
+        "population_size": manager.population_size,
+        "autosave_interval": manager.autosave_interval,
+        "encoder_sigma": float(encoder_sigma),
+        "decoder_sigma": float(denoise_sigma),
+        "base_encoder_sigma": float(base_encoder_sigma),
+        "base_decoder_sigma": float(base_decoder_sigma),
+        "sample_rate": int(current_sample_rate),
+        "resolution": int(current_resolution),
+        "difficulty_target": difficulty_target,
+        "shared_seed": int(seed),
+        "sound_seed": int(sound_seed),
+    }
+
+    config_hash_value = hashlib.sha256(
+        json.dumps(config_snapshot, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    provenance = collect_provenance(config_hash=f"sha256:{config_hash_value}")
+    provenance["random_seeds"] = {"session": int(seed), "sound": int(sound_seed)}
+
+    best_psnr = float(metrics.psnr)
+    best_ssim = float(metrics.ssim)
+    if best_candidate_summary is not None:
+        best_psnr = float(best_candidate_summary.get("psnr", best_psnr))
+        best_ssim = float(best_candidate_summary.get("ssim", best_ssim))
+
+    metrics_block = {
+        "ai_vs_reference": metrics.as_dict(),
+        "sound_vs_reference": sound_metrics.as_dict(),
+        "ai_vs_sound": ai_sound_alignment.as_dict(),
+        "overlap": {
+            "ai_vs_reference": float(ai_overlap_score),
+            "sound_vs_reference": float(sound_overlap_score),
+        },
+        "global_pooled": {
+            "psnr": float(metrics.psnr),
+            "ssim": float(metrics.ssim),
+            "desc": "pooled/global comparator",
+        },
+        "per_candidate_strict": {
+            "psnr": best_psnr,
+            "ssim": best_ssim,
+            "desc": "gallery/best-candidate strict comparator",
+        },
+    }
+
+    payload = {
+        "hardware_backend": hardware_backend,
+        "difficulty": {
+            "current": float(state.get("difficulty_progress", 0.0)),
+            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
+            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
+            "dwell_generations": int(target_dwell),
+            "momentum": float(state.get("difficulty_improvement", 0.0)),
+            "volatility": float(state.get("difficulty_volatility", 0.0)),
+            "raw": difficulty_raw,
+            "normalized": difficulty_normalized,
+            "target": difficulty_target,
+        },
+        "seeds": {
+            "shared": int(seed),
+            "sound": int(sound_seed),
+        },
+        "noise": {
+            "base_encoder_sigma": float(base_encoder_sigma),
+            "base_decoder_sigma": float(base_decoder_sigma),
+            "active_encoder_sigma": float(encoder_sigma),
+            "active_decoder_sigma": float(denoise_sigma),
+        },
+        "sound": {
+            "current_sample_rate": int(current_sample_rate),
+            "current_resolution": int(current_resolution),
+            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
+            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
+            "band_volumes": dict(getattr(sound_clip, "band_volumes", {})),
+            "generator_seed": int(getattr(sound_clip, "seed", sound_seed)),
+            "generator_sample_rate": int(
+                getattr(sound_clip, "sample_rate", current_sample_rate)
+            ),
+        },
+        "metrics": metrics_block,
+        "performance_history": list(state.get("performance_history", [])),
+        "manager": {
+            "population_size": int(manager.population_size),
+            "autosave_interval": int(manager.autosave_interval),
+            "generation_count": len(manager.generations),
+            "best_candidate": best_candidate_summary,
+            "mutation_boost": int(manager.mutation_boost),
+        },
+        "provenance": provenance,
+    }
+    if manager.hyper_profile.enabled:
+        profile = manager.hyper_profile
+        payload["hyper_performance"] = {
+            "target_subjects": int(profile.target_subjects),
+            "batch_size": int(profile.batch_size),
+            "dwell_generations": int(profile.dwell_generations),
+            "queue_generations": int(profile.queue_generations),
+            "autosave_interval": int(profile.autosave_interval),
+            "mean_generation_duration": float(profile.mean_duration),
+            "subjects_per_second": float(profile.throughput),
+        }
+    return payload
+
+
+def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, Any]]) -> bytes:
+    """Create a zipped export containing session metrics and progress curves.
+
+    Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
+    """
+
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("session_summary.json", json.dumps(payload, indent=2))
@@ -1950,6 +2051,7 @@ def run() -> None:
                         ),
                     )
                 )
+                state["sound_target_dwell"] = target_dwell
             manual_refresh = st.button(
                 "Refresh sound scene",
                 key="refresh_sound_scene",
@@ -2399,10 +2501,10 @@ def run() -> None:
                         key="autosave_interval",
                     )
                 )
-                state.setdefault("population_size", population_size)
-                state.setdefault("generations_to_queue", generations_to_queue)
-                state.setdefault("autosave_interval", autosave_interval)
-                state.setdefault("evolution_mode", evolution_mode)
+                state["population_size"] = population_size
+                state["generations_to_queue"] = generations_to_queue
+                state["autosave_interval"] = autosave_interval
+                state["evolution_mode"] = evolution_mode
 
     if show_advanced:
         with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
