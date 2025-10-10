@@ -490,6 +490,7 @@ def _activate_tree(state: st.session_state, tree_id: str) -> None:
         return
     state["active_tree_id"] = tree_id
     state["evolution_manager"] = entry["manager"]
+    state["manager"] = entry["manager"]
     state["evolution_signature"] = entry["signature"]
     state["run_infinite"] = entry.get("run_infinite", False)
     state["pending_generations"] = entry.get("pending", 0)
@@ -920,6 +921,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         autosave_dir,
         len(manager.generations),
     )
+    state["manager"] = manager
 
 
 def _ensure_manager(
@@ -983,6 +985,7 @@ def _ensure_manager(
         state["pending_generations"] = 0
         state["run_infinite"] = was_running_infinite
         logger.info("Initialised evolution tree %s", label)
+        state["manager"] = manager
         return manager
 
     manager = entry["manager"]
@@ -1013,6 +1016,7 @@ def _ensure_manager(
         state["evolution_signature"] = signature
         state["pending_generations"] = 0
         logger.info("Reinitialised evolution manager for new scene: %s", label)
+        state["manager"] = manager
         return manager
 
     manager.update_settings(
@@ -1032,6 +1036,7 @@ def _ensure_manager(
     entry["manager"] = manager
     entry["signature"] = signature
     state["evolution_manager"] = manager
+    state["manager"] = manager
     state["evolution_signature"] = signature
     if tree_label:
         _update_tree_label(state, tree_label)
@@ -2634,6 +2639,7 @@ def run() -> None:
 
     if reset_button:
         state.pop("evolution_manager", None)
+        state.pop("manager", None)
         state.pop("evolution_signature", None)
         state["pending_generations"] = 0
         state["run_infinite"] = False
@@ -2648,6 +2654,7 @@ def run() -> None:
 
     if reload_button:
         state.pop("evolution_manager", None)
+        state.pop("manager", None)
         state.pop("evolution_signature", None)
         state["autosave_checked"] = False
         state.pop("adaptive_scene", None)
@@ -2668,6 +2675,7 @@ def run() -> None:
         force_new_tree=force_new_tree,
         tree_label=tree_label,
     )
+    state["manager"] = manager
     _update_tree_label(state, tree_label)
     _refresh_active_parents(state, manager)
 
