@@ -192,3 +192,42 @@ def test_session_export_payload_contains_provenance(monkeypatch) -> None:
     difficulty_block = payload["difficulty"]
     for key in ("raw", "normalized", "target"):
         assert key in difficulty_block
+
+
+def test_handle_auto_pause_retains_infinite(monkeypatch) -> None:
+    from umbra import ui
+
+    messages: list[str] = []
+
+    sidebar_stub = SimpleNamespace(info=lambda message: messages.append(str(message)))
+    monkeypatch.setattr(ui, "st", SimpleNamespace(sidebar=sidebar_stub), raising=False)
+
+    state: dict[str, object] = {"run_infinite": True, "pending_generations": 5}
+
+    ui._handle_auto_pause(state, difficulty_progress=0.95, pause_threshold=0.9)
+
+    assert state["run_infinite"] is True
+    assert state["auto_pause_acknowledged"] is True
+    assert messages, "Expected an informational message when auto pause triggers in infinite mode"
+
+
+def test_handle_auto_pause_pauses_finite(monkeypatch) -> None:
+    from umbra import ui
+
+    messages: list[str] = []
+
+    sidebar_stub = SimpleNamespace(info=lambda message: messages.append(str(message)))
+    monkeypatch.setattr(ui, "st", SimpleNamespace(sidebar=sidebar_stub), raising=False)
+
+    state: dict[str, object] = {"run_infinite": False, "pending_generations": 7}
+
+    ui._handle_auto_pause(state, difficulty_progress=0.95, pause_threshold=0.9)
+
+    assert state["run_infinite"] is False
+    assert state["pending_generations"] == 0
+    assert state["auto_pause_acknowledged"] is True
+    assert messages, "Expected an informational message when auto pause pauses finite runs"
+
+    ui._handle_auto_pause(state, difficulty_progress=0.2, pause_threshold=0.9)
+
+    assert state["auto_pause_acknowledged"] is False

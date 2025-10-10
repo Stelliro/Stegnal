@@ -274,18 +274,41 @@ def _render_quick_controls(
         state["show_advanced_controls"] = not state.get("show_advanced_controls", False)
 
     pause_threshold = auto_settings.get("pause_threshold", 0.9)
+    _handle_auto_pause(
+        state,
+        difficulty_progress=difficulty_progress,
+        pause_threshold=pause_threshold,
+    )
+
+    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
+
+
+def _handle_auto_pause(
+    state: st.session_state,
+    *,
+    difficulty_progress: float,
+    pause_threshold: float,
+) -> None:
+    """Pause finite runs at a difficulty spike while letting infinite runs continue."""
+
     if difficulty_progress >= pause_threshold:
-        if not state.get("auto_pause_acknowledged", False):
+        if state.get("auto_pause_acknowledged", False):
+            return
+
+        if state.get("run_infinite", False):
+            st.sidebar.info(
+                "Difficulty spike reached – infinite evolution continues while settings retune."
+            )
+        else:
             state["run_infinite"] = False
             state["pending_generations"] = 0
-            state["auto_pause_acknowledged"] = True
             st.sidebar.info(
                 "Difficulty spike reached – evolution paused so a new scene can be prepared."
             )
-    else:
-        state["auto_pause_acknowledged"] = False
+        state["auto_pause_acknowledged"] = True
+        return
 
-    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
+    state["auto_pause_acknowledged"] = False
 
 
 _IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
