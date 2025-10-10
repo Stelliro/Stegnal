@@ -2347,10 +2347,10 @@ def run() -> None:
                         key="autosave_interval",
                     )
                 )
-                state["population_size"] = population_size
-                state["generations_to_queue"] = generations_to_queue
-                state["autosave_interval"] = autosave_interval
-                state["evolution_mode"] = evolution_mode
+                state.setdefault("population_size", population_size)
+                state.setdefault("generations_to_queue", generations_to_queue)
+                state.setdefault("autosave_interval", autosave_interval)
+                state.setdefault("evolution_mode", evolution_mode)
 
     if show_advanced:
         with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
