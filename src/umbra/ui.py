@@ -3,35 +3,739 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
+import logging
+import math
+import time
+import zipfile
+from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
-from typing import Dict
-import zipfile
+from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
-from umbra.evolution import EvolutionManager, compute_image_signature
-from umbra.metrics import compute_metrics
-from umbra.adversarial import AdversarialManager, GeneratorParams, apply_generator
-from umbra.sound import ShapeGuess, generate_sound_art, guess_shapes
+from umbra.evolution import (
+    EvolutionManager,
+    GenerationRecord,
+    HyperPerformanceProfile,
+    compute_image_signature,
+    normalize_difficulty,
+)
+from umbra.logging_utils import collect_provenance, configure_logging
+from umbra.metrics import ReconstructionMetrics, compute_metrics
+from umbra.neural import NeuralRewardModel
+from umbra.progress import prepare_trend_chart, sanitize_progress_rows
+from umbra.reconstruction import (
+    ReconstructionResult,
+    run_reconstruction_cycle,
+    waveform_to_wav_bytes,
+)
+from umbra.sound import (
+    ShapeGuess,
+    generate_sound_art,
+    generate_sound_art_from_waveform,
+    guess_shapes,
+    load_waveform_from_wav,
+)
 from umbra.visualization import (
     colorize_comparison,
     multiplicative_overlap,
     normalize_for_display,
     to_uint8_image,
 )
-import logging
-import os
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_AUTOSAVE_DIR = Path.home() / ".umbra_autosave"
+
+_PAGE_CONFIGURED = False
+
+_DARK_STYLE = """
+<style>
+:root {
+    color-scheme: dark;
+}
+.stApp, .block-container {
+    background: #0d1017 !important;
+    color: #f5f6fa !important;
+}
+.stMarkdown, .stMetric, .stSelectbox, .stButton, .stSlider, .stTabs {
+    color: #f5f6fa !important;
+}
+.stButton>button, .stSlider>div>div>div>button {
+    background: #1f2937 !important;
+    color: #f5f6fa !important;
+    border: 1px solid #374151 !important;
+}
+.stSelectbox>div>div>button, .stSelectbox>div>div>div {
+    background: #111827 !important;
+    color: #f5f6fa !important;
+}
+.stExpander, .stTextInput, .stNumberInput, .stMultiSelect, .stFileUploader {
+    background: transparent !important;
+    color: #f5f6fa !important;
+}
+.stTable, .stDataFrame {
+    color: #f5f6fa !important;
+}
+</style>
+"""
+
+
+def _ensure_page_config() -> None:
+    """Apply a compact dark configuration once for the Streamlit page."""
+
+    global _PAGE_CONFIGURED
+    if _PAGE_CONFIGURED:
+        return
+    st.set_page_config(
+        page_title="Project Umbra",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    st.markdown(_DARK_STYLE, unsafe_allow_html=True)
+    _PAGE_CONFIGURED = True
+
+
+def _quantize_slider_value(
+    value: float,
+    *,
+    min_value: float,
+    max_value: float,
+    step: float,
+) -> float:
+    """Clip ``value`` to the slider domain and align it with the provided step."""
+
+    if step <= 0:
+        raise ValueError("Slider step must be positive")
+
+    clipped = float(np.clip(value, min_value, max_value))
+    steps = round((clipped - min_value) / step)
+    quantized = min_value + steps * step
+    quantized = float(np.clip(quantized, min_value, max_value))
+    # Guard against floating point drift so Streamlit accepts the default value.
+    decimals = max(0, -int(math.floor(math.log10(step))) if step < 1 else 0)
+    return round(quantized, decimals)
+
+
+def _metric_badge_html(label: str, psnr: float, ssim: float) -> str:
+    """Return a styled HTML badge summarising PSNR/SSIM metrics."""
+
+    safe_label = html.escape(label)
+    return (
+        "<div style=\"background-color: var(--secondary-background-color,#f0f2f6);"
+        "padding:0.5rem 0.75rem;border-radius:0.5rem;font-size:0.85rem;"
+        "line-height:1.4;\">"
+        f"<strong>{safe_label}</strong><br>"
+        f"PSNR {psnr:.2f} dB · SSIM {ssim:.3f}"
+        "</div>"
+    )
+
+
+def _blend_range(bounds: tuple[int, int], weight: float) -> int:
+    """Interpolate ``bounds`` using ``weight`` in ``[0, 1]`` and return an int."""
+
+    low, high = bounds
+    return int(round(np.interp(np.clip(weight, 0.0, 1.0), [0.0, 1.0], [low, high])))
+
+
+def _auto_run_parameters(
+    *,
+    difficulty_progress: float,
+    profile: dict[str, Any],
+    hyper_profile: HyperPerformanceProfile | None,
+) -> dict[str, int]:
+    """Derive compact run parameters from the chosen difficulty profile."""
+
+    base_target = float(profile.get("target", 0.5))
+    weight = float(np.clip(0.35 * difficulty_progress + 0.65 * base_target, 0.0, 1.0))
+
+    subjects_goal = int(profile.get("subjects", 120))
+    if hyper_profile is not None and hyper_profile.target_subjects:
+        subjects_goal = int(max(subjects_goal, hyper_profile.target_subjects))
+    else:
+        subjects_goal = int(round(subjects_goal * (0.85 + 0.3 * weight)))
+
+    dwell = _blend_range(tuple(profile.get("dwell", (12, 20))), weight)
+    population = _blend_range(tuple(profile.get("population", (4, 8))), weight)
+    if dwell > 0:
+        ideal_population = max(3, int(round(subjects_goal / dwell)))
+        population = int(np.clip(ideal_population, profile["population"][0], profile["population"][1]))
+
+    queue = _blend_range(tuple(profile.get("queue", (4, 8))), weight)
+    autosave = _blend_range(tuple(profile.get("autosave", (6, 10))), weight)
+
+    return {
+        "population_size": max(1, population),
+        "generations_to_queue": max(1, queue),
+        "autosave_interval": max(1, autosave),
+        "target_dwell": max(1, dwell),
+        "subjects_goal": max(1, subjects_goal),
+        "pause_threshold": float(profile.get("pause_threshold", 0.9)),
+        "difficulty_target": base_target,
+    }
+
+
+def _aggregate_reward_components(record: GenerationRecord) -> dict[str, float | None]:
+    """Average reward component contributions for ``record``."""
+
+    def _mean(values: list[float | None]) -> float | None:
+        finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+        if not finite:
+            return None
+        return float(np.mean(finite))
+
+    overlap_vals = [
+        candidate.reward_components.get("overlap") for candidate in record.candidates
+    ]
+    msssim_vals = [
+        candidate.reward_components.get("msssim") for candidate in record.candidates
+    ]
+    dct_vals = [
+        candidate.reward_components.get("dct_corr") for candidate in record.candidates
+    ]
+
+    return {
+        "overlap": _mean(overlap_vals),
+        "msssim": _mean(msssim_vals),
+        "dct_corr": _mean(dct_vals),
+    }
+
+
+def _render_quick_controls(
+    state: st.session_state,
+    *,
+    difficulty_progress: float,
+    hyper_profile: HyperPerformanceProfile | None,
+) -> tuple[bool, bool, bool, bool, bool, dict[str, int]]:
+    """Render the compact sidebar controls and return control actions."""
+
+    st.sidebar.header("Quick experiment controls")
+    mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
+    default_mode = state.get("difficulty_mode")
+    if default_mode not in mode_names:
+        default_mode = mode_names[1] if len(mode_names) > 1 else mode_names[0]
+    difficulty_mode = st.sidebar.select_slider(
+        "Difficulty focus",
+        options=mode_names,
+        value=default_mode,
+        help="Single dial that steers all modelling settings and adaptive tuning.",
+    )
+    state["difficulty_mode"] = difficulty_mode
+    profile = _DIFFICULTY_MODE_PRESETS[difficulty_mode]
+    auto_settings = _auto_run_parameters(
+        difficulty_progress=difficulty_progress,
+        profile=profile,
+        hyper_profile=hyper_profile,
+    )
+
+    if not state.get("show_advanced_controls", False) and hyper_profile is None:
+        state["population_size"] = auto_settings["population_size"]
+        state["generations_to_queue"] = auto_settings["generations_to_queue"]
+        state["autosave_interval"] = auto_settings["autosave_interval"]
+        state["sound_target_dwell"] = auto_settings["target_dwell"]
+        state["last_sound_target_dwell"] = auto_settings["target_dwell"]
+
+    desired_target = auto_settings["difficulty_target"]
+    state["difficulty_target_override"] = desired_target
+
+    metrics_cols = st.sidebar.columns(2)
+    metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
+    metrics_cols[1].metric("Difficulty target", f"{desired_target * 100:.0f}%")
+    st.sidebar.caption(
+        f"Auto-tuned for about {auto_settings['subjects_goal']} subjects with "
+        f"{auto_settings['population_size']} evolving in parallel."
+    )
+
+    controls_row = st.sidebar.columns(2)
+    run_button = controls_row[0].button("Start", use_container_width=True)
+    stop_button = controls_row[1].button("Pause", use_container_width=True)
+
+    secondary_row = st.sidebar.columns(2)
+    reset_button = secondary_row[0].button("Reset", use_container_width=True)
+    save_button = secondary_row[1].button("Save", use_container_width=True)
+    reload_button = st.sidebar.button("Reload autosave", use_container_width=True)
+
+    toggle_label = (
+        "Show advanced settings" if not state.get("show_advanced_controls", False) else "Hide advanced settings"
+    )
+    if st.sidebar.button(toggle_label, use_container_width=True):
+        state["show_advanced_controls"] = not state.get("show_advanced_controls", False)
+
+    pause_threshold = auto_settings.get("pause_threshold", 0.9)
+    if difficulty_progress >= pause_threshold:
+        if not state.get("auto_pause_acknowledged", False):
+            state["run_infinite"] = False
+            state["pending_generations"] = 0
+            state["auto_pause_acknowledged"] = True
+            st.sidebar.info(
+                "Difficulty spike reached – evolution paused so a new scene can be prepared."
+            )
+    else:
+        state["auto_pause_acknowledged"] = False
+
+    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
+
+
+_IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "Geometric Echo (balanced)": {
+        "encoder_sigma": 0.2,
+        "decoder_sigma": 1.0,
+        "description": "Balanced encoder/decoder pair tuned for the classic Umbra evolution flow.",
+    },
+    "Nocturne Bloom (soft focus)": {
+        "encoder_sigma": 0.28,
+        "decoder_sigma": 0.85,
+        "description": "Higher encoder variance with a softer decoder for painterly reconstructions.",
+    },
+    "Solar Cascade (high contrast)": {
+        "encoder_sigma": 0.38,
+        "decoder_sigma": 0.65,
+        "description": "Aggressive noise for vivid contrasts balanced by a sharper decoder output.",
+    },
+}
+
+_SOUND_MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "Ambient Skyline": {
+        "sample_rate": (20_000, 48_000),
+        "resolution": (160, 224),
+        "target_dwell": 12,
+        "description": "Mid-range rates with generous dwell time for slow evolving ambient textures.",
+    },
+    "Pulse Forge": {
+        "sample_rate": (28_000, 64_000),
+        "resolution": (192, 256),
+        "target_dwell": 8,
+        "description": "Higher sample rates and resolutions for rhythmic, fast-changing scenes.",
+    },
+    "Aurora Sweep": {
+        "sample_rate": (16_000, 56_000),
+        "resolution": (128, 224),
+        "target_dwell": 16,
+        "description": "Wide spectrum exploration with longer dwell for evolving harmonic washes.",
+    },
+}
+
+_DIFFICULTY_MODE_PRESETS: OrderedDict[str, dict[str, Any]] = OrderedDict(
+    [
+        (
+            "Calm focus",
+            {
+                "target": 0.3,
+                "subjects": 90,
+                "population": (3, 6),
+                "queue": (3, 6),
+                "autosave": (5, 8),
+                "dwell": (12, 18),
+                "pause_threshold": 0.82,
+            },
+        ),
+        (
+            "Balanced climb",
+            {
+                "target": 0.5,
+                "subjects": 120,
+                "population": (4, 8),
+                "queue": (4, 9),
+                "autosave": (6, 10),
+                "dwell": (14, 22),
+                "pause_threshold": 0.86,
+            },
+        ),
+        (
+            "Edge runner",
+            {
+                "target": 0.68,
+                "subjects": 150,
+                "population": (5, 9),
+                "queue": (5, 10),
+                "autosave": (6, 11),
+                "dwell": (18, 28),
+                "pause_threshold": 0.9,
+            },
+        ),
+        (
+            "Apex trial",
+            {
+                "target": 0.82,
+                "subjects": 180,
+                "population": (6, 12),
+                "queue": (6, 12),
+                "autosave": (7, 12),
+                "dwell": (20, 34),
+                "pause_threshold": 0.92,
+            },
+        ),
+    ]
+)
+
+
+def _generate_tree_id() -> str:
+    return uuid4().hex
+
+
+def _default_tree_label(sound_seed: int, resolution: int, sample_rate: int) -> str:
+    rate_khz = sample_rate / 1000.0
+    return f"Seed {sound_seed} • {resolution}px @ {rate_khz:.1f} kHz"
+
+
+def _format_tree_label(entry: dict[str, Any]) -> str:
+    label = entry.get("label") or "Evolution tree"
+    manager: EvolutionManager | None = entry.get("manager")
+    generation_count = len(manager.generations) if manager is not None else 0
+    suffix = "s" if generation_count != 1 else ""
+    return f"{label} ({generation_count} generation{suffix})"
+
+
+def _activate_tree(state: st.session_state, tree_id: str) -> None:
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    entry = forest.get(tree_id)
+    if entry is None:
+        return
+    state["active_tree_id"] = tree_id
+    state["evolution_manager"] = entry["manager"]
+    state["evolution_signature"] = entry["signature"]
+    state["run_infinite"] = entry.get("run_infinite", False)
+    state["pending_generations"] = entry.get("pending", 0)
+    meta = dict(entry.get("metadata", {}))
+    if "shared_seed" in meta:
+        state["shared_seed"] = int(meta["shared_seed"])
+    else:
+        state["shared_seed"] = int(entry["manager"].base_seed)
+    if "sound_seed" in meta:
+        state["active_sound_seed"] = int(meta["sound_seed"])
+    if "sample_rate" in meta:
+        state["current_sound_sample_rate"] = int(meta["sample_rate"])
+    if "resolution" in meta:
+        state["current_sound_resolution"] = int(meta["resolution"])
+    if "parent_seeds" in meta:
+        parent_meta = meta.get("parent_seeds", [])
+        if isinstance(parent_meta, (list, tuple)):
+            state["active_parent_seeds"] = [int(seed) for seed in parent_meta]
+
+
+def _register_tree(
+    state: st.session_state,
+    manager: EvolutionManager,
+    *,
+    label: str,
+    run_infinite: bool,
+    pending: int = 0,
+    activate: bool = True,
+    unique: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    signature = (manager.image_signature, int(manager.base_seed))
+
+    if not unique:
+        for existing_id, entry in forest.items():
+            if entry.get("signature") == signature:
+                entry["manager"] = manager
+                entry["label"] = label
+                entry["run_infinite"] = bool(run_infinite)
+                entry["pending"] = int(pending)
+                entry["metadata"] = dict(metadata or entry.get("metadata", {}))
+                if activate or state.get("active_tree_id") is None:
+                    _activate_tree(state, existing_id)
+                return existing_id
+
+    tree_id = _generate_tree_id()
+    forest[tree_id] = {
+        "manager": manager,
+        "signature": signature,
+        "label": label,
+        "created": time.time(),
+        "run_infinite": bool(run_infinite),
+        "pending": int(pending),
+        "metadata": dict(metadata or {}),
+    }
+
+    if activate or state.get("active_tree_id") is None:
+        _activate_tree(state, tree_id)
+    return tree_id
+
+
+def _sync_active_tree_state(state: st.session_state) -> None:
+    forest: dict[str, dict[str, Any]] | None = state.get("evolution_trees")
+    tree_id = state.get("active_tree_id")
+    if not forest or tree_id not in forest:
+        return
+    entry = forest[tree_id]
+    entry["run_infinite"] = bool(state.get("run_infinite", False))
+    entry["pending"] = int(state.get("pending_generations", 0))
+    entry["signature"] = tuple(state.get("evolution_signature", entry["signature"]))
+    meta = dict(entry.get("metadata", {}))
+    meta.update(
+        {
+            "shared_seed": int(state.get("shared_seed", meta.get("shared_seed", 0))),
+            "sound_seed": int(state.get("active_sound_seed", meta.get("sound_seed", 0))),
+            "sample_rate": int(
+                state.get("current_sound_sample_rate", meta.get("sample_rate", 48_000))
+            ),
+            "resolution": int(
+                state.get("current_sound_resolution", meta.get("resolution", 192))
+            ),
+            "parent_seeds": [
+                int(seed)
+                for seed in state.get(
+                    "active_parent_seeds", meta.get("parent_seeds", [])
+                )
+            ],
+        }
+    )
+    entry["metadata"] = meta
+
+
+def _update_tree_label(state: st.session_state, label: str) -> None:
+    forest: dict[str, dict[str, Any]] | None = state.get("evolution_trees")
+    tree_id = state.get("active_tree_id")
+    if not forest or tree_id not in forest:
+        return
+    forest[tree_id]["label"] = label
+
+
+def _refresh_active_parents(
+    state: st.session_state,
+    manager: EvolutionManager,
+    generation: GenerationRecord | None = None,
+) -> None:
+    """Ensure the session tracks lineage seeds for selective breeding."""
+
+    available = {entry.seed for entry in manager.parent_lineage}
+    selection = [
+        int(seed)
+        for seed in state.get("active_parent_seeds", [])
+        if int(seed) in available
+    ]
+    if generation is not None and generation.candidates:
+        selection.append(generation.best_candidate.seed)
+    elif not selection and available:
+        best_entry = max(manager.parent_lineage, key=lambda entry: entry.metrics.ssim)
+        selection.append(best_entry.seed)
+    state["active_parent_seeds"] = list(dict.fromkeys(selection))
+
+
+def _get_reconstruction_cache(state: st.session_state) -> dict[str, Any]:
+    """Access the memoized reconstruction lab state."""
+
+    return state.setdefault("_reconstruction_lab", {})
+
+
+def _store_reconstruction_result(
+    state: st.session_state, result: ReconstructionResult
+) -> None:
+    cache = _get_reconstruction_cache(state)
+    cache["result"] = result
+    cache["stored_at"] = time.time()
+
+
+def _render_reconstruction_result(result: ReconstructionResult) -> None:
+    st.markdown("### Reconstruction outcomes")
+    base_cols = st.columns(3)
+    base_cols[0].image(
+        to_uint8_image(result.base_image),
+        caption="Ground truth collage",
+        use_column_width=True,
+    )
+    base_cols[1].image(
+        to_uint8_image(result.ensemble_prediction),
+        caption="Ensemble prediction",
+        use_column_width=True,
+    )
+    base_cols[2].image(
+        to_uint8_image(result.hybrid_prediction),
+        caption="Hybrid fill (ensemble + audio)",
+        use_column_width=True,
+    )
+
+    comparison_cols = st.columns(2)
+    comparison_cols[0].image(
+        to_uint8_image(result.audio_reconstruction),
+        caption="Audio-derived reconstruction",
+        use_column_width=True,
+    )
+    overlay = colorize_comparison(result.base_image, result.hybrid_prediction)
+    comparison_cols[1].image(
+        to_uint8_image(overlay),
+        caption="Overlay vs. ground truth",
+        use_column_width=True,
+    )
+
+    diff = np.abs(result.base_image - result.hybrid_prediction)
+    st.image(
+        to_uint8_image(normalize_for_display(diff)),
+        caption="Residual difference heatmap",
+        use_column_width=True,
+    )
+
+    coverage_map = normalize_for_display(result.coverage)
+    coverage_rgb = np.stack(
+        [coverage_map, np.zeros_like(coverage_map), 1.0 - coverage_map],
+        axis=2,
+    )
+    st.image(
+        to_uint8_image(coverage_rgb),
+        caption="Coverage confidence (red = uncertain, blue = confident)",
+        use_column_width=True,
+    )
+
+    variation_count = result.variations.shape[0]
+    if variation_count > 0:
+        index = st.slider(
+            "Inspect noisy variation",
+            min_value=0,
+            max_value=variation_count - 1,
+            value=0,
+            key="reconstruction_variation_index",
+        )
+        st.image(
+            to_uint8_image(result.variations[index]),
+            caption=f"Variation sample {index + 1} of {variation_count}",
+            use_column_width=True,
+        )
+
+    try:
+        wav_bytes = waveform_to_wav_bytes(result.waveform, result.sample_rate)
+    except ValueError as exc:
+        st.warning(f"Unable to render waveform audio: {exc}")
+    else:
+        st.audio(wav_bytes, format="audio/wav")
+
+    shape_rows = [
+        {
+            "Shape": item.shape,
+            "Colour (RGB)": (
+                f"{item.color[0]:.2f}, {item.color[1]:.2f}, {item.color[2]:.2f}"
+            ),
+            "Centre": f"({item.center[0]}, {item.center[1]})",
+            "Rotation": f"{item.rotation:.1f}°",
+            "Size": item.size,
+        }
+        for item in result.shapes
+    ]
+    if shape_rows:
+        st.dataframe(pd.DataFrame(shape_rows), use_container_width=True)
+
+
+
+def _render_reconstruction_lab(
+    state: st.session_state, *, default_resolution: int, default_sample_rate: int
+) -> None:
+    cache = _get_reconstruction_cache(state)
+    default_seed = int(state.get("shared_seed", 0)) or 1
+
+    seed_value = int(cache.get("seed", default_seed))
+    variation_value = int(cache.get("variation_count", 6))
+    noise_value = float(cache.get("noise_sigma", 0.3))
+    dropout_value = float(cache.get("dropout_probability", 0.35))
+    sample_rate_value = int(cache.get("sample_rate", default_sample_rate))
+
+    noise_default = _quantize_slider_value(
+        noise_value, min_value=0.05, max_value=0.6, step=0.05
+    )
+    dropout_default = _quantize_slider_value(
+        dropout_value, min_value=0.05, max_value=0.8, step=0.05
+    )
+    sample_rate_default = int(
+        _quantize_slider_value(
+            float(sample_rate_value),
+            min_value=16_000,
+            max_value=64_000,
+            step=2_000,
+        )
+    )
+
+    seed = st.number_input(
+        "Collage seed",
+        value=seed_value,
+        min_value=1,
+        step=1,
+        key="reconstruction_seed",
+        help="Controls the random collage generator used for the reconstruction challenge.",
+    )
+    variation_count = st.slider(
+        "Number of noisy glimpses",
+        min_value=3,
+        max_value=15,
+        value=min(max(variation_value, 3), 15),
+        key="reconstruction_variations",
+        help="How many corrupted observations to blend before predicting the missing pixels.",
+    )
+    noise_sigma = st.slider(
+        "Noise amplitude",
+        min_value=0.05,
+        max_value=0.6,
+        value=float(noise_default),
+        step=0.05,
+        key="reconstruction_noise",
+        help="Standard deviation of the Gaussian noise added to each variation.",
+    )
+    dropout_probability = st.slider(
+        "Dropout probability",
+        min_value=0.05,
+        max_value=0.8,
+        value=float(dropout_default),
+        step=0.05,
+        key="reconstruction_dropout",
+        help="Likelihood that a pixel is replaced with unrelated noise in each glimpse.",
+    )
+    sample_rate = st.slider(
+        "Audio sample rate",
+        min_value=16_000,
+        max_value=64_000,
+        step=2_000,
+        value=sample_rate_default,
+        key="reconstruction_sample_rate",
+        help="Encoding rate for the collage-to-audio conversion stage.",
+    )
+
+    run_experiment = st.button(
+        "Run reconstruction experiment",
+        key="reconstruction_run",
+    )
+
+    if run_experiment:
+        try:
+            result = run_reconstruction_cycle(
+                int(seed),
+                resolution=(default_resolution, default_resolution),
+                variation_count=int(variation_count),
+                noise_sigma=float(noise_sigma),
+                dropout_probability=float(dropout_probability),
+                sample_rate=int(sample_rate),
+            )
+        except ValueError as exc:
+            st.error(f"Failed to run reconstruction experiment: {exc}")
+        else:
+            cache.update(
+                {
+                    "seed": int(seed),
+                    "variation_count": int(variation_count),
+                    "noise_sigma": float(noise_sigma),
+                    "dropout_probability": float(dropout_probability),
+                    "sample_rate": int(sample_rate),
+                }
+            )
+            _store_reconstruction_result(state, result)
+            st.success("Reconstruction experiment completed; review the outcomes below.")
+
+    cached_result = cache.get("result")
+    if isinstance(cached_result, ReconstructionResult):
+        _render_reconstruction_result(cached_result)
+    else:
+        st.caption("Run the reconstruction experiment to visualise predictions.")
 
 
 def _update_difficulty(state: st.session_state, latest_overlap: float) -> float:
@@ -46,6 +750,19 @@ def _autosave_path(directory: Path) -> Path:
     return directory / "evolution_state.pkl"
 
 
+def _finite_or_none(value: Any) -> float | None:
+    """Return ``value`` as a finite float, or ``None`` when unavailable."""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if math.isfinite(numeric):
+        return numeric
+    return None
+
+
 def _attempt_autoload(autosave_dir: Path) -> None:
     state = st.session_state
     try:
@@ -53,16 +770,9 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     except FileNotFoundError:
         return
     except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Failed to load autosave from %s", autosave_dir)
         st.sidebar.warning(f"Failed to load autosave: {exc}")
         return
-
-    state["evolution_manager"] = manager
-    state["evolution_signature"] = (
-        manager.image_signature,
-        float(manager.encoder.sigma),
-        float(manager.decoder.denoise_sigma or 0.0),
-        int(manager.base_seed),
-    )
 
     previous_scene = state.get("adaptive_scene")
     scene = dict(previous_scene) if isinstance(previous_scene, dict) else {}
@@ -80,10 +790,51 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         }
     )
     state["adaptive_scene"] = scene
+    state["active_sound_seed"] = int(scene["sound_seed"])
+    state["current_sound_sample_rate"] = int(scene["sample_rate"])
+    state["current_sound_resolution"] = int(scene["resolution"])
+    state["shared_seed"] = int(scene["base_seed"])
     state["sound_generations_left"] = int(scene["target_dwell"])
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
+    if EvolutionManager.hyper_mode_enabled():
+        state["_hyper_profile_cache"] = manager.hyper_profile
+        state["generations_to_queue"] = int(
+            max(1, manager.hyper_profile.queue_generations or state.get("generations_to_queue", 1))
+        )
+        dwell = int(
+            max(1, manager.hyper_profile.dwell_generations or state.get("sound_target_dwell", scene["target_dwell"]))
+        )
+        state["sound_target_dwell"] = dwell
+        state["last_sound_target_dwell"] = dwell
+        state["sound_generations_left"] = min(int(state.get("sound_generations_left", dwell)), dwell)
+    label = f"Autosave • {time.strftime('%H:%M:%S')}"
+    metadata = {
+        "shared_seed": int(scene["base_seed"]),
+        "sound_seed": int(scene["sound_seed"]),
+        "sample_rate": int(scene["sample_rate"]),
+        "resolution": int(scene["resolution"]),
+        "parent_seeds": [entry.seed for entry in manager.parent_lineage],
+    }
+    _register_tree(
+        state,
+        manager,
+        label=label,
+        run_infinite=False,
+        pending=0,
+        activate=True,
+        metadata=metadata,
+    )
+    state["evolution_signature"] = (manager.image_signature, int(manager.base_seed))
+    state["pending_generations"] = 0
+    state["run_infinite"] = False
+    _sync_active_tree_state(state)
     st.sidebar.success("Loaded autosaved evolution session.")
+    logger.info(
+        "Restored autosave from %s with %d generations",
+        autosave_dir,
+        len(manager.generations),
+    )
 
 
 def _ensure_manager(
@@ -93,17 +844,33 @@ def _ensure_manager(
     population_size: int,
     seed: int,
     autosave_interval: int,
+    *,
+    force_new_tree: bool = False,
+    tree_label: str | None = None,
 ) -> EvolutionManager:
     state = st.session_state
-    signature = (
-        compute_image_signature(original),
-        float(encoder.sigma),
-        float(decoder.denoise_sigma or 0.0),
-        int(seed),
-    )
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    was_running_infinite = bool(state.get("run_infinite", False))
+    signature = (compute_image_signature(original), int(seed))
+    metadata = {
+        "shared_seed": int(state.get("shared_seed", seed)),
+        "sound_seed": int(state.get("active_sound_seed", seed)),
+        "sample_rate": int(state.get("current_sound_sample_rate", 48_000)),
+        "resolution": int(
+            state.get(
+                "current_sound_resolution",
+                original.shape[0] if original.ndim >= 2 else int(np.sqrt(original.size)),
+            )
+        ),
+        "parent_seeds": [int(seed) for seed in state.get("active_parent_seeds", [])],
+    }
 
-    manager: EvolutionManager | None = state.get("evolution_manager")
-    if manager is None or state.get("evolution_signature") != signature:
+    active_id = state.get("active_tree_id")
+    entry = forest.get(active_id)
+
+    if force_new_tree or entry is None:
+        if force_new_tree:
+            was_running_infinite = False
         manager = EvolutionManager(
             original=original,
             encoder=encoder,
@@ -112,18 +879,78 @@ def _ensure_manager(
             base_seed=seed,
             autosave_interval=autosave_interval,
         )
-        state["evolution_manager"] = manager
+        label = tree_label or _default_tree_label(
+            int(state.get("active_sound_seed", seed)),
+            int(original.shape[0] if original.ndim >= 2 else np.sqrt(original.size)),
+            int(state.get("current_sound_sample_rate", 48_000)),
+        )
+        _register_tree(
+            state,
+            manager,
+            label=label,
+            run_infinite=was_running_infinite,
+            pending=0,
+            activate=True,
+            unique=force_new_tree,
+            metadata=metadata,
+        )
         state["evolution_signature"] = signature
         state["pending_generations"] = 0
-        state["run_infinite"] = False
-    else:
-        manager.update_settings(
+        state["run_infinite"] = was_running_infinite
+        logger.info("Initialised evolution tree %s", label)
+        return manager
+
+    manager = entry["manager"]
+    if entry.get("signature") != signature:
+        manager = EvolutionManager(
             original=original,
             encoder=encoder,
             decoder=decoder,
             population_size=population_size,
+            base_seed=seed,
             autosave_interval=autosave_interval,
         )
+        label = tree_label or entry.get("label") or _default_tree_label(
+            int(state.get("active_sound_seed", seed)),
+            int(original.shape[0] if original.ndim >= 2 else np.sqrt(original.size)),
+            int(state.get("current_sound_sample_rate", 48_000)),
+        )
+        _register_tree(
+            state,
+            manager,
+            label=label,
+            run_infinite=was_running_infinite,
+            pending=0,
+            activate=True,
+            unique=True,
+            metadata=metadata,
+        )
+        state["evolution_signature"] = signature
+        state["pending_generations"] = 0
+        logger.info("Reinitialised evolution manager for new scene: %s", label)
+        return manager
+
+    manager.update_settings(
+        original=original,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=population_size,
+        autosave_interval=autosave_interval,
+    )
+    engine_mode = state.get("_active_evolution_engine", "Lineage & noise (classic)")
+    if engine_mode == "Neural lineage fusion":
+        advisor = manager.reward_advisor
+        if not isinstance(advisor, NeuralRewardModel):
+            manager.set_advisor(NeuralRewardModel())
+    else:
+        manager.set_advisor(None)
+    entry["manager"] = manager
+    entry["signature"] = signature
+    state["evolution_manager"] = manager
+    state["evolution_signature"] = signature
+    if tree_label:
+        _update_tree_label(state, tree_label)
+    _sync_active_tree_state(state)
     return manager
 
 
@@ -199,12 +1026,12 @@ def _render_image(column: st.delta_generator.DeltaGenerator, image: np.ndarray, 
     alt_text = html.escape(caption)
     caption_html = html.escape(caption).replace("\n", "<br />")
     column.markdown(
-        """
+        f"""
         <figure style="margin:0;text-align:center;">
-          <img src="{src}" alt="{alt}" style="width:100%;height:auto;border-radius:4px;" />
-          <figcaption style="font-size:0.8rem;color:var(--text-color,#666);">{caption}</figcaption>
+          <img src=\"{data_url}\" alt=\"{alt_text}\" style=\"width:100%;height:auto;border-radius:4px;\" />
+          <figcaption style=\"font-size:0.8rem;color:var(--text-color,#666);\">{caption_html}</figcaption>
         </figure>
-        """.format(src=data_url, alt=alt_text, caption=caption_html),
+        """,
         unsafe_allow_html=True,
     )
 
@@ -217,14 +1044,16 @@ def _reset_widget_key(state: st.session_state, key: str) -> None:
         try:
             reset(key, None)
         except Exception:  # pragma: no cover - defensive guard
-            pass
+            logger.debug(
+                "reset_state_value failed for key '%s'", key, exc_info=True
+            )
 
     setter = getattr(state, "_set_widget_state", None)
     if callable(setter):  # pragma: no branch - private Streamlit helper
         try:
             setter(key, None)
         except Exception:  # pragma: no cover - defensive guard
-            pass
+            logger.debug("_set_widget_state failed for key '%s'", key, exc_info=True)
 
     widget_state = getattr(state, "_new_widget_state", None)
     if isinstance(widget_state, dict):  # pragma: no branch - legacy internals
@@ -234,10 +1063,13 @@ def _reset_widget_key(state: st.session_state, key: str) -> None:
         try:
             del state[key]
         except Exception:  # pragma: no cover - defensive guard
+            logger.debug("Failed to delete key '%s' directly", key, exc_info=True)
             try:
                 state.pop(key, None)
             except Exception:
-                pass
+                logger.debug(
+                    "Failed to remove key '%s' using pop", key, exc_info=True
+                )
 
 
 def _migrate_legacy_state(state: st.session_state) -> None:
@@ -248,6 +1080,7 @@ def _migrate_legacy_state(state: st.session_state) -> None:
         if "sound_seed" in state:
             legacy_seed = state.get("sound_seed")
     except Exception:  # pragma: no cover - defensive guard
+        logger.debug("Unable to read legacy sound_seed", exc_info=True)
         legacy_seed = None
     _reset_widget_key(state, "sound_seed")
     if legacy_seed is not None and "active_sound_seed" not in state:
@@ -311,7 +1144,7 @@ def _detect_hardware_backend() -> str:
             suffix = "s" if device_count > 1 else ""
             backends.append(f"CuPy CUDA ({device_count} device{suffix})")
     except Exception:  # pragma: no cover - optional dependency
-        pass
+        logger.debug("CuPy backend check failed", exc_info=True)
 
     try:  # pragma: no cover - optional dependency
         import torch
@@ -320,7 +1153,7 @@ def _detect_hardware_backend() -> str:
             name = torch.cuda.get_device_name(0)
             backends.append(f"PyTorch CUDA ({name})")
     except Exception:  # pragma: no cover - optional dependency
-        pass
+        logger.debug("PyTorch backend check failed", exc_info=True)
 
     if backends:
         return ", ".join(backends)
@@ -529,10 +1362,10 @@ def _record_performance_history(
     ai_ssim: float,
     ai_psnr: float,
     sound_overlap: float,
-) -> list[Dict[str, float]]:
+) -> list[dict[str, float]]:
     """Track recent reconstruction metrics for adaptive scheduling."""
 
-    history: list[Dict[str, float]] = list(state.get("performance_history", []))
+    history: list[dict[str, float]] = list(state.get("performance_history", []))
     history.append(
         {
             "ai_overlap": float(ai_overlap),
@@ -548,12 +1381,12 @@ def _record_performance_history(
 
 
 def _derive_difficulty_metrics(
-    history: list[Dict[str, float]]
-) -> tuple[float, float, float]:
-    """Compute difficulty progress, improvement, and volatility signals."""
+    history: list[dict[str, float]]
+) -> tuple[float, float, float, float]:
+    """Compute difficulty progress, improvement, volatility, and reward signals."""
 
     if not history:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     overlaps = np.asarray([entry["ai_overlap"] for entry in history], dtype=np.float32)
     recent_window = int(min(len(history), _RECENT_PERFORMANCE))
@@ -564,11 +1397,25 @@ def _derive_difficulty_metrics(
     improvement = float(np.clip(recent_mean - long_term, 0.0, 1.0))
     volatility = float(np.std(recent) / 100.0)
 
+    normalized = np.clip(overlaps / 100.0, 0.0, 1.0)
+    reward_curve = np.clip((normalized - 0.4) / 0.6, 0.0, 1.0)
+    reward_recent = float(np.mean(reward_curve[-recent_window:])) if recent_window else 0.0
+    reward_peak = float(np.max(reward_curve)) if reward_curve.size else 0.0
+    reward_signal = float(np.clip(0.65 * reward_recent + 0.35 * reward_peak, 0.0, 1.0))
+
     coverage = float(min(len(history) / _PERFORMANCE_HISTORY, 1.0))
     difficulty_target = float(
-        np.clip(0.45 * best + 0.35 * recent_mean + 0.2 * coverage + 0.4 * improvement, 0.0, 1.0)
+        np.clip(
+            0.35 * best
+            + 0.3 * recent_mean
+            + 0.15 * coverage
+            + 0.3 * improvement
+            + 0.25 * reward_signal,
+            0.0,
+            1.0,
+        )
     )
-    return difficulty_target, improvement, float(np.clip(volatility, 0.0, 1.0))
+    return difficulty_target, improvement, float(np.clip(volatility, 0.0, 1.0)), reward_signal
 
 
 def _refresh_sound_scene(
@@ -632,7 +1479,150 @@ def _refresh_sound_scene(
     return new_sound_seed, int(sample_rate), int(resolution)
 
 
-def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, Any]]) -> bytes:
+def _session_export_payload(
+    *,
+    state: st.session_state,
+    manager: EvolutionManager,
+    metrics: ReconstructionMetrics,
+    sound_metrics: ReconstructionMetrics,
+    ai_sound_alignment: ReconstructionMetrics,
+    ai_overlap_score: float,
+    sound_overlap_score: float,
+    sound_clip: Any,
+    base_encoder_sigma: float,
+    base_decoder_sigma: float,
+    encoder_sigma: float,
+    denoise_sigma: float,
+    current_sample_rate: int,
+    current_resolution: int,
+    sample_rate_range: tuple[int, int],
+    resolution_range: tuple[int, int],
+    seed: int,
+    sound_seed: int,
+    target_dwell: int,
+    best_candidate_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Assemble the export payload used by the session snapshot."""
+
+    hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
+
+    if manager.generations:
+        last_generation = manager.generations[-1]
+        difficulty_raw = float(last_generation.difficulty_raw)
+        difficulty_target = float(np.clip(last_generation.difficulty_level, 0.0, 1.0))
+    else:
+        difficulty_raw = float(state.get("latest_generation_difficulty_raw", 0.0))
+        difficulty_target = float(
+            np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
+        )
+    difficulty_normalized = normalize_difficulty(difficulty_raw)
+
+    config_snapshot = {
+        "population_size": manager.population_size,
+        "autosave_interval": manager.autosave_interval,
+        "encoder_sigma": float(encoder_sigma),
+        "decoder_sigma": float(denoise_sigma),
+        "base_encoder_sigma": float(base_encoder_sigma),
+        "base_decoder_sigma": float(base_decoder_sigma),
+        "sample_rate": int(current_sample_rate),
+        "resolution": int(current_resolution),
+        "difficulty_target": difficulty_target,
+        "shared_seed": int(seed),
+        "sound_seed": int(sound_seed),
+    }
+
+    config_hash_value = hashlib.sha256(
+        json.dumps(config_snapshot, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    provenance = collect_provenance(config_hash=f"sha256:{config_hash_value}")
+    provenance["random_seeds"] = {"session": int(seed), "sound": int(sound_seed)}
+
+    best_psnr = float(metrics.psnr)
+    best_ssim = float(metrics.ssim)
+    if best_candidate_summary is not None:
+        best_psnr = float(best_candidate_summary.get("psnr", best_psnr))
+        best_ssim = float(best_candidate_summary.get("ssim", best_ssim))
+
+    metrics_block = {
+        "ai_vs_reference": metrics.as_dict(),
+        "sound_vs_reference": sound_metrics.as_dict(),
+        "ai_vs_sound": ai_sound_alignment.as_dict(),
+        "overlap": {
+            "ai_vs_reference": float(ai_overlap_score),
+            "sound_vs_reference": float(sound_overlap_score),
+        },
+        "global_pooled": {
+            "psnr": float(metrics.psnr),
+            "ssim": float(metrics.ssim),
+            "desc": "pooled/global comparator",
+        },
+        "per_candidate_strict": {
+            "psnr": best_psnr,
+            "ssim": best_ssim,
+            "desc": "gallery/best-candidate strict comparator",
+        },
+    }
+
+    payload = {
+        "hardware_backend": hardware_backend,
+        "difficulty": {
+            "current": float(state.get("difficulty_progress", 0.0)),
+            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
+            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
+            "dwell_generations": int(target_dwell),
+            "momentum": float(state.get("difficulty_improvement", 0.0)),
+            "volatility": float(state.get("difficulty_volatility", 0.0)),
+            "raw": difficulty_raw,
+            "normalized": difficulty_normalized,
+            "target": difficulty_target,
+        },
+        "seeds": {
+            "shared": int(seed),
+            "sound": int(sound_seed),
+        },
+        "noise": {
+            "base_encoder_sigma": float(base_encoder_sigma),
+            "base_decoder_sigma": float(base_decoder_sigma),
+            "active_encoder_sigma": float(encoder_sigma),
+            "active_decoder_sigma": float(denoise_sigma),
+        },
+        "sound": {
+            "current_sample_rate": int(current_sample_rate),
+            "current_resolution": int(current_resolution),
+            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
+            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
+            "band_volumes": dict(getattr(sound_clip, "band_volumes", {})),
+            "generator_seed": int(getattr(sound_clip, "seed", sound_seed)),
+            "generator_sample_rate": int(
+                getattr(sound_clip, "sample_rate", current_sample_rate)
+            ),
+        },
+        "metrics": metrics_block,
+        "performance_history": list(state.get("performance_history", [])),
+        "manager": {
+            "population_size": int(manager.population_size),
+            "autosave_interval": int(manager.autosave_interval),
+            "generation_count": len(manager.generations),
+            "best_candidate": best_candidate_summary,
+            "mutation_boost": int(manager.mutation_boost),
+        },
+        "provenance": provenance,
+    }
+    if manager.hyper_profile.enabled:
+        profile = manager.hyper_profile
+        payload["hyper_performance"] = {
+            "target_subjects": int(profile.target_subjects),
+            "batch_size": int(profile.batch_size),
+            "dwell_generations": int(profile.dwell_generations),
+            "queue_generations": int(profile.queue_generations),
+            "autosave_interval": int(profile.autosave_interval),
+            "mean_generation_duration": float(profile.mean_duration),
+            "subjects_per_second": float(profile.throughput),
+        }
+    return payload
+
+
+def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, Any]]) -> bytes:
     """Create a zipped export containing session metrics and progress curves.
 
     Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
@@ -655,25 +1645,25 @@ def _build_export_bundle(payload: Dict[str, Any], progress_rows: list[Dict[str, 
 
 def run() -> None:
     """Entry-point for the Streamlit application."""
-    st.set_page_config(page_title="Project Umbra Visual Explorer", layout="wide")
+    _ensure_page_config()
     # Streamlit options: show detailed errors and reduce external telemetry
     try:
         st.set_option("client.showErrorDetails", True)
         st.set_option("browser.gatherUsageStats", False)
     except Exception:
-        pass
-    logging.basicConfig(level=logging.INFO)
-    st.title("Project Umbra Visual Explorer")
-    st.markdown(
-        """
-        Use this dashboard to inspect how the Project Umbra toy pipeline encodes
-        images into apparent noise and reconstructs them. Adjust the parameters to
-        explore how the stochastic encoder and decoder behave, and inspect the
-        overlap score that multiplies the generated and detected imagery.
-        """
+        logger.debug("Failed to configure Streamlit options", exc_info=True)
+
+    log_dir = configure_logging()
+    state = st.session_state
+    if state.get("_umbra_log_directory") != str(log_dir):
+        state["_umbra_log_directory"] = str(log_dir)
+        logger.info("Logging configured; writing UI diagnostics to %s", log_dir)
+
+    st.title("Project Umbra · Compact evolution console")
+    st.caption(
+        "Difficulty steers every setting automatically—press start and let the system tune itself."
     )
 
-    state = st.session_state
     _migrate_legacy_state(state)
     state.setdefault("pending_generations", 0)
     state.setdefault("run_infinite", False)
@@ -701,18 +1691,95 @@ def run() -> None:
     state.setdefault("performance_history", [])
     state.setdefault("difficulty_improvement", 0.0)
     state.setdefault("difficulty_volatility", 0.0)
+    state.setdefault("difficulty_reward", 0.0)
+    state.setdefault("difficulty_reward_points", 0.0)
+    state.setdefault("show_advanced_controls", False)
+    state.setdefault("latest_generation_reward", 0.0)
+    state.setdefault("latest_generation_peak", 0.0)
+    state.setdefault("latest_generation_difficulty", 0.0)
+    state.setdefault("latest_generation_difficulty_raw", 0.0)
+    state.setdefault("latest_generation_improvement", 0.0)
+    state.setdefault("latest_lifetime_reward", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
+    state.setdefault("evolution_trees", {})
+    state.setdefault("active_parent_seeds", [])
+    if state.get("active_tree_id") not in state["evolution_trees"]:
+        state.pop("active_tree_id", None)
+    state.setdefault("_active_image_model", next(iter(_IMAGE_MODEL_PRESETS)))
+    state.setdefault("_active_sound_model", next(iter(_SOUND_MODEL_PRESETS)))
+    state.setdefault("_active_evolution_engine", "Lineage & noise (classic)")
+
+    hyper_enabled = EvolutionManager.hyper_mode_enabled()
+    hyper_profile: HyperPerformanceProfile | None = None
+    if hyper_enabled:
+        cached_profile = state.get("_hyper_profile_cache")
+        if isinstance(cached_profile, HyperPerformanceProfile):
+            hyper_profile = cached_profile
+        else:
+            hyper_profile = EvolutionManager.default_hyper_profile()
+        state["_hyper_profile_cache"] = hyper_profile
+        population_baseline = int(
+            max(1, hyper_profile.batch_size or state.get("population_size", 5))
+        )
+        autosave_baseline = int(
+            max(1, hyper_profile.autosave_interval or state.get("autosave_interval", 5))
+        )
+        dwell_baseline = int(
+            max(1, hyper_profile.dwell_generations or state.get("sound_target_dwell", 10))
+        )
+        queue_baseline = int(
+            max(1, hyper_profile.queue_generations or dwell_baseline)
+        )
+        state["population_size"] = population_baseline
+        state["autosave_interval"] = autosave_baseline
+        state["generations_to_queue"] = queue_baseline
+        state["sound_target_dwell"] = dwell_baseline
+        state["last_sound_target_dwell"] = dwell_baseline
+        state["sound_generations_left"] = min(
+            int(state.get("sound_generations_left", dwell_baseline)),
+            dwell_baseline,
+        )
+        state["evolution_mode"] = "Finite"
+    else:
+        hyper_profile = None
+
+    difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    (
+        run_button,
+        stop_button,
+        reset_button,
+        save_button,
+        reload_button,
+        auto_settings,
+    ) = _render_quick_controls(
+        state,
+        difficulty_progress=difficulty_progress,
+        hyper_profile=hyper_profile,
+    )
+    state["_latest_auto_settings"] = auto_settings
+
+    population_size = int(state.get("population_size", auto_settings["population_size"]))
+    generations_to_queue = int(
+        state.get("generations_to_queue", auto_settings["generations_to_queue"])
+    )
+    autosave_interval = int(state.get("autosave_interval", auto_settings["autosave_interval"]))
+    evolution_mode = state.get("evolution_mode", "Finite")
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
-    st.sidebar.header("Input & Parameters")
-    autosave_input = st.sidebar.text_input(
-        "Autosave directory",
-        value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
-        help="Evolution checkpoints are saved here as evolution_state.pkl.",
-        key="autosave_dir",
-    )
-    autosave_dir = Path(autosave_input).expanduser()
+    show_advanced = bool(state.get("show_advanced_controls", False))
+    load_button = False
+    if show_advanced:
+        with st.sidebar.expander("Session & autosave", expanded=False):
+            st.text_input(
+                "Autosave directory",
+                value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
+                help="Evolution checkpoints are saved here as evolution_state.pkl.",
+                key="autosave_dir",
+            )
+            load_button = st.button("Load autosave")
+
+    autosave_dir = Path(state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))).expanduser()
     normalized_autosave_dir = str(autosave_dir)
     if state.get("last_autosave_dir") != normalized_autosave_dir:
         state["last_autosave_dir"] = normalized_autosave_dir
@@ -724,23 +1791,131 @@ def run() -> None:
             _attempt_autoload(autosave_dir)
         state["autosave_checked"] = True
 
-    difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    if load_button:
+        _attempt_autoload(autosave_dir)
 
-    st.sidebar.subheader("Sound cadence")
-    target_dwell = int(
-        st.sidebar.number_input(
-            "Generations per sound target",
-            min_value=1,
-            max_value=500,
-            value=int(state.get("sound_target_dwell", 10)),
-            step=1,
-            key="sound_target_dwell",
-            help=(
-                "Number of evolution steps to spend matching the current sound-derived "
-                "image before refreshing it with a new randomised scene."
-            ),
+    image_model_names = list(_IMAGE_MODEL_PRESETS.keys())
+    current_image_model = state.get("_active_image_model", image_model_names[0])
+    selected_image_model = current_image_model
+    sound_model_names = list(_SOUND_MODEL_PRESETS.keys())
+    current_sound_model = state.get("_active_sound_model", sound_model_names[0])
+    selected_sound_model = current_sound_model
+    evolution_engines = ["Lineage & noise (classic)", "Neural lineage fusion"]
+    selected_engine = state.get("_active_evolution_engine", evolution_engines[0])
+
+    if show_advanced:
+        with st.sidebar.expander("Model presets", expanded=False):
+            engine_index = (
+                evolution_engines.index(selected_engine)
+                if selected_engine in evolution_engines
+                else 0
+            )
+            selected_image_model = st.selectbox(
+                "Image evolution preset",
+                image_model_names,
+                index=image_model_names.index(current_image_model),
+                key="image_model_select",
+            )
+            st.caption(_IMAGE_MODEL_PRESETS[selected_image_model]["description"])
+            selected_sound_model = st.selectbox(
+                "Sound scene preset",
+                sound_model_names,
+                index=sound_model_names.index(current_sound_model),
+                key="sound_model_select",
+            )
+            st.caption(_SOUND_MODEL_PRESETS[selected_sound_model]["description"])
+            selected_engine = st.selectbox(
+                "Evolution engine",
+                evolution_engines,
+                index=engine_index,
+                key="evolution_engine_select",
+            )
+            if selected_engine == "Neural lineage fusion":
+                st.caption(
+                    "Neural advisor boosts high performers while preserving elite lineages for deep selective breeding."
+                )
+            else:
+                st.caption(
+                    "Classic stochastic evolution that prioritises lineage parents and their direct noise descendants."
+                )
+
+    if state.get("_active_image_model") != selected_image_model:
+        preset = _IMAGE_MODEL_PRESETS[selected_image_model]
+        state["_active_image_model"] = selected_image_model
+        state["encoder_sigma_base"] = float(preset["encoder_sigma"])
+        state["decoder_sigma_base"] = float(preset["decoder_sigma"])
+
+    if state.get("_active_sound_model") != selected_sound_model:
+        preset = _SOUND_MODEL_PRESETS[selected_sound_model]
+        state["_active_sound_model"] = selected_sound_model
+        state["sound_sample_rate_bounds"] = tuple(int(v) for v in preset["sample_rate"])
+        state["sound_resolution_bounds"] = tuple(int(v) for v in preset["resolution"])
+        state["sound_target_dwell"] = int(preset["target_dwell"])
+        state["last_sound_target_dwell"] = int(preset["target_dwell"])
+        state["sound_generations_left"] = int(preset["target_dwell"])
+
+    if state.get("_active_evolution_engine") != selected_engine:
+        state["_active_evolution_engine"] = selected_engine
+
+    target_dwell = int(state.get("sound_target_dwell", auto_settings["target_dwell"]))
+    manual_refresh = False
+    if hyper_enabled and hyper_profile is not None:
+        target_dwell = int(
+            max(1, hyper_profile.dwell_generations or target_dwell)
         )
-    )
+        state["sound_target_dwell"] = target_dwell
+        state["last_sound_target_dwell"] = target_dwell
+    elif not show_advanced:
+        target_dwell = int(auto_settings["target_dwell"])
+        state["sound_target_dwell"] = target_dwell
+        state["last_sound_target_dwell"] = target_dwell
+
+    if show_advanced:
+        with st.sidebar.expander("Sound cadence", expanded=False):
+            if hyper_enabled and hyper_profile is not None:
+                subjects_per_cycle = int(
+                    max(
+                        hyper_profile.target_subjects,
+                        target_dwell * max(state.get("population_size", 1), 1),
+                    )
+                )
+                st.metric("Generations per sound target", target_dwell)
+                st.metric("Subjects scheduled this cycle", subjects_per_cycle)
+                st.caption(
+                    "Hyper performance mode rotates the sound scene automatically once the dwell window completes."
+                )
+            else:
+                target_dwell = int(
+                    st.number_input(
+                        "Generations per sound target",
+                        min_value=1,
+                        max_value=500,
+                        value=int(state.get("sound_target_dwell", target_dwell)),
+                        step=1,
+                        key="sound_target_dwell",
+                        help=(
+                            "Number of evolution steps to spend matching the current sound-derived image before refreshing it with a new randomised scene."
+                        ),
+                    )
+                )
+            manual_refresh = st.button(
+                "Refresh sound scene",
+                key="refresh_sound_scene",
+                help="Force an immediate reseed using the current difficulty profile.",
+            )
+            if manual_refresh:
+                new_seed, new_rate, new_resolution = _refresh_sound_scene(
+                    state,
+                    difficulty_progress,
+                    target_dwell,
+                    improvement=float(state.get("difficulty_improvement", 0.0)),
+                    volatility=float(state.get("difficulty_volatility", 0.0)),
+                    max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
+                )
+                st.info(
+                    "Forced refresh triggered new scene "
+                    f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
+                )
 
     if state.get("last_sound_target_dwell") != target_dwell:
         state["last_sound_target_dwell"] = target_dwell
@@ -761,24 +1936,43 @@ def run() -> None:
         state["sound_generations_left"] = target_dwell
     remaining_before = int(state.get("sound_generations_left", target_dwell))
 
-    manual_refresh = st.sidebar.button(
-        "Refresh sound scene",
-        key="refresh_sound_scene",
-        help="Force an immediate reseed using the current difficulty profile.",
-    )
-    if manual_refresh:
-        new_seed, new_rate, new_resolution = _refresh_sound_scene(
-            state,
-            difficulty_progress,
-            target_dwell,
-            improvement=float(state.get("difficulty_improvement", 0.0)),
-            volatility=float(state.get("difficulty_volatility", 0.0)),
-            max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
-        )
-        st.sidebar.info(
-            "Forced refresh triggered new scene "
-            f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
-        )
+    forest = state.setdefault("evolution_trees", {})
+    new_tree_requested = False
+    if show_advanced:
+        with st.sidebar.expander("Evolution trees", expanded=False):
+            if forest:
+                tree_ids = list(forest.keys())
+                active_tree_id = state.get("active_tree_id", tree_ids[0])
+                if active_tree_id not in forest:
+                    active_tree_id = tree_ids[0]
+                    _activate_tree(state, active_tree_id)
+                selected_tree_id = st.selectbox(
+                    "Stored branches",
+                    tree_ids,
+                    index=tree_ids.index(active_tree_id),
+                    format_func=lambda tid: _format_tree_label(forest[tid]),
+                )
+                if selected_tree_id != active_tree_id:
+                    _activate_tree(state, selected_tree_id)
+                    forest = state.setdefault("evolution_trees", {})
+                st.caption(
+                    "Switch between stored evolution branches to revisit previous sound scenes."
+                )
+            else:
+                st.caption("Branches will appear here after your first evolution run.")
+
+            new_tree_requested = st.button(
+                "Create new evolution tree",
+                key="spawn_new_tree",
+                help="Start a fresh branch with the current presets and sound scene.",
+            )
+    if new_tree_requested:
+        state["_spawn_new_tree_requested"] = True
+        state["pending_generations"] = 0
+        state["run_infinite"] = False
+        _sync_active_tree_state(state)
+        if show_advanced:
+            st.sidebar.info("Queued a new tree; it will initialise on the next evolution tick.")
 
     seed = int(state.get("shared_seed", 0))
     sound_seed = int(state.get("active_sound_seed", seed))
@@ -804,26 +1998,6 @@ def run() -> None:
     state["active_encoder_sigma"] = encoder_sigma
     state["active_decoder_sigma"] = denoise_sigma
 
-    st.sidebar.subheader("Adaptive configuration")
-    st.sidebar.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
-    st.sidebar.metric("Shared seed", str(seed))
-    st.sidebar.metric("Sound seed", str(sound_seed))
-    st.sidebar.metric(
-        "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
-    )
-    st.sidebar.metric(
-        "Image resolution window",
-        f"{resolution_range[0]}–{resolution_range[1]} px",
-    )
-
-    noise_cols = st.sidebar.columns(2)
-    noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
-    noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
-    st.sidebar.caption(
-        "Adaptive noise scales increase encoder randomness while tempering decoder blur "
-        "as the system improves."
-    )
-
     state["sound_generations_left"] = int(
         max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
     )
@@ -843,11 +2017,31 @@ def run() -> None:
         )
         state["current_sound_resolution"] = current_resolution
 
-    st.sidebar.metric("Active sample rate", f"{current_sample_rate:,} Hz")
-    st.sidebar.metric(
-        "Active image resolution",
-        f"{current_resolution}×{current_resolution} px",
-    )
+    if show_advanced:
+        with st.sidebar.expander("Active configuration", expanded=False):
+            st.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
+            st.metric("Shared seed", str(seed))
+            st.metric("Sound seed", str(sound_seed))
+            st.metric(
+                "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
+            )
+            st.metric(
+                "Image resolution window",
+                f"{resolution_range[0]}–{resolution_range[1]} px",
+            )
+            st.metric("Active sample rate", f"{current_sample_rate:,} Hz")
+            st.metric(
+                "Active image resolution",
+                f"{current_resolution}×{current_resolution} px",
+            )
+
+            noise_cols = st.columns(2)
+            noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
+            noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
+            st.caption(
+                "Adaptive noise scales increase encoder randomness while tempering decoder blur as the system improves."
+            )
+    _sync_active_tree_state(state)
 
     original_color, original, sound_clip, shape_specs = generate_sound_art(
         seed=sound_seed,
@@ -891,52 +2085,67 @@ def run() -> None:
     sound_metrics = compute_metrics(colored_original, sound_colored)
     ai_sound_alignment = compute_metrics(ai_colored, sound_colored)
 
-    st.subheader("Sound profile")
-    volume_cols = st.columns(3)
-    for idx, color in enumerate(("red", "green", "blue")):
-        volume_cols[idx].metric(
-            f"{color.title()} volume",
-            f"{sound_clip.band_volumes[color]:.2f}",
-            help="Relative energy detected in the sound clip for this colour band.",
-        )
-    st.caption(
-        f"Waveform length: {sound_clip.samples.size} samples @ {sound_clip.sample_rate} Hz."
+    overview_tab, evolution_tab, experiments_tab = st.tabs(
+        ["Scene overview", "Evolution detail", "Experiments"]
     )
 
-    st.subheader("Reconstruction quality")
-    ai_metrics_cols = st.columns(3)
-    ai_metrics_cols[0].metric("AI colour PSNR", f"{metrics.psnr:.2f} dB")
-    ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
-    ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
+    with overview_tab:
+        st.subheader("Sound profile")
+        volume_cols = st.columns(3)
+        for idx, color in enumerate(("red", "green", "blue")):
+            volume_cols[idx].metric(
+                f"{color.title()} volume",
+                f"{sound_clip.band_volumes[color]:.2f}",
+                help="Relative energy detected in the sound clip for this colour band.",
+            )
+        st.caption(
+            f"Waveform length: {sound_clip.samples.size} samples @ {sound_clip.sample_rate} Hz."
+        )
 
-    if state.get("adversarial_enabled", False):
-        adv: AdversarialManager | None = state.get("adversarial")
-        if adv is None:
-            adv = AdversarialManager()
-            state["adversarial"] = adv
-        pred_image = apply_generator(original, adv.state.generator)
-        pred_metrics = compute_metrics(colored_original, _apply_color_template(pred_image, color_template))
-        _, pred_overlap_score = multiplicative_overlap(original, pred_image)
-        gen, best_score, dec_sigma = adv.step(original, reconstructed)
-        state["decoder_sigma_base"] = dec_sigma
-        st.subheader("Adversarial generator")
-        gen_cols = st.columns(4)
-        gen_cols[0].metric("Gen blur σ", f"{gen.blur_sigma:.2f}")
-        gen_cols[1].metric("Gen contrast", f"{gen.contrast:.2f}")
-        gen_cols[2].metric("Gen brightness", f"{gen.brightness:.2f}")
-        gen_cols[3].metric("Gen score", f"{best_score:.3f}")
-        st.metric("Predicted overlap", f"{pred_overlap_score:.1f}%")
+        st.subheader("Reconstruction quality")
+        ai_metrics_cols = st.columns(3)
+        ai_metrics_cols[0].metric("AI colour PSNR", f"{metrics.psnr:.2f} dB")
+        ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
+        ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
 
-    sound_metrics_cols = st.columns(3)
-    sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
-    sound_metrics_cols[1].metric("Sound colour SSIM", f"{sound_metrics.ssim:.3f}")
-    sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
+        if state.get("adversarial_enabled", False):
+            adv: AdversarialManager | None = state.get("adversarial")
+            if adv is None:
+                adv = AdversarialManager()
+                state["adversarial"] = adv
+            pred_image = apply_generator(original, adv.state.generator)
+            _, pred_overlap_score = multiplicative_overlap(original, pred_image)
+            gen, best_score, dec_sigma = adv.step(original, reconstructed)
+            state["decoder_sigma_base"] = dec_sigma
+            st.subheader("Adversarial generator")
+            gen_cols = st.columns(4)
+            gen_cols[0].metric("Gen blur σ", f"{gen.blur_sigma:.2f}")
+            gen_cols[1].metric("Gen contrast", f"{gen.contrast:.2f}")
+            gen_cols[2].metric("Gen brightness", f"{gen.brightness:.2f}")
+            gen_cols[3].metric("Gen score", f"{best_score:.3f}")
+            st.metric("Predicted overlap", f"{pred_overlap_score:.1f}%")
 
-    st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
+        sound_metrics_cols = st.columns(3)
+        sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
+        sound_metrics_cols[1].metric("Sound colour SSIM", f"{sound_metrics.ssim:.3f}")
+        sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
+
+        st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
 
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
     max_overlap_so_far = float(state["max_overlap_seen"])
+    reward_points = float(
+        max(
+            state.get("difficulty_reward_points", 0.0),
+            state.get("latest_lifetime_reward", 0.0),
+        )
+    )
+    if overlap_pct >= 40.0:
+        reward_points += float(
+            np.interp(overlap_pct, [40.0, 60.0, 100.0], [1.0, 3.0, 5.0])
+        )
+    state["difficulty_reward_points"] = reward_points
     history = _record_performance_history(
         state,
         overlap_pct,
@@ -944,9 +2153,22 @@ def run() -> None:
         float(metrics.psnr),
         float(sound_overlap_score),
     )
-    target_progress, improvement_signal, volatility_signal = _derive_difficulty_metrics(history)
+    target_progress, improvement_signal, volatility_signal, reward_signal = _derive_difficulty_metrics(
+        history
+    )
+    generation_difficulty = float(
+        np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
+    )
+    improvement_signal = max(
+        improvement_signal,
+        float(np.clip(state.get("latest_generation_improvement", 0.0), 0.0, 1.0)),
+    )
+    reward_signal = max(
+        reward_signal,
+        float(np.clip(state.get("latest_generation_peak", 0.0) / 5.0, 0.0, 1.0)),
+    )
     reseed_progress = min(1.0, state.get("sound_reseed_count", 0) / 10.0)
-    blended_target = max(target_progress, reseed_progress)
+    blended_target = max(target_progress, reseed_progress, generation_difficulty)
     previous_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
     updated_progress = float(
         np.clip(0.6 * previous_progress + 0.4 * blended_target, 0.0, 1.0)
@@ -954,126 +2176,193 @@ def run() -> None:
     state["difficulty_progress"] = updated_progress
     state["difficulty_improvement"] = float(improvement_signal)
     state["difficulty_volatility"] = float(volatility_signal)
+    state["difficulty_reward"] = float(reward_signal)
     difficulty_progress = updated_progress
 
-    st.sidebar.metric("Adaptive difficulty", f"{difficulty_progress * 100:.0f}%")
-    momentum = float(state.get("difficulty_improvement", 0.0)) * 100.0
-    variability = float(state.get("difficulty_volatility", 0.0)) * 100.0
-    trend_cols = st.sidebar.columns(2)
-    trend_cols[0].metric("Difficulty momentum", f"{momentum:.1f} pts")
-    trend_cols[1].metric("Difficulty range", f"{variability:.1f} pts")
-
-    st.write(
-        "The overlap score multiplies the normalized original and reconstructed pixels," \
-        " providing a quick proxy for how much of the signal is mutually present."
-    )
-
-    st.subheader("Shape guessing AI")
-    ai_guess_map: Dict[str, ShapeGuess] = {guess.color: guess for guess in guess_shapes(ai_colored)}
-    sound_guess_map: Dict[str, ShapeGuess] = {
-        guess.color: guess for guess in guess_shapes(sound_colored)
-    }
-    guess_rows = []
-    for spec in shape_specs:
-        ai_guess = ai_guess_map.get(spec.color)
-        sound_guess = sound_guess_map.get(spec.color)
-        guess_rows.append(
-            {
-                "Colour": spec.color.title(),
-                "Target shape": spec.shape.title(),
-                "Target volume": f"{spec.volume:.2f}",
-                "Target size (px)": f"{spec.size}",
-                "Target rotation (°)": f"{spec.rotation:.1f}",
-                "Target centre (y, x)": f"({spec.center[0]}, {spec.center[1]})",
-                "AI guess": ai_guess.guess.title() if ai_guess else "None",
-                "AI confidence": f"{ai_guess.confidence:.2f}" if ai_guess else "0.00",
-                "AI match": "✅" if ai_guess and ai_guess.guess == spec.shape else "❌",
-                "Sound guess": sound_guess.guess.title() if sound_guess else "None",
-                "Sound confidence": f"{sound_guess.confidence:.2f}" if sound_guess else "0.00",
-                "Sound match": "✅" if sound_guess and sound_guess.guess == spec.shape else "❌",
-            }
+    difficulty_box = st.sidebar.expander("Difficulty signals", expanded=False)
+    with difficulty_box:
+        st.metric("Adaptive difficulty", f"{difficulty_progress * 100:.0f}%")
+        momentum = float(state.get("difficulty_improvement", 0.0)) * 100.0
+        variability = float(state.get("difficulty_volatility", 0.0)) * 100.0
+        trend_cols = st.columns(2)
+        trend_cols[0].metric("Difficulty momentum", f"{momentum:.1f} pts")
+        trend_cols[1].metric("Difficulty range", f"{variability:.1f} pts")
+        reward_cols = st.columns(3)
+        reward_cols[0].metric(
+            "High-overlap reward",
+            f"{float(state.get('difficulty_reward', 0.0)) * 100:.0f} pts",
+            help="Boost awarded when overlap exceeds 40%, encouraging harder scenarios.",
         )
-    st.table(guess_rows)
-    st.caption(
-        "Both AIs operate on the colourised reconstructions. Matching guesses indicate that "
-        "the generated patterns retained the intended geometric cues."
-    )
-
-    st.subheader("Visual comparisons")
-    overview_row = [
-        (colored_original, f"Sound-derived image ({source_label})"),
-        (packet_display, "Encoded packet (noise + signal)"),
-        (ai_colored, "AI reconstruction (colourised)"),
-        (sound_colored, "Sound-only reconstruction (colourised)"),
-    ]
-    overlay_row = [
-        (noise_display, "Predicted noise contribution"),
-        (ai_overlap_color, "Colour overlap: AI vs original"),
-        (sound_overlap_color, "Colour overlap: Sound vs original"),
-        (cross_overlap_color, "Colour overlap: AI vs sound"),
-    ]
-
-    for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
-        for col, (image, caption) in zip(columns, content):
-            _render_image(col, image, caption)
-
-    st.caption(
-        "Red highlights information present only in the generated candidate, blue marks"
-        " reference-only structure, and neutral grayscale indicates shared content."
-    )
-
-    st.sidebar.subheader("Evolution settings")
-    population_size = int(
-        st.sidebar.number_input(
-            "AI attempts per generation",
-            min_value=1,
-            max_value=32,
-            value=int(state.get("population_size", 4)),
-            step=1,
-            key="population_size",
+        reward_cols[1].metric(
+            "Lifetime reward",
+            f"{state.get('difficulty_reward_points', 0.0):.1f} pts",
+            help="Cumulative bonus reflecting consistently strong overlap scores.",
         )
-    )
-    generations_to_queue = int(
-        st.sidebar.number_input(
-            "Generations to queue",
-            min_value=1,
-            value=int(state.get("generations_to_queue", 5)),
-            step=1,
-            key="generations_to_queue",
+        reward_cols[2].metric(
+            "Generation bonus",
+            f"{state.get('latest_generation_reward', 0.0):.2f}",
+            help="Average reward captured across the most recent generation.",
         )
-    )
-    evolution_mode = st.sidebar.selectbox(
-        "Evolution length",
-        options=["Finite", "Infinite"],
-        index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
-        key="evolution_mode",
-    )
-    autosave_interval = int(
-        st.sidebar.number_input(
-            "Autosave every N generations",
-            min_value=1,
-            value=int(state.get("autosave_interval", 5)),
-            step=1,
-            key="autosave_interval",
+
+    with overview_tab:
+        st.write(
+            "The overlap score measures agreement as ``1 - |original - reconstruction|``,"
+            " so a perfect match reaches 100% while gaps in the prediction reduce the"
+            " percentage."
         )
-    )
 
-    run_button = st.sidebar.button("Start evolution")
-    stop_button = st.sidebar.button("Stop evolution")
-    reset_button = st.sidebar.button("Reset evolution")
-    save_button = st.sidebar.button("Save snapshot now")
-    reload_button = st.sidebar.button("Reload autosave")
+        st.subheader("Shape guessing AI")
+        ai_guess_map: dict[str, ShapeGuess] = {
+            guess.color: guess for guess in guess_shapes(ai_colored)
+        }
+        sound_guess_map: dict[str, ShapeGuess] = {
+            guess.color: guess for guess in guess_shapes(sound_colored)
+        }
+        guess_rows = []
+        for spec in shape_specs:
+            ai_guess = ai_guess_map.get(spec.color)
+            sound_guess = sound_guess_map.get(spec.color)
+            guess_rows.append(
+                {
+                    "Colour": spec.color.title(),
+                    "Target shape": spec.shape.title(),
+                    "Target volume": f"{spec.volume:.2f}",
+                    "Target size (px)": f"{spec.size}",
+                    "Target rotation (°)": f"{spec.rotation:.1f}",
+                    "Target centre (y, x)": f"({spec.center[0]}, {spec.center[1]})",
+                    "AI guess": ai_guess.guess.title() if ai_guess else "None",
+                    "AI confidence": f"{ai_guess.confidence:.2f}" if ai_guess else "0.00",
+                    "AI match": "✅" if ai_guess and ai_guess.guess == spec.shape else "❌",
+                    "Sound guess": sound_guess.guess.title() if sound_guess else "None",
+                    "Sound confidence": f"{sound_guess.confidence:.2f}" if sound_guess else "0.00",
+                    "Sound match": "✅" if sound_guess and sound_guess.guess == spec.shape else "❌",
+                }
+            )
+        st.table(guess_rows)
+        st.caption(
+            "Both AIs operate on the colourised reconstructions. Matching guesses indicate that "
+            "the generated patterns retained the intended geometric cues."
+        )
 
-    st.sidebar.subheader("Adversarial mode (beta)")
-    st.sidebar.checkbox(
-        "Enable generator vs decoder co-evolution",
-        key="adversarial_enabled",
-        value=bool(state.get("adversarial_enabled", False)),
-        help=(
-            "Trains a predictive generator to approximate the decoder's output without passing through"
-            " the channel, while the decoder adapts its denoise level."
-        ),
-    )
+        st.subheader("Visual comparisons")
+        overview_row = [
+            (colored_original, f"Sound-derived image ({source_label})"),
+            (packet_display, "Encoded packet (noise + signal)"),
+            (ai_colored, "AI reconstruction (colourised)"),
+            (sound_colored, "Sound-only reconstruction (colourised)"),
+        ]
+        overlay_row = [
+            (noise_display, "Predicted noise contribution"),
+            (ai_overlap_color, "Colour overlap: AI vs original"),
+            (sound_overlap_color, "Colour overlap: Sound vs original"),
+            (cross_overlap_color, "Colour overlap: AI vs sound"),
+        ]
+
+        for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
+            for col, (image, caption) in zip(columns, content):
+                _render_image(col, image, caption)
+
+        st.caption(
+            "Red highlights information present only in the generated candidate, blue marks"
+            " reference-only structure, and neutral grayscale indicates shared content."
+        )
+
+    if show_advanced:
+        with st.sidebar.expander("Evolution run controls", expanded=True):
+            if hyper_enabled and hyper_profile is not None:
+                population_size = int(
+                    max(1, hyper_profile.batch_size or population_size)
+                )
+                generations_to_queue = int(
+                    max(
+                        1,
+                        hyper_profile.queue_generations
+                        or hyper_profile.dwell_generations
+                        or generations_to_queue,
+                    )
+                )
+                autosave_interval = int(
+                    max(1, hyper_profile.autosave_interval or autosave_interval)
+                )
+                target_subjects = int(
+                    max(
+                        hyper_profile.target_subjects,
+                        population_size * max(hyper_profile.dwell_generations, 1),
+                    )
+                )
+                state["population_size"] = population_size
+                state["generations_to_queue"] = generations_to_queue
+                state["autosave_interval"] = autosave_interval
+                state["evolution_mode"] = "Finite"
+
+                col_top, col_bottom = st.columns(2)
+                col_top.metric("Subjects per generation", population_size)
+                col_top.metric("Queued generations", generations_to_queue)
+                col_bottom.metric("Subjects per sound cycle", target_subjects)
+                col_bottom.metric("Autosave interval", autosave_interval)
+                if hyper_profile.mean_duration > 0.0:
+                    throughput = hyper_profile.throughput
+                    timing_text = (
+                        f"Avg generation {hyper_profile.mean_duration:.2f}s • {throughput:.1f} subjects/s"
+                        if throughput > 0.0
+                        else f"Avg generation {hyper_profile.mean_duration:.2f}s"
+                    )
+                    st.caption(timing_text)
+                st.caption(
+                    "Hyper performance mode tunes these parameters from runtime throughput and the current difficulty so you can focus on results."
+                )
+                evolution_mode = "Finite"
+            else:
+                population_size = int(
+                    st.number_input(
+                        "AI attempts per generation",
+                        min_value=1,
+                        max_value=32,
+                        value=population_size,
+                        step=1,
+                        key="population_size",
+                    )
+                )
+                generations_to_queue = int(
+                    st.number_input(
+                        "Generations to queue",
+                        min_value=1,
+                        value=generations_to_queue,
+                        step=1,
+                        key="generations_to_queue",
+                    )
+                )
+                evolution_mode = st.selectbox(
+                    "Evolution length",
+                    options=["Finite", "Infinite"],
+                    index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
+                    key="evolution_mode",
+                )
+                autosave_interval = int(
+                    st.number_input(
+                        "Autosave every N generations",
+                        min_value=1,
+                        value=autosave_interval,
+                        step=1,
+                        key="autosave_interval",
+                    )
+                )
+                state["population_size"] = population_size
+                state["generations_to_queue"] = generations_to_queue
+                state["autosave_interval"] = autosave_interval
+                state["evolution_mode"] = evolution_mode
+
+    if show_advanced:
+        with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
+            st.checkbox(
+                "Enable generator vs decoder co-evolution",
+                key="adversarial_enabled",
+                value=bool(state.get("adversarial_enabled", False)),
+                help=(
+                    "Trains a predictive generator to approximate the decoder's output without passing through"
+                    " the channel, while the decoder adapts its denoise level."
+                ),
+            )
     if state.get("adversarial_enabled", False) and "adversarial" not in state:
         state["adversarial"] = AdversarialManager()
 
@@ -1085,6 +2374,9 @@ def run() -> None:
         state.pop("adaptive_scene", None)
         state["sound_generations_left"] = 0
         state["difficulty"] = 0.0
+        state["evolution_trees"] = {}
+        state.pop("active_tree_id", None)
+        state["active_parent_seeds"] = []
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
@@ -1092,7 +2384,12 @@ def run() -> None:
         state.pop("evolution_signature", None)
         state["autosave_checked"] = False
         state.pop("adaptive_scene", None)
+        state["evolution_trees"] = {}
+        state.pop("active_tree_id", None)
+        state["active_parent_seeds"] = []
 
+    tree_label = _default_tree_label(sound_seed, current_resolution, current_sample_rate)
+    force_new_tree = bool(state.pop("_spawn_new_tree_requested", False))
     manager = _ensure_manager(
         original=original,
         encoder=encoder,
@@ -1100,7 +2397,63 @@ def run() -> None:
         population_size=population_size,
         seed=seed,
         autosave_interval=autosave_interval,
+        force_new_tree=force_new_tree,
+        tree_label=tree_label,
     )
+    _update_tree_label(state, tree_label)
+    _refresh_active_parents(state, manager)
+
+    if show_advanced:
+        with st.sidebar.expander("Selective breeding", expanded=False):
+            parent_entries = sorted(
+                manager.parent_lineage,
+                key=lambda entry: (entry.origin_generation, -entry.metrics.ssim),
+            )
+            parent_labels = {
+                entry.seed: (
+                    f"Gen {entry.origin_generation} • seed {entry.seed} "
+                    f"(SSIM {entry.metrics.ssim:.3f}, overlap {entry.overlap_score:.1f}%)"
+                )
+                for entry in parent_entries
+            }
+            parent_options = list(parent_labels.keys())
+            default_selection = [
+                seed for seed in state.get("active_parent_seeds", []) if seed in parent_labels
+            ]
+            if not default_selection and parent_options:
+                default_selection = [parent_options[-1]]
+            parent_selection = st.multiselect(
+                "Active parent seeds",
+                parent_options,
+                default=default_selection,
+                key="parent_seed_select",
+                format_func=lambda seed: parent_labels.get(seed, f"Seed {seed}"),
+                help=(
+                    "Selected parent seeds remain in every generation and act as anchors for "
+                    "new child mutations. Leave the selection empty to use the full lineage."
+                ),
+            )
+            state["active_parent_seeds"] = [int(seed) for seed in parent_selection]
+            _sync_active_tree_state(state)
+
+            if parent_entries:
+                active_parent_set = {int(seed) for seed in state.get("active_parent_seeds", [])}
+                summary_rows = [
+                    {
+                        "Seed": entry.seed,
+                        "Generation": entry.origin_generation,
+                        "SSIM": f"{entry.metrics.ssim:.3f}",
+                        "Overlap (%)": f"{entry.overlap_score:.1f}",
+                        "Appearances": entry.appearances,
+                        "Reward": f"{entry.cumulative_reward:.2f}",
+                        "Peak reward": f"{entry.peak_reward:.2f}",
+                        "Active": "★" if entry.seed in active_parent_set else "",
+                    }
+                    for entry in parent_entries
+                ]
+                st.table(summary_rows)
+            else:
+                st.info("Run at least one generation to populate the parent lineage.")
 
     if save_button:
         save_path = manager.save(autosave_dir)
@@ -1110,12 +2463,17 @@ def run() -> None:
         if evolution_mode == "Finite":
             state["pending_generations"] = generations_to_queue
             state["run_infinite"] = False
+            logger.info("Queued %d generations for finite evolution", generations_to_queue)
         else:
             state["run_infinite"] = True
+            logger.info("Activated infinite evolution mode")
+        _sync_active_tree_state(state)
 
     if stop_button:
         state["run_infinite"] = False
         state["pending_generations"] = 0
+        logger.info("Requested evolution stop")
+        _sync_active_tree_state(state)
 
     pending_generations = int(state.get("pending_generations", 0))
     runs_to_execute = 0
@@ -1130,13 +2488,60 @@ def run() -> None:
     reseeded = False
     if runs_to_execute:
         for _ in range(runs_to_execute):
-            manager.run_generation()
+            selection = state.get("active_parent_seeds", [])
+            parent_selection = selection if selection else None
+            generation = manager.run_generation(parent_selection=parent_selection)
+            _refresh_active_parents(state, manager, generation)
+            state["latest_generation_reward"] = float(generation.reward_summary)
+            state["latest_generation_peak"] = float(generation.reward_peak)
+            state["latest_generation_difficulty"] = float(generation.difficulty_level)
+            state["latest_generation_difficulty_raw"] = float(generation.difficulty_raw)
+            state["latest_generation_improvement"] = float(generation.improvement)
+            state["difficulty_reward_points"] = float(manager.lifetime_reward)
+            state["latest_lifetime_reward"] = float(manager.lifetime_reward)
+            reward_signal = float(np.clip(generation.reward_peak / 5.0, 0.0, 1.0))
+            state["difficulty_reward"] = max(
+                float(state.get("difficulty_reward", 0.0)),
+                reward_signal,
+            )
             generations_ran += 1
             if finite_batch:
                 state["pending_generations"] = max(
                     int(state.get("pending_generations", 0)) - 1,
                     0,
                 )
+        logger.debug(
+            "Executed %d generation(s); pending=%d infinite=%s",
+            generations_ran,
+            int(state.get("pending_generations", 0)),
+            state.get("run_infinite", False),
+        )
+        if hyper_enabled:
+            profile = manager.hyper_profile
+            state["_hyper_profile_cache"] = profile
+            state["population_size"] = int(
+                max(1, profile.batch_size or state.get("population_size", population_size))
+            )
+            state["autosave_interval"] = int(
+                max(1, profile.autosave_interval or state.get("autosave_interval", autosave_interval))
+            )
+            state["generations_to_queue"] = int(
+                max(1, profile.queue_generations or state.get("generations_to_queue", generations_to_queue))
+            )
+            state["sound_target_dwell"] = int(
+                max(1, profile.dwell_generations or state.get("sound_target_dwell", target_dwell))
+            )
+            state["last_sound_target_dwell"] = int(state["sound_target_dwell"])
+            state["sound_generations_left"] = min(
+                int(state.get("sound_generations_left", state["sound_target_dwell"])),
+                int(state["sound_target_dwell"]),
+            )
+            state["evolution_mode"] = "Finite"
+            population_size = int(state["population_size"])
+            autosave_interval = int(state["autosave_interval"])
+            generations_to_queue = int(state["generations_to_queue"])
+            target_dwell = int(state["sound_target_dwell"])
+        _sync_active_tree_state(state)
 
     trigger_rerun = False
     if generations_ran:
@@ -1179,214 +2584,288 @@ def run() -> None:
     if generations_ran and len(manager.generations) % manager.autosave_interval == 0:
         save_path = manager.save(autosave_dir)
         st.sidebar.success(f"Autosaved evolution session to {save_path}")
+        logger.info("Autosaved evolution session to %s", save_path)
 
     st.sidebar.metric(
         "Generations remaining on sound target",
         int(state.get("sound_generations_left", target_dwell)),
     )
 
-    generation_progress_rows: list[Dict[str, Any]] = []
-    best_candidate_summary: Dict[str, Any] | None = None
+    generation_progress_rows: list[dict[str, Any]] = []
+    best_candidate_summary: dict[str, Any] | None = None
 
     if manager.generations:
-        st.header("Evolution progress")
-        generation_progress_rows = [
-            {
-                "Generation": record.index,
-                "Best SSIM": record.best_candidate.metrics.ssim,
-                "Best PSNR": record.best_candidate.metrics.psnr,
-                "Best overlap": record.best_candidate.overlap_score,
-            }
-            for record in manager.generations
-        ]
+        with evolution_tab:
+            st.subheader("Evolution progress")
+            generation_progress_rows = []
+            for record in manager.generations:
+                components = _aggregate_reward_components(record)
+                row: dict[str, Any] = {
+                    "Generation": int(record.index),
+                    "Best SSIM": _finite_or_none(record.best_candidate.metrics.ssim),
+                    "Best PSNR": _finite_or_none(record.best_candidate.metrics.psnr),
+                    "Best overlap": _finite_or_none(record.best_candidate.overlap_score),
+                    "Avg reward": _finite_or_none(record.reward_summary),
+                    "Peak reward": _finite_or_none(record.reward_peak),
+                    "Difficulty": _finite_or_none(record.difficulty_level),
+                    "Lifetime reward": _finite_or_none(record.cumulative_reward),
+                    "reward_total": _finite_or_none(record.reward_summary),
+                    "reward_overlap": _finite_or_none(components.get("overlap")),
+                    "reward_msssim": _finite_or_none(components.get("msssim")),
+                    "reward_dct_corr": _finite_or_none(components.get("dct_corr")),
+                    "difficulty_raw": _finite_or_none(record.difficulty_raw),
+                    "difficulty_normalized": _finite_or_none(
+                        record.difficulty_normalized
+                    ),
+                }
+                if record.checkpoint_tag:
+                    row["checkpoint_tag"] = record.checkpoint_tag
+                generation_progress_rows.append(row)
 
-        if generation_progress_rows:
-            progress_df = (
-                pd.DataFrame(generation_progress_rows)
-                .replace([np.inf, -np.inf], np.nan)
-                .dropna()
-            )
-            st.subheader("Best-of-generation trend")
-            if not progress_df.empty:
-                progress_df = progress_df.set_index("Generation")
-                has_variation = (
-                    progress_df.index.size > 1
-                    and any(progress_df[col].nunique() > 1 for col in progress_df.columns)
+            if generation_progress_rows:
+                sanitized_rows, dropped_values = sanitize_progress_rows(
+                    generation_progress_rows
                 )
-                has_finite = bool(np.isfinite(progress_df.to_numpy()).all())
-                if has_variation and has_finite:
-                    st.line_chart(progress_df, width="stretch")
-                elif not has_finite:
-                    st.caption(
-                        "Trend chart hidden until generations contain finite metric values."
+                spec, message = prepare_trend_chart(
+                    sanitized_rows, had_non_finite=dropped_values
+                )
+                if spec:
+                    st.vega_lite_chart(spec, use_container_width=True)
+                    logger.debug(
+                        "Rendered trend chart with %d records", len(sanitized_rows)
                     )
-                else:
-                    st.caption(
-                        "Trend chart will appear once multiple non-identical generations are"
-                        " available."
+                if message:
+                    st.caption(message)
+
+            gen_indices = [record.index for record in manager.generations]
+            default_gen = gen_indices[-1]
+            if len(gen_indices) > 1:
+                selected_generation = st.select_slider(
+                    "Select generation",
+                    options=gen_indices,
+                    value=default_gen,
+                    key="selected_generation",
+                    format_func=lambda idx: f"Generation {idx}",
+                )
+            else:
+                selected_generation = default_gen
+                st.caption("Only one generation so far; displaying the latest results.")
+            generation = manager.generations[selected_generation]
+            best_candidate = generation.best_candidate
+
+            best_candidate_summary = {
+                "generation": generation.index,
+                "seed": best_candidate.seed,
+                "psnr": best_candidate.metrics.psnr,
+                "ssim": best_candidate.metrics.ssim,
+                "overlap": best_candidate.overlap_score,
+            }
+
+            st.subheader("Best candidate metrics")
+            best_cols = st.columns(3)
+            best_cols[0].metric("Seed", str(best_candidate.seed))
+            best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
+            best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
+            st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
+            reward_cols = st.columns(2)
+            reward_cols[0].metric(
+                "Generation reward", f"{generation.reward_summary:.2f}",
+                help="Mean reward achieved across the generation's candidates.",
+            )
+            reward_cols[1].metric(
+                "Difficulty target", f"{generation.difficulty_level * 100:.0f}%",
+                help="Adaptive difficulty derived from reward and overlap performance.",
+            )
+
+            badge_cols = st.columns(2)
+            badge_cols[0].markdown(
+                _metric_badge_html(
+                    "Global pooled metrics (PSNR/SSIM)",
+                    metrics.psnr,
+                    metrics.ssim,
+                ),
+                unsafe_allow_html=True,
+            )
+            badge_cols[1].markdown(
+                _metric_badge_html(
+                    "Per-candidate strict metrics (PSNR/SSIM)",
+                    best_candidate.metrics.psnr,
+                    best_candidate.metrics.ssim,
+                ),
+                unsafe_allow_html=True,
+            )
+
+            st.subheader("Generation gallery")
+            cols_per_row = min(4, len(generation.candidates))
+            for offset in range(0, len(generation.candidates), cols_per_row):
+                row = st.columns(cols_per_row)
+                for col, candidate in zip(
+                    row, generation.candidates[offset : offset + cols_per_row]
+                ):
+                    caption = (
+                        f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
                     )
+                    candidate_image = _apply_color_template(
+                        candidate.reconstruction, color_template
+                    )
+                    _render_image(col, candidate_image, caption)
+
+            st.subheader("Candidate inspector")
+            option_labels = [
+                f"AI {idx + 1}: Seed {cand.seed} – SSIM {cand.metrics.ssim:.3f}"
+                for idx, cand in enumerate(generation.candidates)
+            ]
+            candidate_indices = list(range(len(generation.candidates)))
+            default_candidate = next(
+                (
+                    i
+                    for i, cand in enumerate(generation.candidates)
+                    if cand.seed == best_candidate.seed
+                ),
+                0,
+            )
+            selected_index = st.selectbox(
+                "Choose a candidate to inspect",
+                options=candidate_indices,
+                index=default_candidate,
+                format_func=lambda idx: option_labels[idx],
+                key="candidate_selector",
+            )
+            inspected = generation.candidates[selected_index]
+            inspect_overlap_map, inspect_overlap_score = multiplicative_overlap(
+                manager.original, inspected.reconstruction
+            )
+            inspected_color = colorize_comparison(
+                manager.original, inspected.reconstruction
+            )
+
+            inspect_cols = st.columns(4)
+            _render_image(inspect_cols[0], colored_original, "Evolution reference")
+            inspected_reconstruction = _apply_color_template(
+                inspected.reconstruction, color_template
+            )
+            _render_image(
+                inspect_cols[1],
+                inspected_reconstruction,
+                f"Candidate seed {inspected.seed}",
+            )
+            _render_image(
+                inspect_cols[2],
+                inspect_overlap_map,
+                f"Overlap map ({inspect_overlap_score:.1f}%)",
+            )
+            _render_image(
+                inspect_cols[3],
+                inspected_color,
+                "Colour overlap vs reference",
+            )
+
+            st.subheader("Generation summary")
+            summary_rows = [
+                {
+                    "AI": idx + 1,
+                    "Seed": cand.seed,
+                    "PSNR (dB)": f"{cand.metrics.psnr:.2f}",
+                    "SSIM": f"{cand.metrics.ssim:.3f}",
+                    "Overlap (%)": f"{cand.overlap_score:.1f}",
+                }
+                for idx, cand in enumerate(generation.candidates)
+            ]
+            st.table(summary_rows)
+
+        with experiments_tab:
+            st.subheader("Sound-to-image synthesizer")
+            uploaded_sound_file = st.file_uploader(
+                "Upload WAV audio",
+                type=("wav", "wave"),
+                key="uploaded_sound_file",
+            )
+            if uploaded_sound_file is not None:
+                try:
+                    uploaded_sound_file.seek(0)
+                    audio_bytes = uploaded_sound_file.read()
+                    waveform, uploaded_rate = load_waveform_from_wav(audio_bytes)
+                    uploaded_color, uploaded_gray, uploaded_sound, _ = (
+                        generate_sound_art_from_waveform(
+                            waveform,
+                            uploaded_rate,
+                            image_size=(current_resolution, current_resolution),
+                        )
+                    )
+                    st.markdown(
+                        f"**Uploaded sound clip** — {uploaded_rate:,} Hz, {waveform.size} samples"
+                    )
+                    st.image(
+                        to_uint8_image(uploaded_color),
+                        caption="Sound-derived target from upload",
+                        use_column_width=True,
+                    )
+                    candidate_image = np.asarray(best_candidate.reconstruction, dtype=np.float32)
+                    upload_template = _build_color_template(uploaded_color, uploaded_gray)
+                    interpreted = _apply_color_template(candidate_image, upload_template)
+                    st.image(
+                        to_uint8_image(interpreted),
+                        caption=(
+                            "Evolution interpretation using the selected generation's best candidate"
+                        ),
+                        use_column_width=True,
+                    )
+                except ValueError as exc:
+                    st.error(f"Failed to process audio: {exc}")
             else:
                 st.caption(
-                    "Trend chart will appear once generations contain finite metric values."
+                    "Upload a WAV file to derive a scene and compare it against the selected evolution branch."
                 )
 
-        gen_indices = [record.index for record in manager.generations]
-        default_gen = gen_indices[-1]
-        if len(gen_indices) > 1:
-            selected_generation = st.select_slider(
-                "Select generation",
-                options=gen_indices,
-                value=default_gen,
-                key="selected_generation",
-                format_func=lambda idx: f"Generation {idx}",
+            st.subheader("Noise reconstruction lab")
+            _render_reconstruction_lab(
+                state,
+                default_resolution=current_resolution,
+                default_sample_rate=int(state.get("current_sound_sample_rate", 48_000)),
             )
-        else:
-            selected_generation = default_gen
-            st.caption("Only one generation so far; displaying the latest results.")
-        generation = manager.generations[selected_generation]
-        best_candidate = generation.best_candidate
+    else:
+        with evolution_tab:
+            st.info("Run at least one generation to visualise evolution progress.")
+        with experiments_tab:
+            st.info("Experiments unlock after the first generation completes.")
 
-        best_candidate_summary = {
-            "generation": generation.index,
-            "seed": best_candidate.seed,
-            "psnr": best_candidate.metrics.psnr,
-            "ssim": best_candidate.metrics.ssim,
-            "overlap": best_candidate.overlap_score,
-        }
-
-        st.subheader("Best candidate metrics")
-        best_cols = st.columns(3)
-        best_cols[0].metric("Seed", str(best_candidate.seed))
-        best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
-        best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
-        st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
-
-        st.subheader("Generation gallery")
-        cols_per_row = min(4, len(generation.candidates))
-        for offset in range(0, len(generation.candidates), cols_per_row):
-            row = st.columns(cols_per_row)
-            for col, candidate in zip(row, generation.candidates[offset : offset + cols_per_row]):
-                caption = (
-                    f"Seed {candidate.seed}\nPSNR {candidate.metrics.psnr:.2f} dB\nSSIM {candidate.metrics.ssim:.3f}"
-                )
-                candidate_image = _apply_color_template(candidate.reconstruction, color_template)
-                _render_image(col, candidate_image, caption)
-
-        st.subheader("Candidate inspector")
-        option_labels = [
-            f"AI {idx + 1}: Seed {cand.seed} – SSIM {cand.metrics.ssim:.3f}"
-            for idx, cand in enumerate(generation.candidates)
-        ]
-        candidate_indices = list(range(len(generation.candidates)))
-        default_candidate = next(
-            (i for i, cand in enumerate(generation.candidates) if cand.seed == best_candidate.seed),
-            0,
-        )
-        selected_index = st.selectbox(
-            "Choose a candidate to inspect",
-            options=candidate_indices,
-            index=default_candidate,
-            format_func=lambda idx: option_labels[idx],
-            key="candidate_selector",
-        )
-        inspected = generation.candidates[selected_index]
-        inspect_overlap_map, inspect_overlap_score = multiplicative_overlap(
-            manager.original, inspected.reconstruction
-        )
-        inspected_color = colorize_comparison(manager.original, inspected.reconstruction)
-
-        inspect_cols = st.columns(4)
-        _render_image(inspect_cols[0], colored_original, "Evolution reference")
-        inspected_reconstruction = _apply_color_template(inspected.reconstruction, color_template)
-        _render_image(
-            inspect_cols[1],
-            inspected_reconstruction,
-            f"Candidate seed {inspected.seed}",
-        )
-        _render_image(
-            inspect_cols[2],
-            inspect_overlap_map,
-            f"Overlap map ({inspect_overlap_score:.1f}%)",
-        )
-        _render_image(
-            inspect_cols[3],
-            inspected_color,
-            "Colour overlap vs reference",
-        )
-
-        st.subheader("Generation summary")
-        summary_rows = [
-            {
-                "AI": idx + 1,
-                "Seed": cand.seed,
-                "PSNR (dB)": f"{cand.metrics.psnr:.2f}",
-                "SSIM": f"{cand.metrics.ssim:.3f}",
-                "Overlap (%)": f"{cand.overlap_score:.1f}",
-            }
-            for idx, cand in enumerate(generation.candidates)
-        ]
-        st.table(summary_rows)
-
-    export_payload = {
-        "hardware_backend": state.get("hardware_backend", "CPU (NumPy)"),
-        "difficulty": {
-            "current": float(state.get("difficulty_progress", 0.0)),
-            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
-            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
-            "dwell_generations": int(target_dwell),
-            "momentum": float(state.get("difficulty_improvement", 0.0)),
-            "volatility": float(state.get("difficulty_volatility", 0.0)),
-        },
-        "seeds": {
-            "shared": int(seed),
-            "sound": int(sound_seed),
-        },
-        "noise": {
-            "base_encoder_sigma": float(base_encoder_sigma),
-            "base_decoder_sigma": float(base_decoder_sigma),
-            "active_encoder_sigma": float(encoder_sigma),
-            "active_decoder_sigma": float(denoise_sigma),
-        },
-        "sound": {
-            "current_sample_rate": int(current_sample_rate),
-            "current_resolution": int(current_resolution),
-            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
-            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
-            "band_volumes": sound_clip.band_volumes,
-            "generator_seed": int(sound_clip.seed),
-            "generator_sample_rate": int(sound_clip.sample_rate),
-        },
-        "metrics": {
-            "ai_vs_reference": metrics.as_dict(),
-            "sound_vs_reference": sound_metrics.as_dict(),
-            "ai_vs_sound": ai_sound_alignment.as_dict(),
-            "overlap": {
-                "ai_vs_reference": float(ai_overlap_score),
-                "sound_vs_reference": float(sound_overlap_score),
-            },
-        },
-        "performance_history": list(state.get("performance_history", [])),
-        "manager": {
-            "population_size": int(manager.population_size),
-            "autosave_interval": int(manager.autosave_interval),
-            "generation_count": len(manager.generations),
-            "best_candidate": best_candidate_summary,
-        },
-    }
+    export_payload = _session_export_payload(
+        state=state,
+        manager=manager,
+        metrics=metrics,
+        sound_metrics=sound_metrics,
+        ai_sound_alignment=ai_sound_alignment,
+        ai_overlap_score=ai_overlap_score,
+        sound_overlap_score=sound_overlap_score,
+        sound_clip=sound_clip,
+        base_encoder_sigma=base_encoder_sigma,
+        base_decoder_sigma=base_decoder_sigma,
+        encoder_sigma=encoder_sigma,
+        denoise_sigma=denoise_sigma,
+        current_sample_rate=current_sample_rate,
+        current_resolution=current_resolution,
+        sample_rate_range=sample_rate_range,
+        resolution_range=resolution_range,
+        seed=int(seed),
+        sound_seed=int(sound_seed),
+        target_dwell=target_dwell,
+        best_candidate_summary=best_candidate_summary,
+    )
 
     export_bytes = _build_export_bundle(export_payload, generation_progress_rows)
     export_b64 = base64.b64encode(export_bytes).decode("ascii")
     st.sidebar.markdown(
         (
-            "<a href=\"data:application/zip;base64,{data}\" "
+            f"<a href=\"data:application/zip;base64,{export_b64}\" "
             "download=\"umbra_session_snapshot.zip\" "
             "class=\"st-emotion-cache-3a2x2s e1nzilvr5\">Download session snapshot</a>"
-        ).format(data=export_b64),
+        ),
         unsafe_allow_html=True,
     )
 
     # Ensure infinite mode keeps ticking by scheduling a rerun after work
     if trigger_rerun:
+        logger.debug("Scheduling rerun for continued evolution")
         _trigger_rerun()
 
     st.markdown(

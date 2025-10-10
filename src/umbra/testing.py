@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from .decoding import NoiseStreamDecoder
-from .encoding import NoiseStreamEncoder
-from .metrics import compute_metrics, ReconstructionMetrics
+from umbra.decoding import NoiseStreamDecoder
+from umbra.encoding import NoiseStreamEncoder
+from umbra.metrics import ReconstructionMetrics, compute_metrics
 
 
 def run_smoke_test(

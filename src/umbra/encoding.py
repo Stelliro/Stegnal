@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -15,12 +17,13 @@ class NoisePacket:
     """Container for an encoded image represented as noise."""
 
     encoded: np.ndarray
-    image_shape: Tuple[int, ...]
+    image_shape: tuple[int, ...]
     permutation_seed: int
     sigma: float
 
     def to_file(self, path: str | Path) -> None:
         """Serialize the packet to disk using NumPy."""
+        logger.debug("Serializing noise packet to %s", path)
         np.savez_compressed(
             path,
             encoded=self.encoded.astype(np.float32),
@@ -30,7 +33,8 @@ class NoisePacket:
         )
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "NoisePacket":
+    def from_file(cls, path: str | Path) -> NoisePacket:
+        logger.debug("Loading noise packet from %s", path)
         with np.load(path) as data:
             encoded = data["encoded"].astype(np.float32)
             shape = tuple(int(v) for v in data["image_shape"].astype(int))
@@ -51,7 +55,7 @@ class NoiseStreamEncoder:
         return {"sigma": float(self.sigma)}
 
     @classmethod
-    def from_config(cls, config: dict[str, float]) -> "NoiseStreamEncoder":
+    def from_config(cls, config: dict[str, float]) -> NoiseStreamEncoder:
         """Instantiate the encoder from :meth:`to_config` output."""
 
         return cls(sigma=float(config.get("sigma", 0.2)))
@@ -66,7 +70,13 @@ class NoiseStreamEncoder:
         """Encode the image using a permutation driven by ``seed``."""
         if image.ndim not in (2, 3):
             raise ValueError("Expected image array with shape (H, W) or (H, W, C)")
-        image_shape: Tuple[int, ...] = tuple(int(dim) for dim in image.shape)
+        image_shape: tuple[int, ...] = tuple(int(dim) for dim in image.shape)
+        logger.debug(
+            "Encoding image with shape %s using sigma %.3f and seed %d",
+            image_shape,
+            float(self.sigma),
+            seed,
+        )
         rng = np.random.default_rng(seed)
         flat = np.asarray(image, dtype=np.float32).reshape(-1)
         permutation = rng.permutation(flat.size)
