@@ -21,9 +21,16 @@ def test_multiplicative_overlap_returns_map_and_score():
     reference = np.array([[0.2, 0.5], [0.8, 1.0]], dtype=np.float32)
     candidate = np.array([[0.2, 0.3], [0.4, 0.9]], dtype=np.float32)
     overlap, score = multiplicative_overlap(reference, candidate)
-    expected_overlap = np.clip(reference * candidate, 0.0, 1.0)
+    expected_overlap = np.clip(1.0 - np.abs(reference - candidate), 0.0, 1.0)
     assert np.allclose(overlap, expected_overlap)
     assert score == pytest.approx(expected_overlap.mean() * 100.0)
+
+
+def test_multiplicative_overlap_reaches_hundred_for_identical_images():
+    reference = np.linspace(0.0, 1.0, 9, dtype=np.float32).reshape(3, 3)
+    overlap, score = multiplicative_overlap(reference, reference.copy())
+    assert np.allclose(overlap, 1.0)
+    assert score == pytest.approx(100.0)
 
 
 def test_multiplicative_overlap_requires_matching_shapes():

@@ -8,10 +8,12 @@ supervision. The decoder evolves its denoise parameter to counter the generator.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,6 +79,10 @@ class AdversarialManager:
             step_count=0,
         )
         self.rng = np.random.default_rng()
+        logger.info(
+            "Initialised adversarial manager with decoder sigma %.3f",
+            self.state.decoder_sigma,
+        )
 
     def _score(self, original: np.ndarray, target: np.ndarray, params: GeneratorParams) -> float:
         pred = apply_generator(original, params)
@@ -84,7 +90,7 @@ class AdversarialManager:
         ssim_proxy = float(np.mean(1.0 - np.abs(pred - target)))
         return 0.6 * overlap + 0.4 * ssim_proxy
 
-    def step(self, original: np.ndarray, target: np.ndarray) -> Tuple[GeneratorParams, float, float]:
+    def step(self, original: np.ndarray, target: np.ndarray) -> tuple[GeneratorParams, float, float]:
         """Perform one co-evolution step.
 
         The generator proposes parameter jitters; the decoder responds by nudging
@@ -95,6 +101,9 @@ class AdversarialManager:
         base_score = self._score(original, target, current)
         best_params = current
         best_score = base_score
+        logger.debug(
+            "Adversarial step %d base score %.4f", self.state.step_count, base_score
+        )
 
         # Propose a few jittered candidates around the current generator parameters
         for _ in range(6):
@@ -123,6 +132,12 @@ class AdversarialManager:
 
         self.state.best_score = max(self.state.best_score, best_score)
         self.state.step_count += 1
+        logger.info(
+            "Adversarial iteration %d best score %.4f decoder sigma %.3f",
+            self.state.step_count,
+            best_score,
+            self.state.decoder_sigma,
+        )
         return self.state.generator, float(best_score), float(self.state.decoder_sigma)
 
 
@@ -131,6 +146,3 @@ __all__ = [
     "AdversarialManager",
     "apply_generator",
 ]
-
-
-
