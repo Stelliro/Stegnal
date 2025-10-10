@@ -1151,6 +1151,35 @@ _RECENT_PERFORMANCE = 8
 _MAX_GENERATIONS_PER_TICK = 3
 
 
+def _should_schedule_rerun(
+    *,
+    generations_ran: int,
+    reseeded: bool,
+    run_infinite: bool,
+    pending_generations: int,
+) -> bool:
+    """Return ``True`` when the Streamlit app should immediately rerun.
+
+    The previous implementation only considered infinite mode when no finite work had
+    been scheduled for the current tick. If a user switched to infinite mode while a
+    finite backlog was still draining, the rerun condition short-circuited and the UI
+    stopped scheduling additional generations once the backlog reached zero. By
+    checking the infinite flag independently of the finite queue we guarantee that the
+    evolution loop keeps ticking after the queued work completes.
+    """
+
+    if generations_ran <= 0:
+        return False
+
+    if reseeded:
+        return True
+
+    if pending_generations > 0:
+        return True
+
+    return run_infinite
+
+
 def _detect_hardware_backend() -> str:
     """Attempt to detect accelerated compute backends available to the app."""
 
@@ -2595,13 +2624,11 @@ def run() -> None:
     else:
         state["sound_generations_left"] = remaining_before
 
-    trigger_rerun = bool(
-        generations_ran
-        and (
-            reseeded
-            or (finite_batch and state.get("pending_generations", 0) > 0)
-            or (not finite_batch and state.get("run_infinite", False))
-        )
+    trigger_rerun = _should_schedule_rerun(
+        generations_ran=generations_ran,
+        reseeded=reseeded,
+        run_infinite=bool(state.get("run_infinite", False)),
+        pending_generations=int(state.get("pending_generations", 0)),
     )
 
     if generations_ran and len(manager.generations) % manager.autosave_interval == 0:

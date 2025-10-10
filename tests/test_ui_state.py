@@ -231,3 +231,39 @@ def test_handle_auto_pause_pauses_finite(monkeypatch) -> None:
     ui._handle_auto_pause(state, difficulty_progress=0.2, pause_threshold=0.9)
 
     assert state["auto_pause_acknowledged"] is False
+
+
+def test_should_schedule_rerun_handles_mixed_modes() -> None:
+    from umbra import ui
+
+    # No generations executed -> never rerun.
+    assert not ui._should_schedule_rerun(
+        generations_ran=0,
+        reseeded=False,
+        run_infinite=True,
+        pending_generations=0,
+    )
+
+    # Finite backlog still present keeps scheduling reruns.
+    assert ui._should_schedule_rerun(
+        generations_ran=2,
+        reseeded=False,
+        run_infinite=False,
+        pending_generations=3,
+    )
+
+    # When the backlog drains but infinite mode remains active we continue running.
+    assert ui._should_schedule_rerun(
+        generations_ran=3,
+        reseeded=False,
+        run_infinite=True,
+        pending_generations=0,
+    )
+
+    # With no backlog and finite mode disabled we stop.
+    assert not ui._should_schedule_rerun(
+        generations_ran=1,
+        reseeded=False,
+        run_infinite=False,
+        pending_generations=0,
+    )
