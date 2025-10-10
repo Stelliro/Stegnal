@@ -31,6 +31,9 @@ def test_evolution_manager_runs_multiple_generations() -> None:
     assert all(0.0 <= metric.ssim <= 1.0 for metric in best_metrics)
     assert manager.lifetime_reward > 0.0
     assert all(record.reward_summary >= 0.0 for record in manager.generations)
+    assert manager.total_score > 0.0
+    assert len(manager.total_score_trace) == 3
+    assert all(record.total_score >= 0.0 for record in manager.generations)
 
 
 def test_parent_lineage_retains_elites_and_children() -> None:
@@ -116,6 +119,7 @@ def test_perfect_overlap_is_reachable_with_zero_noise() -> None:
     best = generation.best_candidate
     assert best.overlap_score > 99.9
     assert np.allclose(best.reconstruction.astype(np.float32), image, atol=1e-3)
+    assert generation.total_score >= best.overlap_score * 0.5
 
 
 def test_difficulty_respects_overlap_improvement() -> None:

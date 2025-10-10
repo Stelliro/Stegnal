@@ -1661,6 +1661,8 @@ def _session_export_payload(
             "generation_count": len(manager.generations),
             "best_candidate": best_candidate_summary,
             "mutation_boost": int(manager.mutation_boost),
+            "total_score": float(state.get("lifetime_total_score", manager.total_score)),
+            "latest_total_score": float(state.get("latest_generation_total_score", 0.0)),
         },
         "provenance": provenance,
     }
@@ -1756,6 +1758,8 @@ def run() -> None:
     state.setdefault("latest_generation_difficulty_raw", 0.0)
     state.setdefault("latest_generation_improvement", 0.0)
     state.setdefault("latest_lifetime_reward", 0.0)
+    state.setdefault("latest_generation_total_score", 0.0)
+    state.setdefault("lifetime_total_score", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
     state.setdefault("evolution_trees", {})
     state.setdefault("active_parent_seeds", [])
@@ -2263,9 +2267,14 @@ def run() -> None:
             help="Cumulative bonus reflecting consistently strong overlap scores.",
         )
         reward_cols[2].metric(
-            "Generation bonus",
-            f"{state.get('latest_generation_reward', 0.0):.2f}",
-            help="Average reward captured across the most recent generation.",
+            "Generation total score",
+            f"{state.get('latest_generation_total_score', 0.0):.1f}",
+            help="Difficulty-weighted score achieved by the latest generation.",
+        )
+        st.metric(
+            "Lifetime total score",
+            f"{state.get('lifetime_total_score', 0.0):.1f}",
+            help="Cumulative difficulty-weighted performance across this run.",
         )
 
     with overview_tab:
@@ -2441,6 +2450,8 @@ def run() -> None:
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
         state["active_parent_seeds"] = []
+        state["latest_generation_total_score"] = 0.0
+        state["lifetime_total_score"] = 0.0
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
@@ -2464,6 +2475,7 @@ def run() -> None:
         force_new_tree=force_new_tree,
         tree_label=tree_label,
     )
+    state["lifetime_total_score"] = float(getattr(manager, "total_score", 0.0))
     _update_tree_label(state, tree_label)
     _refresh_active_parents(state, manager)
 
@@ -2547,6 +2559,8 @@ def run() -> None:
         runs_to_execute = min(pending_generations, _MAX_GENERATIONS_PER_TICK)
     elif state.get("run_infinite", False):
         runs_to_execute = 1
+    if state.get("run_infinite", False) and runs_to_execute == 0:
+        runs_to_execute = 1
 
     generations_ran = 0
     reseeded = False
@@ -2563,6 +2577,8 @@ def run() -> None:
             state["latest_generation_improvement"] = float(generation.improvement)
             state["difficulty_reward_points"] = float(manager.lifetime_reward)
             state["latest_lifetime_reward"] = float(manager.lifetime_reward)
+            state["latest_generation_total_score"] = float(generation.total_score)
+            state["lifetime_total_score"] = float(manager.total_score)
             reward_signal = float(np.clip(generation.reward_peak / 5.0, 0.0, 1.0))
             state["difficulty_reward"] = max(
                 float(state.get("difficulty_reward", 0.0)),
@@ -2671,6 +2687,7 @@ def run() -> None:
                     "Peak reward": _finite_or_none(record.reward_peak),
                     "Difficulty": _finite_or_none(record.difficulty_level),
                     "Lifetime reward": _finite_or_none(record.cumulative_reward),
+                    "Total score": _finite_or_none(record.total_score),
                     "reward_total": _finite_or_none(record.reward_summary),
                     "reward_overlap": _finite_or_none(components.get("overlap")),
                     "reward_msssim": _finite_or_none(components.get("msssim")),
@@ -2729,12 +2746,16 @@ def run() -> None:
             best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
             best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
             st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
-            reward_cols = st.columns(2)
+            reward_cols = st.columns(3)
             reward_cols[0].metric(
+                "Total score", f"{generation.total_score:.1f}",
+                help="Difficulty-weighted score combining overlap and scene scale.",
+            )
+            reward_cols[1].metric(
                 "Generation reward", f"{generation.reward_summary:.2f}",
                 help="Mean reward achieved across the generation's candidates.",
             )
-            reward_cols[1].metric(
+            reward_cols[2].metric(
                 "Difficulty target", f"{generation.difficulty_level * 100:.0f}%",
                 help="Adaptive difficulty derived from reward and overlap performance.",
             )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import pickle
 import time
@@ -185,6 +186,7 @@ class GenerationRecord:
     difficulty_raw: float = 0.0
     improvement: float = 0.0
     checkpoint_tag: str | None = None
+    total_score: float = 0.0
 
     @property
     def best_candidate(self) -> CandidateResult:
@@ -216,6 +218,8 @@ class EvolutionSession:
     lifetime_reward: float = 0.0
     reward_trace: list[float] = field(default_factory=list)
     difficulty_trace: list[float] = field(default_factory=list)
+    total_score: float = 0.0
+    total_score_trace: list[float] = field(default_factory=list)
     elite_seeds: list[int] = field(default_factory=list)
     advisor_state: dict[str, Any] | None = None
     best_overlap: float = 0.0
@@ -283,6 +287,8 @@ class EvolutionManager:
         self.lifetime_reward: float = 0.0
         self.reward_trace: list[float] = []
         self.difficulty_trace: list[float] = []
+        self.total_score: float = 0.0
+        self.total_score_trace: list[float] = []
         self._best_overlap: float = 0.0
         self._plateau_generations: int = 0
         self._mutation_boost: int = 0
@@ -640,6 +646,9 @@ class EvolutionManager:
             record.peak_reward = float(max(record.peak_reward, candidate.reward))
             record.last_generation = generation.index
         best = generation.best_candidate
+        generation.total_score = self._compute_total_score(generation, best)
+        self.total_score += float(generation.total_score)
+        self.total_score_trace.append(float(generation.total_score))
         logger.info(
             "Completed generation %d; best seed %d with SSIM %.3f and overlap %.2f",
             generation.index,
@@ -649,6 +658,36 @@ class EvolutionManager:
         )
         self._handle_plateau(generation)
         return generation
+
+    def _compute_total_score(
+        self, generation: GenerationRecord, candidate: CandidateResult
+    ) -> float:
+        """Combine overlap, difficulty, and scene size into a total score."""
+
+        scheduled = float(np.clip(generation.difficulty_level, 0.0, 1.0))
+        if scheduled <= 0.0 and generation.difficulty_raw:
+            scheduled = float(
+                np.clip(normalize_difficulty(generation.difficulty_raw), 0.0, 1.0)
+            )
+
+        overlap = float(np.clip(candidate.overlap_score, 0.0, 100.0))
+        difficulty_scale = 0.5 + scheduled
+
+        if self.original.ndim >= 2:
+            height = int(self.original.shape[0])
+            width = int(self.original.shape[1])
+        else:  # pragma: no cover - degenerate originals are unlikely but handled
+            side = int(max(int(np.sqrt(self.original.size)), 1))
+            height = width = side
+
+        pixel_count = max(float(height * width), 1.0)
+        reference_pixels = 50.0 * 50.0
+        size_ratio = max(pixel_count / reference_pixels, 1e-6)
+        size_scale = 1.0 + 0.1 * math.log10(size_ratio)
+        size_scale = float(np.clip(size_scale, 0.25, None))
+
+        total = overlap * difficulty_scale * size_scale
+        return float(max(total, 0.0))
 
     def _record_generation_duration(
         self,
@@ -840,6 +879,7 @@ class EvolutionManager:
                     ),
                     improvement=float(getattr(record, "improvement", 0.0)),
                     checkpoint_tag=getattr(record, "checkpoint_tag", None),
+                    total_score=float(getattr(record, "total_score", 0.0)),
                 )
             )
 
@@ -857,6 +897,8 @@ class EvolutionManager:
             lifetime_reward=float(self.lifetime_reward),
             reward_trace=list(self.reward_trace),
             difficulty_trace=list(self.difficulty_trace),
+            total_score=float(self.total_score),
+            total_score_trace=list(self.total_score_trace),
             elite_seeds=list(self._elite_pool),
             advisor_state=(
                 self._reward_model.to_state() if self._reward_model is not None else None
@@ -942,6 +984,7 @@ class EvolutionManager:
                     ),
                     improvement=float(getattr(record, "improvement", 0.0)),
                     checkpoint_tag=getattr(record, "checkpoint_tag", None),
+                    total_score=float(getattr(record, "total_score", 0.0)),
                 )
             )
 
@@ -976,6 +1019,8 @@ class EvolutionManager:
         manager.lifetime_reward = float(getattr(session, "lifetime_reward", 0.0))
         manager.reward_trace = list(getattr(session, "reward_trace", []))
         manager.difficulty_trace = list(getattr(session, "difficulty_trace", []))
+        manager.total_score = float(getattr(session, "total_score", 0.0))
+        manager.total_score_trace = list(getattr(session, "total_score_trace", []))
         manager._elite_pool = list(getattr(session, "elite_seeds", []))
         manager._best_overlap = float(getattr(session, "best_overlap", 0.0))
         manager._plateau_generations = int(getattr(session, "plateau_generations", 0))

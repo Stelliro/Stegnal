@@ -192,6 +192,9 @@ def test_session_export_payload_contains_provenance(monkeypatch) -> None:
     difficulty_block = payload["difficulty"]
     for key in ("raw", "normalized", "target"):
         assert key in difficulty_block
+    manager_block = payload["manager"]
+    assert "total_score" in manager_block
+    assert "latest_total_score" in manager_block
 
 
 def test_handle_auto_pause_retains_infinite(monkeypatch) -> None:
