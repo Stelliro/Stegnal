@@ -849,7 +849,7 @@ def _ensure_manager(
     tree_label: str | None = None,
 ) -> EvolutionManager:
     state = st.session_state
-    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {}) 
     was_running_infinite = bool(state.get("run_infinite", False))
     signature = (compute_image_signature(original), int(seed))
     metadata = {
@@ -1126,6 +1126,35 @@ _SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (64, 96, 128, 160, 192, 224, 256)
 _PERFORMANCE_HISTORY = 60
 _RECENT_PERFORMANCE = 8
 _MAX_GENERATIONS_PER_TICK = 3
+
+
+def _should_schedule_rerun(
+    *,
+    generations_ran: int,
+    reseeded: bool,
+    run_infinite: bool,
+    pending_generations: int,
+) -> bool:
+    """Return ``True`` when the Streamlit app should immediately rerun.
+
+    The previous implementation only considered infinite mode when no finite work had
+    been scheduled for the current tick. If a user switched to infinite mode while a
+    finite backlog was still draining, the rerun condition short-circuited and the UI
+    stopped scheduling additional generations once the backlog reached zero. By
+    checking the infinite flag independently of the finite queue we guarantee that the
+    evolution loop keeps ticking after the queued work completes.
+    """
+
+    if generations_ran <= 0:
+        return False
+
+    if reseeded:
+        return True
+
+    if pending_generations > 0:
+        return True
+
+    return run_infinite
 
 
 def _detect_hardware_backend() -> str:
@@ -1503,6 +1532,130 @@ def _session_export_payload(
     best_candidate_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Assemble the export payload used by the session snapshot."""
+
+    hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
+
+    if manager.generations:
+        last_generation = manager.generations[-1]
+        difficulty_raw = float(last_generation.difficulty_raw)
+        difficulty_target = float(np.clip(last_generation.difficulty_level, 0.0, 1.0))
+    else:
+        difficulty_raw = float(state.get("latest_generation_difficulty_raw", 0.0))
+        difficulty_target = float(
+            np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
+        )
+    difficulty_normalized = normalize_difficulty(difficulty_raw)
+
+    config_snapshot = {
+        "population_size": manager.population_size,
+        "autosave_interval": manager.autosave_interval,
+        "encoder_sigma": float(encoder_sigma),
+        "decoder_sigma": float(denoise_sigma),
+        "base_encoder_sigma": float(base_encoder_sigma),
+        "base_decoder_sigma": float(base_decoder_sigma),
+        "sample_rate": int(current_sample_rate),
+        "resolution": int(current_resolution),
+        "difficulty_target": difficulty_target,
+        "shared_seed": int(seed),
+        "sound_seed": int(sound_seed),
+    }
+
+    config_hash_value = hashlib.sha256(
+        json.dumps(config_snapshot, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    provenance = collect_provenance(config_hash=f"sha256:{config_hash_value}")
+    provenance["random_seeds"] = {"session": int(seed), "sound": int(sound_seed)}
+
+    best_psnr = float(metrics.psnr)
+    best_ssim = float(metrics.ssim)
+    if best_candidate_summary is not None:
+        best_psnr = float(best_candidate_summary.get("psnr", best_psnr))
+        best_ssim = float(best_candidate_summary.get("ssim", best_ssim))
+
+    metrics_block = {
+        "ai_vs_reference": metrics.as_dict(),
+        "sound_vs_reference": sound_metrics.as_dict(),
+        "ai_vs_sound": ai_sound_alignment.as_dict(),
+        "overlap": {
+            "ai_vs_reference": float(ai_overlap_score),
+            "sound_vs_reference": float(sound_overlap_score),
+        },
+        "global_pooled": {
+            "psnr": float(metrics.psnr),
+            "ssim": float(metrics.ssim),
+            "desc": "pooled/global comparator",
+        },
+        "per_candidate_strict": {
+            "psnr": best_psnr,
+            "ssim": best_ssim,
+            "desc": "gallery/best-candidate strict comparator",
+        },
+    }
+
+    payload = {
+        "hardware_backend": hardware_backend,
+        "difficulty": {
+            "current": float(state.get("difficulty_progress", 0.0)),
+            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
+            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
+            "dwell_generations": int(target_dwell),
+            "momentum": float(state.get("difficulty_improvement", 0.0)),
+            "volatility": float(state.get("difficulty_volatility", 0.0)),
+            "raw": difficulty_raw,
+            "normalized": difficulty_normalized,
+            "target": difficulty_target,
+        },
+        "seeds": {
+            "shared": int(seed),
+            "sound": int(sound_seed),
+        },
+        "noise": {
+            "base_encoder_sigma": float(base_encoder_sigma),
+            "base_decoder_sigma": float(base_decoder_sigma),
+            "active_encoder_sigma": float(encoder_sigma),
+            "active_decoder_sigma": float(denoise_sigma),
+        },
+        "sound": {
+            "current_sample_rate": int(current_sample_rate),
+            "current_resolution": int(current_resolution),
+            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
+            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
+            "band_volumes": dict(getattr(sound_clip, "band_volumes", {})),
+            "generator_seed": int(getattr(sound_clip, "seed", sound_seed)),
+            "generator_sample_rate": int(
+                getattr(sound_clip, "sample_rate", current_sample_rate)
+            ),
+        },
+        "metrics": metrics_block,
+        "performance_history": list(state.get("performance_history", [])),
+        "manager": {
+            "population_size": int(manager.population_size),
+            "autosave_interval": int(manager.autosave_interval),
+            "generation_count": len(manager.generations),
+            "best_candidate": best_candidate_summary,
+            "mutation_boost": int(manager.mutation_boost),
+        },
+        "provenance": provenance,
+    }
+    if manager.hyper_profile.enabled:
+        profile = manager.hyper_profile
+        payload["hyper_performance"] = {
+            "target_subjects": int(profile.target_subjects),
+            "batch_size": int(profile.batch_size),
+            "dwell_generations": int(profile.dwell_generations),
+            "queue_generations": int(profile.queue_generations),
+            "autosave_interval": int(profile.autosave_interval),
+            "mean_generation_duration": float(profile.mean_duration),
+            "subjects_per_second": float(profile.throughput),
+        }
+    return payload
+
+
+def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, Any]]) -> bytes:
+    """Create a zipped export containing session metrics and progress curves.
+
+    Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
+    """
 
     hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
 
@@ -2573,13 +2726,11 @@ def run() -> None:
     else:
         state["sound_generations_left"] = remaining_before
 
-    trigger_rerun = bool(
-        generations_ran
-        and (
-            reseeded
-            or (finite_batch and state.get("pending_generations", 0) > 0)
-            or (not finite_batch and state.get("run_infinite", False))
-        )
+    trigger_rerun = _should_schedule_rerun(
+        generations_ran=generations_ran,
+        reseeded=reseeded,
+        run_infinite=bool(state.get("run_infinite", False)),
+        pending_generations=int(state.get("pending_generations", 0)),
     )
 
     if generations_ran and len(manager.generations) % manager.autosave_interval == 0:
