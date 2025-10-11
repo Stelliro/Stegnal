@@ -179,5 +179,86 @@ def prepare_trend_chart(
     return spec, None
 
 
-__all__ = ["sanitize_progress_rows", "prepare_trend_chart"]
+def prepare_metrics_chart(
+    history: Sequence[Mapping[str, float]],
+) -> dict[str, object] | None:
+    """Return a Vega-Lite spec visualising the performance history."""
+
+    if len(history) < 2:
+        return None
+
+    metric_labels = {
+        "ai_overlap": "AI overlap (%)",
+        "ai_ssim": "AI SSIM",
+        "ai_psnr": "AI PSNR (dB)",
+        "sound_overlap": "Sound overlap (%)",
+    }
+
+    values: list[dict[str, float | str]] = []
+    for index, entry in enumerate(history, start=1):
+        for key, label in metric_labels.items():
+            if key not in entry:
+                continue
+            try:
+                numeric = float(entry[key])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric):
+                continue
+            values.append({"Step": float(index), "Metric": label, "Value": numeric})
+
+    if not values:
+        return None
+
+    unique_steps = {value["Step"] for value in values}
+    if len(unique_steps) <= 1:
+        return None
+
+    metric_variations: dict[str, set[float]] = {}
+    for entry in values:
+        label = str(entry["Metric"])
+        metric_variations.setdefault(label, set()).add(float(entry["Value"]))
+    varying_metrics = {label for label, samples in metric_variations.items() if len(samples) > 1}
+    if not varying_metrics:
+        return None
+
+    step_values = [value["Step"] for value in values]
+    score_values = [value["Value"] for value in values]
+
+    x_domain = [min(step_values), max(step_values)]
+    y_domain = [min(score_values), max(score_values)]
+    if y_domain[0] == y_domain[1]:
+        return None
+
+    spec: dict[str, object] = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+        "data": {"values": values},
+        "mark": {"type": "line", "point": True},
+        "encoding": {
+            "x": {
+                "field": "Step",
+                "type": "quantitative",
+                "title": "Observation",
+                "scale": {"domain": x_domain},
+            },
+            "y": {
+                "field": "Value",
+                "type": "quantitative",
+                "title": "Score",
+                "scale": {"domain": y_domain},
+            },
+            "color": {"field": "Metric", "type": "nominal", "title": "Metric"},
+            "tooltip": [
+                {"field": "Step", "type": "quantitative"},
+                {"field": "Metric", "type": "nominal"},
+                {"field": "Value", "type": "quantitative"},
+            ],
+        },
+        "config": {"legend": {"orient": "bottom", "title": ""}},
+    }
+
+    return spec
+
+
+__all__ = ["sanitize_progress_rows", "prepare_trend_chart", "prepare_metrics_chart"]
 
