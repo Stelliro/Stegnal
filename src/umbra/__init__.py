@@ -1,5 +1,11 @@
 """Project Umbra toy pipeline package."""
 
+from .codec import (
+    decode_wav_bytes_to_image,
+    decode_waveform_to_image,
+    encode_image_to_wav_bytes,
+    encode_image_to_waveform,
+)
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
 from .evolution import EvolutionManager, HyperPerformanceProfile, ParentLineage
@@ -19,12 +25,17 @@ from .reconstruction import (
     run_reconstruction_cycle,
     waveform_to_wav_bytes,
 )
+from .predictor import predict_image_from_waveform
 from .visualization import colorize_comparison, multiplicative_overlap, normalize_for_display
 
 __all__ = [
     "NoisePacket",
     "NoiseStreamEncoder",
     "NoiseStreamDecoder",
+    "encode_image_to_waveform",
+    "encode_image_to_wav_bytes",
+    "decode_waveform_to_image",
+    "decode_wav_bytes_to_image",
     "EvolutionManager",
     "ParentLineage",
     "HyperPerformanceProfile",
@@ -45,6 +56,7 @@ __all__ = [
     "generate_shape_collage",
     "image_to_waveform",
     "predict_missing_pixels",
+    "predict_image_from_waveform",
     "reconstruct_from_waveform",
     "run_reconstruction_cycle",
     "waveform_to_wav_bytes",

@@ -22,6 +22,7 @@ from .metrics import (
     compute_ms_ssim,
     dct_band_correlation,
 )
+from .runs import append_history, get_run_paths, load_history, new_run
 from .visualization import multiplicative_overlap
 
 if TYPE_CHECKING:  # pragma: no cover - optional neural advisor import
@@ -212,6 +213,8 @@ class EvolutionSession:
     autosave_interval: int
     generations: list[GenerationRecord]
     rng_state: dict
+    run_id: str | None = None
+    next_generation_index: int = 0
     parent_lineage: list[ParentLineage] = field(default_factory=list)
     lifetime_reward: float = 0.0
     reward_trace: list[float] = field(default_factory=list)
@@ -257,6 +260,9 @@ class EvolutionManager:
         base_seed: int,
         autosave_interval: int = 5,
         advisor: NeuralRewardModel | None = None,
+        *,
+        run_id: str | None = None,
+        next_generation_index: int | None = None,
     ) -> None:
         self.original = np.asarray(original, dtype=np.float32)
         self.encoder = encoder
@@ -274,6 +280,17 @@ class EvolutionManager:
             self.autosave_interval = max(1, int(autosave_interval))
             self._hyper_profile = HyperPerformanceProfile(enabled=False)
         self.base_seed = int(base_seed)
+        if run_id is None:
+            run_id, run_dir = new_run()
+        else:
+            run_id = str(run_id)
+            run_dir, _ = get_run_paths(run_id)
+        self.run_id = run_id
+        self._run_directory = run_dir
+        if next_generation_index is None:
+            self.next_generation_index = 0
+        else:
+            self.next_generation_index = max(0, int(next_generation_index))
         self.generations: list[GenerationRecord] = []
         self.rng = np.random.default_rng(self.base_seed)
         self._parent_lineage: dict[int, ParentLineage] = {}
@@ -343,6 +360,102 @@ class EvolutionManager:
         """Attach or detach a neural reward advisor."""
 
         self._reward_model = advisor
+
+    @property
+    def run_directory(self) -> Path:
+        """Return the filesystem directory backing this evolution run."""
+
+        return self._run_directory
+
+    def append_generation_record(
+        self,
+        generation: GenerationRecord,
+        *,
+        persist: bool = True,
+        use_next_index: bool = False,
+    ) -> None:
+        """Append ``generation`` to the history and optionally persist it."""
+
+        if use_next_index or generation.index < 0:
+            generation.index = int(self.next_generation_index)
+        else:
+            generation.index = int(generation.index)
+        self.generations.append(generation)
+        self.next_generation_index = max(self.next_generation_index, generation.index + 1)
+        if persist:
+            self._persist_generation_history(generation)
+
+    def sync_history(self) -> None:
+        """Ensure the on-disk history matches the in-memory generations."""
+
+        if not self.run_id:
+            return
+
+        rows = [self._history_payload(record) for record in self.generations]
+        run_dir, history_path = get_run_paths(self.run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        if not rows:
+            return
+
+        try:
+            history = load_history(self.run_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to read existing history; forcing rebuild", exc_info=True)
+            history = None
+
+        needs_replace = True
+        if history is not None and hasattr(history, "empty") and not history.empty:
+            try:
+                existing_generations = list(history["generation"])
+            except Exception:  # pragma: no cover - defensive
+                existing_generations = []
+            desired_generations = [row["generation"] for row in rows]
+            if existing_generations == desired_generations:
+                needs_replace = False
+
+        if needs_replace:
+            try:
+                append_history(self.run_id, rows, replace=True)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Failed to rebuild run history", exc_info=True)
+
+    def _history_payload(self, generation: GenerationRecord) -> dict[str, object]:
+        best_seed: int | None = None
+        best_overlap: float | None = None
+        best_ssim: float | None = None
+        if generation.candidates:
+            try:
+                best = generation.best_candidate
+            except ValueError:  # pragma: no cover - defensive
+                best = None
+            if best is not None:
+                best_seed = int(best.seed)
+                best_overlap = float(best.overlap_score)
+                best_ssim = float(best.metrics.ssim)
+
+        return {
+            "generation": int(generation.index),
+            "reward_summary": float(getattr(generation, "reward_summary", 0.0)),
+            "reward_peak": float(getattr(generation, "reward_peak", 0.0)),
+            "cumulative_reward": float(getattr(generation, "cumulative_reward", 0.0)),
+            "difficulty_level": float(getattr(generation, "difficulty_level", 0.0)),
+            "difficulty_raw": float(getattr(generation, "difficulty_raw", 0.0)),
+            "improvement": float(getattr(generation, "improvement", 0.0)),
+            "checkpoint_tag": generation.checkpoint_tag,
+            "best_seed": best_seed,
+            "best_overlap": best_overlap,
+            "best_ssim": best_ssim,
+        }
+
+    def _persist_generation_history(self, generation: GenerationRecord) -> None:
+        if not self.run_id:
+            return
+        payload = self._history_payload(generation)
+        try:
+            append_history(self.run_id, payload)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to append generation history", exc_info=True)
 
     def update_settings(
         self,
@@ -512,10 +625,11 @@ class EvolutionManager:
         while len(seeds) < target_candidates:
             _add_seed(self._spawn_child_seed(anchors or seeds))
 
-        generation = GenerationRecord(index=len(self.generations))
+        generation_index = int(self.next_generation_index)
+        generation = GenerationRecord(index=generation_index)
         logger.info(
             "Running generation %d with %d parents and %d children",
-            generation.index,
+            generation_index,
             len(anchors),
             len(seeds) - len(anchors),
         )
@@ -578,7 +692,6 @@ class EvolutionManager:
             rewards.append(reward)
             generation.candidates.append(candidate)
 
-        self.generations.append(generation)
         if rewards:
             generation.reward_summary = float(np.mean(rewards))
             generation.reward_peak = float(np.max(rewards))
@@ -639,15 +752,20 @@ class EvolutionManager:
             record.cumulative_reward = float(record.cumulative_reward + candidate.reward)
             record.peak_reward = float(max(record.peak_reward, candidate.reward))
             record.last_generation = generation.index
-        best = generation.best_candidate
-        logger.info(
-            "Completed generation %d; best seed %d with SSIM %.3f and overlap %.2f",
-            generation.index,
-            best.seed,
-            best.metrics.ssim,
-            best.overlap_score,
-        )
+        self.append_generation_record(generation, persist=False, use_next_index=True)
+        if generation.candidates:
+            best = generation.best_candidate
+            logger.info(
+                "Completed generation %d; best seed %d with SSIM %.3f and overlap %.2f",
+                generation.index,
+                best.seed,
+                best.metrics.ssim,
+                best.overlap_score,
+            )
+        else:
+            logger.info("Completed generation %d with no evaluated candidates", generation.index)
         self._handle_plateau(generation)
+        self._persist_generation_history(generation)
         return generation
 
     def _record_generation_duration(
@@ -851,6 +969,8 @@ class EvolutionManager:
             population_size=self.population_size,
             base_seed=self.base_seed,
             autosave_interval=self.autosave_interval,
+            run_id=self.run_id,
+            next_generation_index=int(self.next_generation_index),
             generations=compact_generations,
             rng_state=self.rng.bit_generator.state,
             parent_lineage=list(self._parent_lineage.values()),
@@ -872,6 +992,7 @@ class EvolutionManager:
     def save(self, directory: str | Path) -> Path:
         """Persist the current session to ``directory``."""
 
+        self.sync_history()
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "evolution_state.pkl"
@@ -968,8 +1089,11 @@ class EvolutionManager:
             base_seed=session.base_seed,
             autosave_interval=session.autosave_interval,
             advisor=advisor,
+            run_id=getattr(session, "run_id", None),
+            next_generation_index=getattr(session, "next_generation_index", None),
         )
-        manager.generations = restored_generations
+        for record in restored_generations:
+            manager.append_generation_record(record, persist=False, use_next_index=False)
         manager.rng.bit_generator.state = session.rng_state
         lineage = getattr(session, "parent_lineage", [])
         manager._parent_lineage = {entry.seed: entry for entry in lineage}
@@ -996,6 +1120,27 @@ class EvolutionManager:
         manager._throughput_ema = float(getattr(manager._hyper_profile, "throughput", 0.0))
         if advisor is None and advisor_state is None:
             manager._reward_model = None
+        stored_next = getattr(session, "next_generation_index", None)
+        if stored_next is not None:
+            manager.next_generation_index = max(
+                manager.next_generation_index, int(stored_next)
+            )
+        if manager.run_id:
+            try:
+                history_frame = load_history(manager.run_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Failed to load history for run %s", manager.run_id, exc_info=True)
+                history_frame = None
+            if history_frame is not None and hasattr(history_frame, "empty") and not history_frame.empty:
+                try:
+                    last_index = int(max(history_frame["generation"]))
+                except Exception:  # pragma: no cover - defensive
+                    last_index = None
+                if last_index is not None:
+                    manager.next_generation_index = max(
+                        manager.next_generation_index, last_index + 1
+                    )
+        manager.sync_history()
         return manager
 
 
