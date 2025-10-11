@@ -180,58 +180,73 @@ def prepare_trend_chart(
 
 
 def prepare_metrics_chart(
-    history: Sequence[Mapping[str, float]]
-) -> tuple[dict[str, object] | None, str | None]:
-    """Build a compact Vega-Lite spec summarising recent metric history."""
+    history: Sequence[Mapping[str, float]],
+) -> dict[str, object] | None:
+    """Return a Vega-Lite spec visualising the performance history."""
 
-    if not history:
-        return None, "Metrics chart will appear once generation history is available."
+    if len(history) < 2:
+        return None
 
-    metric_names: set[str] = set()
-    for row in history:
-        metric_names.update(row.keys())
+    metric_labels = {
+        "ai_overlap": "AI overlap (%)",
+        "ai_ssim": "AI SSIM",
+        "ai_psnr": "AI PSNR (dB)",
+        "sound_overlap": "Sound overlap (%)",
+    }
 
-    if not metric_names:
-        return None, "Metrics chart requires metric values to display."
-
-    values: list[dict[str, float]] = []
-    for index, row in enumerate(history):
-        step = float(index)
-        for metric in sorted(metric_names):
-            value = row.get(metric)
-            if value is None:
+    values: list[dict[str, float | str]] = []
+    for index, entry in enumerate(history, start=1):
+        for key, label in metric_labels.items():
+            if key not in entry:
                 continue
             try:
-                numeric = float(value)
+                numeric = float(entry[key])
             except (TypeError, ValueError):
                 continue
-            if math.isfinite(numeric):
-                values.append({"Step": step, "Metric": metric, "Value": numeric})
+            if not math.isfinite(numeric):
+                continue
+            values.append({"Step": float(index), "Metric": label, "Value": numeric})
 
     if not values:
-        return (
-            None,
-            "Metrics chart hidden until generations contain finite metric values.",
-        )
+        return None
 
-    y_values = [entry["Value"] for entry in values]
-    y_min = min(y_values)
-    y_max = max(y_values)
+    unique_steps = {value["Step"] for value in values}
+    if len(unique_steps) <= 1:
+        return None
 
-    if y_min == y_max:
-        return None, "Metrics chart will appear once metric values vary over time."
+    metric_variations: dict[str, set[float]] = {}
+    for entry in values:
+        label = str(entry["Metric"])
+        metric_variations.setdefault(label, set()).add(float(entry["Value"]))
+    varying_metrics = {label for label, samples in metric_variations.items() if len(samples) > 1}
+    if not varying_metrics:
+        return None
 
-    x_values = [entry["Step"] for entry in values]
-    x_domain = [min(x_values), max(x_values)]
+    step_values = [value["Step"] for value in values]
+    score_values = [value["Value"] for value in values]
+
+    x_domain = [min(step_values), max(step_values)]
+    y_domain = [min(score_values), max(score_values)]
+    if y_domain[0] == y_domain[1]:
+        return None
 
     spec: dict[str, object] = {
         "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
         "data": {"values": values},
-        "mark": {"type": "line", "point": False},
-        "autosize": {"type": "fit", "contains": "padding"},
+        "mark": {"type": "line", "point": True},
         "encoding": {
-            "x": {"field": "Step", "type": "quantitative", "title": "Generation step"},
-            "y": {"field": "Value", "type": "quantitative", "title": "Score"},
+            "x": {
+                "field": "Step",
+                "type": "quantitative",
+                "title": "Observation",
+                "scale": {"domain": x_domain},
+            },
+            "y": {
+                "field": "Value",
+                "type": "quantitative",
+                "title": "Score",
+                "scale": {"domain": y_domain},
+            },
             "color": {"field": "Metric", "type": "nominal", "title": "Metric"},
             "tooltip": [
                 {"field": "Step", "type": "quantitative"},
@@ -240,29 +255,9 @@ def prepare_metrics_chart(
             ],
         },
         "config": {"legend": {"orient": "bottom", "title": ""}},
-        "usermeta": {
-            "embedOptions": {
-                "tooltip": {
-                    "modifiers": [
-                        {"name": "offset", "options": {"mainAxis": 8, "crossAxis": 0}},
-                        {"name": "preventOverflow", "options": {"padding": 16}},
-                        {"name": "hide"},
-                        {"name": "flip"},
-                    ]
-                }
-            }
-        },
     }
 
-    spec["encoding"]["x"]["scale"] = {"domain": x_domain}
-    spec["encoding"]["y"]["scale"] = {"domain": [y_min, y_max]}
-
-    logger.debug(
-        "Prepared metrics chart spec with %d values across metrics %s",
-        len(values),
-        sorted(metric_names),
-    )
-    return spec, None
+    return spec
 
 
 __all__ = ["sanitize_progress_rows", "prepare_trend_chart", "prepare_metrics_chart"]

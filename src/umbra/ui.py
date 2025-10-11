@@ -10,6 +10,7 @@ import logging
 import math
 import time
 import zipfile
+from datetime import datetime
 from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
@@ -21,7 +22,13 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from umbra.chart_export import export_chart_png
 from umbra.adversarial import AdversarialManager, apply_generator
+from umbra.codec import (
+    decode_waveform_to_image,
+    encode_image_to_waveform,
+    encode_image_to_wav_bytes,
+)
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import (
@@ -34,20 +41,17 @@ from umbra.evolution import (
 from umbra.logging_utils import collect_provenance, configure_logging
 from umbra.metrics import ReconstructionMetrics, compute_metrics
 from umbra.neural import NeuralRewardModel
-from umbra.progress import (
-    prepare_metrics_chart,
-    prepare_trend_chart,
-    sanitize_progress_rows,
-)
+from umbra.predictor import predict_image_from_waveform
+from umbra.progress import prepare_trend_chart, sanitize_progress_rows
 from umbra.reconstruction import (
     ReconstructionResult,
     run_reconstruction_cycle,
     waveform_to_wav_bytes,
 )
+from umbra.run_helpers import ensure_run_paths
 from umbra.sound import (
     ShapeGuess,
     generate_sound_art,
-    generate_sound_art_from_waveform,
     guess_shapes,
     load_waveform_from_wav,
 )
@@ -95,6 +99,83 @@ _DARK_STYLE = """
 }
 </style>
 """
+
+
+class RunStore:
+    """Persist run-specific artifacts to disk."""
+
+    def __init__(self, root: Path | str) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def start_run(self) -> str:
+        """Create a new run folder and return its identifier."""
+
+        base = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        counter = 0
+        while True:
+            run_id = base if counter == 0 else f"{base}-{counter:02d}"
+            run_dir = self.root / run_id
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+                (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+                return run_id
+            except FileExistsError:
+                counter += 1
+
+    def artifacts_directory(self, run_id: str) -> Path:
+        path = self.root / run_id / "artifacts"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_bytes(self, run_id: str, filename: str, data: bytes) -> Path:
+        path = self.artifacts_directory(run_id) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def save_image(self, run_id: str, filename: str, image: np.ndarray) -> Path:
+        png_bytes = _image_to_png_bytes(image)
+        return self.save_bytes(run_id, filename, png_bytes)
+
+
+def _sanitize_filename(label: str, suffix: str) -> str:
+    safe = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_"
+        for ch in label.strip().lower()
+    )
+    safe = safe.strip("._") or "artifact"
+    return f"{safe}{suffix}"
+
+
+def _image_to_png_bytes(image: np.ndarray) -> bytes:
+    array = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    with BytesIO() as buffer:
+        Image.fromarray((array * 255.0).astype(np.uint8), mode="RGB").save(
+            buffer, format="PNG"
+        )
+        return buffer.getvalue()
+
+
+def _resize_image(image: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
+    rows, cols = resolution
+    if rows <= 0 or cols <= 0:
+        raise ValueError("resolution must contain positive dimensions")
+    array = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    if array.shape[0] == rows and array.shape[1] == cols:
+        return array
+    pil_image = Image.fromarray((array * 255.0).astype(np.uint8), mode="RGB")
+    resized = pil_image.resize((cols, rows), Image.BILINEAR)
+    return np.asarray(resized, dtype=np.float32) / 255.0
+
+
+def _load_uploaded_image(file) -> np.ndarray:
+    try:
+        with Image.open(file) as uploaded:
+            array = np.asarray(uploaded.convert("RGB"), dtype=np.float32) / 255.0
+        return np.clip(array, 0.0, 1.0)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError(f"Unable to read image: {exc}") from exc
 
 
 def _ensure_page_config() -> None:
@@ -278,41 +359,18 @@ def _render_quick_controls(
         state["show_advanced_controls"] = not state.get("show_advanced_controls", False)
 
     pause_threshold = auto_settings.get("pause_threshold", 0.9)
-    _handle_auto_pause(
-        state,
-        difficulty_progress=difficulty_progress,
-        pause_threshold=pause_threshold,
-    )
-
-    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
-
-
-def _handle_auto_pause(
-    state: st.session_state,
-    *,
-    difficulty_progress: float,
-    pause_threshold: float,
-) -> None:
-    """Pause finite runs at a difficulty spike while letting infinite runs continue."""
-
     if difficulty_progress >= pause_threshold:
-        if state.get("auto_pause_acknowledged", False):
-            return
-
-        if state.get("run_infinite", False):
-            st.sidebar.info(
-                "Difficulty spike reached – infinite evolution continues while settings retune."
-            )
-        else:
+        if not state.get("auto_pause_acknowledged", False):
             state["run_infinite"] = False
             state["pending_generations"] = 0
+            state["auto_pause_acknowledged"] = True
             st.sidebar.info(
                 "Difficulty spike reached – evolution paused so a new scene can be prepared."
             )
-        state["auto_pause_acknowledged"] = True
-        return
+    else:
+        state["auto_pause_acknowledged"] = False
 
-    state["auto_pause_acknowledged"] = False
+    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
 
 
 _IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
@@ -432,6 +490,7 @@ def _activate_tree(state: st.session_state, tree_id: str) -> None:
         return
     state["active_tree_id"] = tree_id
     state["evolution_manager"] = entry["manager"]
+    state["manager"] = entry["manager"]
     state["evolution_signature"] = entry["signature"]
     state["run_infinite"] = entry.get("run_infinite", False)
     state["pending_generations"] = entry.get("pending", 0)
@@ -862,6 +921,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         autosave_dir,
         len(manager.generations),
     )
+    state["manager"] = manager
 
 
 def _ensure_manager(
@@ -876,7 +936,7 @@ def _ensure_manager(
     tree_label: str | None = None,
 ) -> EvolutionManager:
     state = st.session_state
-    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {})
+    forest: dict[str, dict[str, Any]] = state.setdefault("evolution_trees", {}) 
     was_running_infinite = bool(state.get("run_infinite", False))
     signature = (compute_image_signature(original), int(seed))
     metadata = {
@@ -925,6 +985,7 @@ def _ensure_manager(
         state["pending_generations"] = 0
         state["run_infinite"] = was_running_infinite
         logger.info("Initialised evolution tree %s", label)
+        state["manager"] = manager
         return manager
 
     manager = entry["manager"]
@@ -955,6 +1016,7 @@ def _ensure_manager(
         state["evolution_signature"] = signature
         state["pending_generations"] = 0
         logger.info("Reinitialised evolution manager for new scene: %s", label)
+        state["manager"] = manager
         return manager
 
     manager.update_settings(
@@ -974,6 +1036,7 @@ def _ensure_manager(
     entry["manager"] = manager
     entry["signature"] = signature
     state["evolution_manager"] = manager
+    state["manager"] = manager
     state["evolution_signature"] = signature
     if tree_label:
         _update_tree_label(state, tree_label)
@@ -1661,8 +1724,130 @@ def _session_export_payload(
             "generation_count": len(manager.generations),
             "best_candidate": best_candidate_summary,
             "mutation_boost": int(manager.mutation_boost),
-            "total_score": float(state.get("lifetime_total_score", manager.total_score)),
-            "latest_total_score": float(state.get("latest_generation_total_score", 0.0)),
+        },
+        "provenance": provenance,
+    }
+    if manager.hyper_profile.enabled:
+        profile = manager.hyper_profile
+        payload["hyper_performance"] = {
+            "target_subjects": int(profile.target_subjects),
+            "batch_size": int(profile.batch_size),
+            "dwell_generations": int(profile.dwell_generations),
+            "queue_generations": int(profile.queue_generations),
+            "autosave_interval": int(profile.autosave_interval),
+            "mean_generation_duration": float(profile.mean_duration),
+            "subjects_per_second": float(profile.throughput),
+        }
+    return payload
+
+
+def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, Any]]) -> bytes:
+    """Create a zipped export containing session metrics and progress curves.
+
+    Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
+    """
+
+    hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
+
+    if manager.generations:
+        last_generation = manager.generations[-1]
+        difficulty_raw = float(last_generation.difficulty_raw)
+        difficulty_target = float(np.clip(last_generation.difficulty_level, 0.0, 1.0))
+    else:
+        difficulty_raw = float(state.get("latest_generation_difficulty_raw", 0.0))
+        difficulty_target = float(
+            np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
+        )
+    difficulty_normalized = normalize_difficulty(difficulty_raw)
+
+    config_snapshot = {
+        "population_size": manager.population_size,
+        "autosave_interval": manager.autosave_interval,
+        "encoder_sigma": float(encoder_sigma),
+        "decoder_sigma": float(denoise_sigma),
+        "base_encoder_sigma": float(base_encoder_sigma),
+        "base_decoder_sigma": float(base_decoder_sigma),
+        "sample_rate": int(current_sample_rate),
+        "resolution": int(current_resolution),
+        "difficulty_target": difficulty_target,
+        "shared_seed": int(seed),
+        "sound_seed": int(sound_seed),
+    }
+
+    config_hash_value = hashlib.sha256(
+        json.dumps(config_snapshot, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    provenance = collect_provenance(config_hash=f"sha256:{config_hash_value}")
+    provenance["random_seeds"] = {"session": int(seed), "sound": int(sound_seed)}
+
+    best_psnr = float(metrics.psnr)
+    best_ssim = float(metrics.ssim)
+    if best_candidate_summary is not None:
+        best_psnr = float(best_candidate_summary.get("psnr", best_psnr))
+        best_ssim = float(best_candidate_summary.get("ssim", best_ssim))
+
+    metrics_block = {
+        "ai_vs_reference": metrics.as_dict(),
+        "sound_vs_reference": sound_metrics.as_dict(),
+        "ai_vs_sound": ai_sound_alignment.as_dict(),
+        "overlap": {
+            "ai_vs_reference": float(ai_overlap_score),
+            "sound_vs_reference": float(sound_overlap_score),
+        },
+        "global_pooled": {
+            "psnr": float(metrics.psnr),
+            "ssim": float(metrics.ssim),
+            "desc": "pooled/global comparator",
+        },
+        "per_candidate_strict": {
+            "psnr": best_psnr,
+            "ssim": best_ssim,
+            "desc": "gallery/best-candidate strict comparator",
+        },
+    }
+
+    payload = {
+        "hardware_backend": hardware_backend,
+        "difficulty": {
+            "current": float(state.get("difficulty_progress", 0.0)),
+            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
+            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
+            "dwell_generations": int(target_dwell),
+            "momentum": float(state.get("difficulty_improvement", 0.0)),
+            "volatility": float(state.get("difficulty_volatility", 0.0)),
+            "raw": difficulty_raw,
+            "normalized": difficulty_normalized,
+            "target": difficulty_target,
+        },
+        "seeds": {
+            "shared": int(seed),
+            "sound": int(sound_seed),
+        },
+        "noise": {
+            "base_encoder_sigma": float(base_encoder_sigma),
+            "base_decoder_sigma": float(base_decoder_sigma),
+            "active_encoder_sigma": float(encoder_sigma),
+            "active_decoder_sigma": float(denoise_sigma),
+        },
+        "sound": {
+            "current_sample_rate": int(current_sample_rate),
+            "current_resolution": int(current_resolution),
+            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
+            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
+            "band_volumes": dict(getattr(sound_clip, "band_volumes", {})),
+            "generator_seed": int(getattr(sound_clip, "seed", sound_seed)),
+            "generator_sample_rate": int(
+                getattr(sound_clip, "sample_rate", current_sample_rate)
+            ),
+        },
+        "metrics": metrics_block,
+        "performance_history": list(state.get("performance_history", [])),
+        "manager": {
+            "population_size": int(manager.population_size),
+            "autosave_interval": int(manager.autosave_interval),
+            "generation_count": len(manager.generations),
+            "best_candidate": best_candidate_summary,
+            "mutation_boost": int(manager.mutation_boost),
         },
         "provenance": provenance,
     }
@@ -1717,6 +1902,18 @@ def run() -> None:
         state["_umbra_log_directory"] = str(log_dir)
         logger.info("Logging configured; writing UI diagnostics to %s", log_dir)
 
+    run_id = state.get("_umbra_run_id")
+    if not isinstance(run_id, str) or not run_id:
+        run_id = uuid4().hex
+        state["_umbra_run_id"] = run_id
+    run_paths = ensure_run_paths(run_id)
+    state["_umbra_run_directory"] = str(run_paths.root)
+    state["_umbra_charts_directory"] = str(run_paths.charts)
+    chart_files = state.get("_umbra_chart_files")
+    if not isinstance(chart_files, dict):
+        chart_files = {}
+        state["_umbra_chart_files"] = chart_files
+
     st.title("Project Umbra · Compact evolution console")
     st.caption(
         "Difficulty steers every setting automatically—press start and let the system tune itself."
@@ -1732,6 +1929,9 @@ def run() -> None:
     state.setdefault("autosave_interval", 5)
     state.setdefault("generations_to_queue", 5)
     state.setdefault("evolution_mode", "Finite")
+    if "run_store" not in state:
+        state["run_store"] = RunStore(Path("runs"))
+    state.setdefault("active_run_id", None)
     if "shared_seed" not in state:
         state["shared_seed"] = int(np.random.default_rng().integers(0, np.iinfo(np.int32).max))
     state.setdefault("encoder_sigma_base", 0.2)
@@ -1758,8 +1958,6 @@ def run() -> None:
     state.setdefault("latest_generation_difficulty_raw", 0.0)
     state.setdefault("latest_generation_improvement", 0.0)
     state.setdefault("latest_lifetime_reward", 0.0)
-    state.setdefault("latest_generation_total_score", 0.0)
-    state.setdefault("lifetime_total_score", 0.0)
     state.setdefault("hardware_backend", _detect_hardware_backend())
     state.setdefault("evolution_trees", {})
     state.setdefault("active_parent_seeds", [])
@@ -1958,6 +2156,7 @@ def run() -> None:
                         ),
                     )
                 )
+                state["sound_target_dwell"] = target_dwell
             manual_refresh = st.button(
                 "Refresh sound scene",
                 key="refresh_sound_scene",
@@ -2213,14 +2412,18 @@ def run() -> None:
         float(metrics.psnr),
         float(sound_overlap_score),
     )
-    metrics_spec, metrics_message = prepare_metrics_chart(history)
-
-    with overview_tab:
-        st.subheader("Recent performance trend")
-        if metrics_spec:
-            st.vega_lite_chart(metrics_spec, use_container_width=True)
-        if metrics_message:
-            st.caption(metrics_message)
+    metrics_spec = prepare_metrics_chart(history)
+    if metrics_spec:
+        try:
+            metrics_path = run_paths.charts / "metrics.png"
+            export_chart_png(metrics_spec, metrics_path)
+        except Exception:  # pragma: no cover - defensive
+            chart_files.pop("metrics", None)
+            logger.exception("Failed to export metrics chart")
+        else:
+            chart_files["metrics"] = str(metrics_path)
+    else:
+        chart_files.pop("metrics", None)
     target_progress, improvement_signal, volatility_signal, reward_signal = _derive_difficulty_metrics(
         history
     )
@@ -2267,14 +2470,9 @@ def run() -> None:
             help="Cumulative bonus reflecting consistently strong overlap scores.",
         )
         reward_cols[2].metric(
-            "Generation total score",
-            f"{state.get('latest_generation_total_score', 0.0):.1f}",
-            help="Difficulty-weighted score achieved by the latest generation.",
-        )
-        st.metric(
-            "Lifetime total score",
-            f"{state.get('lifetime_total_score', 0.0):.1f}",
-            help="Cumulative difficulty-weighted performance across this run.",
+            "Generation bonus",
+            f"{state.get('latest_generation_reward', 0.0):.2f}",
+            help="Average reward captured across the most recent generation.",
         )
 
     with overview_tab:
@@ -2420,10 +2618,10 @@ def run() -> None:
                         key="autosave_interval",
                     )
                 )
-                state.setdefault("population_size", population_size)
-                state.setdefault("generations_to_queue", generations_to_queue)
-                state.setdefault("autosave_interval", autosave_interval)
-                state.setdefault("evolution_mode", evolution_mode)
+                state["population_size"] = population_size
+                state["generations_to_queue"] = generations_to_queue
+                state["autosave_interval"] = autosave_interval
+                state["evolution_mode"] = evolution_mode
 
     if show_advanced:
         with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
@@ -2441,27 +2639,29 @@ def run() -> None:
 
     if reset_button:
         state.pop("evolution_manager", None)
+        state.pop("manager", None)
         state.pop("evolution_signature", None)
         state["pending_generations"] = 0
         state["run_infinite"] = False
+        state["active_run_id"] = None
         state.pop("adaptive_scene", None)
         state["sound_generations_left"] = 0
         state["difficulty"] = 0.0
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
         state["active_parent_seeds"] = []
-        state["latest_generation_total_score"] = 0.0
-        state["lifetime_total_score"] = 0.0
         st.sidebar.info("Cleared evolution history.")
 
     if reload_button:
         state.pop("evolution_manager", None)
+        state.pop("manager", None)
         state.pop("evolution_signature", None)
         state["autosave_checked"] = False
         state.pop("adaptive_scene", None)
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
         state["active_parent_seeds"] = []
+        state["active_run_id"] = None
 
     tree_label = _default_tree_label(sound_seed, current_resolution, current_sample_rate)
     force_new_tree = bool(state.pop("_spawn_new_tree_requested", False))
@@ -2475,7 +2675,7 @@ def run() -> None:
         force_new_tree=force_new_tree,
         tree_label=tree_label,
     )
-    state["lifetime_total_score"] = float(getattr(manager, "total_score", 0.0))
+    state["manager"] = manager
     _update_tree_label(state, tree_label)
     _refresh_active_parents(state, manager)
 
@@ -2535,6 +2735,8 @@ def run() -> None:
         save_path = manager.save(autosave_dir)
         st.sidebar.success(f"Saved evolution session to {save_path}")
 
+    run_store: RunStore = state["run_store"]
+
     if run_button:
         if evolution_mode == "Finite":
             state["pending_generations"] = generations_to_queue
@@ -2544,12 +2746,17 @@ def run() -> None:
             state["run_infinite"] = True
             logger.info("Activated infinite evolution mode")
         _sync_active_tree_state(state)
+        if not state.get("active_run_id"):
+            new_run_id = run_store.start_run()
+            state["active_run_id"] = new_run_id
+            logger.info("Started run %s", new_run_id)
 
     if stop_button:
         state["run_infinite"] = False
         state["pending_generations"] = 0
         logger.info("Requested evolution stop")
         _sync_active_tree_state(state)
+        state["active_run_id"] = None
 
     pending_generations = int(state.get("pending_generations", 0))
     runs_to_execute = 0
@@ -2577,8 +2784,6 @@ def run() -> None:
             state["latest_generation_improvement"] = float(generation.improvement)
             state["difficulty_reward_points"] = float(manager.lifetime_reward)
             state["latest_lifetime_reward"] = float(manager.lifetime_reward)
-            state["latest_generation_total_score"] = float(generation.total_score)
-            state["lifetime_total_score"] = float(manager.total_score)
             reward_signal = float(np.clip(generation.reward_peak / 5.0, 0.0, 1.0))
             state["difficulty_reward"] = max(
                 float(state.get("difficulty_reward", 0.0)),
@@ -2687,7 +2892,6 @@ def run() -> None:
                     "Peak reward": _finite_or_none(record.reward_peak),
                     "Difficulty": _finite_or_none(record.difficulty_level),
                     "Lifetime reward": _finite_or_none(record.cumulative_reward),
-                    "Total score": _finite_or_none(record.total_score),
                     "reward_total": _finite_or_none(record.reward_summary),
                     "reward_overlap": _finite_or_none(components.get("overlap")),
                     "reward_msssim": _finite_or_none(components.get("msssim")),
@@ -2713,6 +2917,16 @@ def run() -> None:
                     logger.debug(
                         "Rendered trend chart with %d records", len(sanitized_rows)
                     )
+                    try:
+                        trend_path = run_paths.charts / "trend.png"
+                        export_chart_png(spec, trend_path)
+                    except Exception:  # pragma: no cover - defensive
+                        chart_files.pop("trend", None)
+                        logger.exception("Failed to export trend chart")
+                    else:
+                        chart_files["trend"] = str(trend_path)
+                else:
+                    chart_files.pop("trend", None)
                 if message:
                     st.caption(message)
 
@@ -2731,6 +2945,9 @@ def run() -> None:
                 st.caption("Only one generation so far; displaying the latest results.")
             generation = manager.generations[selected_generation]
             best_candidate = generation.best_candidate
+            best_candidate_image = _apply_color_template(
+                best_candidate.reconstruction, color_template
+            )
 
             best_candidate_summary = {
                 "generation": generation.index,
@@ -2746,16 +2963,12 @@ def run() -> None:
             best_cols[1].metric("PSNR", f"{best_candidate.metrics.psnr:.2f} dB")
             best_cols[2].metric("SSIM", f"{best_candidate.metrics.ssim:.3f}")
             st.metric("Best overlap", f"{best_candidate.overlap_score:.1f}%")
-            reward_cols = st.columns(3)
+            reward_cols = st.columns(2)
             reward_cols[0].metric(
-                "Total score", f"{generation.total_score:.1f}",
-                help="Difficulty-weighted score combining overlap and scene scale.",
-            )
-            reward_cols[1].metric(
                 "Generation reward", f"{generation.reward_summary:.2f}",
                 help="Mean reward achieved across the generation's candidates.",
             )
-            reward_cols[2].metric(
+            reward_cols[1].metric(
                 "Difficulty target", f"{generation.difficulty_level * 100:.0f}%",
                 help="Adaptive difficulty derived from reward and overlap performance.",
             )
@@ -2857,60 +3070,243 @@ def run() -> None:
             st.table(summary_rows)
 
         with experiments_tab:
-            st.subheader("Sound-to-image synthesizer")
-            uploaded_sound_file = st.file_uploader(
-                "Upload WAV audio",
-                type=("wav", "wave"),
-                key="uploaded_sound_file",
-            )
-            if uploaded_sound_file is not None:
-                try:
-                    uploaded_sound_file.seek(0)
-                    audio_bytes = uploaded_sound_file.read()
-                    waveform, uploaded_rate = load_waveform_from_wav(audio_bytes)
-                    uploaded_color, uploaded_gray, uploaded_sound, _ = (
-                        generate_sound_art_from_waveform(
-                            waveform,
-                            uploaded_rate,
-                            image_size=(current_resolution, current_resolution),
-                        )
+            st.subheader("Signal codec laboratory")
+            run_id = state.get("active_run_id")
+            if run_id:
+                artifact_dir = run_store.artifacts_directory(run_id)
+                st.caption(
+                    "Active run {run_id} — artifacts stored in {path}".format(
+                        run_id=run_id,
+                        path=artifact_dir,
                     )
-                    st.markdown(
-                        f"**Uploaded sound clip** — {uploaded_rate:,} Hz, {waveform.size} samples"
-                    )
-                    st.image(
-                        to_uint8_image(uploaded_color),
-                        caption="Sound-derived target from upload",
-                        use_column_width=True,
-                    )
-                    candidate_image = np.asarray(best_candidate.reconstruction, dtype=np.float32)
-                    upload_template = _build_color_template(uploaded_color, uploaded_gray)
-                    interpreted = _apply_color_template(candidate_image, upload_template)
-                    st.image(
-                        to_uint8_image(interpreted),
-                        caption=(
-                            "Evolution interpretation using the selected generation's best candidate"
-                        ),
-                        use_column_width=True,
-                    )
-                except ValueError as exc:
-                    st.error(f"Failed to process audio: {exc}")
+                )
             else:
                 st.caption(
-                    "Upload a WAV file to derive a scene and compare it against the selected evolution branch."
+                    "Start an evolution run to automatically save generated artifacts."
                 )
 
-            st.subheader("Noise reconstruction lab")
-            _render_reconstruction_lab(
-                state,
-                default_resolution=current_resolution,
-                default_sample_rate=int(state.get("current_sound_sample_rate", 48_000)),
-            )
+            image_lane, audio_lane = st.columns(2)
+
+            with image_lane:
+                st.markdown("#### Image → WAV")
+                sample_rate_choice = int(
+                    st.slider(
+                        "Sample rate (Hz)",
+                        min_value=8_000,
+                        max_value=96_000,
+                        value=int(np.clip(current_sample_rate, 8_000, 96_000)),
+                        step=1_000,
+                        key="codec_sample_rate",
+                    )
+                )
+                source_options: list[str] = []
+                if best_candidate is not None:
+                    source_options.append("Evolution best")
+                source_options.append("Upload")
+                source_choice = st.radio(
+                    "Source image",
+                    options=source_options,
+                    index=0,
+                    key="codec_image_source",
+                )
+
+                source_image: np.ndarray | None = None
+                source_label = ""
+                if source_choice == "Evolution best" and best_candidate is not None:
+                    source_image = np.asarray(best_candidate_image, dtype=np.float32)
+                    source_label = f"seed-{best_candidate.seed}"
+                else:
+                    uploaded_image = st.file_uploader(
+                        "Upload image",
+                        type=("png", "jpg", "jpeg", "bmp"),
+                        key="codec_image_upload",
+                    )
+                    if uploaded_image is not None:
+                        try:
+                            uploaded_image.seek(0)
+                            source_image = _load_uploaded_image(uploaded_image)
+                            source_label = uploaded_image.name or "upload"
+                        except ValueError as exc:
+                            st.error(str(exc))
+
+                if source_image is not None:
+                    st.image(
+                        to_uint8_image(source_image),
+                        caption=f"Source · {source_label}" if source_label else "Source image",
+                        use_column_width=True,
+                    )
+                    waveform = encode_image_to_waveform(
+                        source_image,
+                        sample_rate=sample_rate_choice,
+                    )
+                    wav_bytes = encode_image_to_wav_bytes(
+                        source_image,
+                        sample_rate=sample_rate_choice,
+                    )
+                    roundtrip = decode_waveform_to_image(
+                        waveform,
+                        sample_rate=sample_rate_choice,
+                        resolution=source_image.shape[:2],
+                    )
+                    st.image(
+                        to_uint8_image(roundtrip),
+                        caption="Heuristic round-trip",
+                        use_column_width=True,
+                    )
+                    metrics_roundtrip = compute_metrics(source_image, roundtrip)
+                    st.markdown(
+                        _metric_badge_html(
+                            "Round-trip vs source",
+                            metrics_roundtrip.psnr,
+                            metrics_roundtrip.ssim,
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    st.audio(wav_bytes, format="audio/wav")
+                    download_name = _sanitize_filename(
+                        source_label or "image",
+                        f"_{sample_rate_choice}hz.wav",
+                    )
+                    st.download_button(
+                        "Download waveform",
+                        data=wav_bytes,
+                        file_name=download_name,
+                        mime="audio/wav",
+                        key="download_waveform_bytes",
+                    )
+                    if run_id:
+                        if st.button("Save waveform artifact", key="save_waveform_artifact"):
+                            saved_path = run_store.save_bytes(run_id, download_name, wav_bytes)
+                            st.success(f"Saved waveform artifact to {saved_path}")
+                    else:
+                        st.caption("Artifacts will be persisted once a run is active.")
+                else:
+                    st.caption("Provide an image to encode it into audio.")
+
+            with audio_lane:
+                st.markdown("#### WAV → Image")
+                uploaded_wav = st.file_uploader(
+                    "Upload WAV audio",
+                    type=("wav", "wave"),
+                    key="codec_wav_upload",
+                )
+                target_resolution = int(
+                    st.number_input(
+                        "Target resolution",
+                        min_value=32,
+                        max_value=512,
+                        value=int(current_resolution),
+                        step=8,
+                        key="codec_target_resolution",
+                    )
+                )
+                if uploaded_wav is not None:
+                    try:
+                        uploaded_wav.seek(0)
+                        wav_bytes = uploaded_wav.read()
+                        waveform, detected_rate = load_waveform_from_wav(wav_bytes)
+                        prediction = predict_image_from_waveform(
+                            waveform,
+                            sample_rate=detected_rate,
+                            resolution=(target_resolution, target_resolution),
+                        )
+                        st.audio(wav_bytes, format="audio/wav")
+                        st.markdown(
+                            f"**Detected sample rate** — {detected_rate:,} Hz, {waveform.size} samples"
+                        )
+                        st.image(
+                            to_uint8_image(prediction),
+                            caption="Predicted image",
+                            use_column_width=True,
+                        )
+                        reference_original = colored_original
+                        if reference_original.shape[:2] != prediction.shape[:2]:
+                            reference_original = _resize_image(
+                                reference_original, prediction.shape[:2]
+                            )
+                        original_metrics = compute_metrics(
+                            reference_original, prediction
+                        )
+                        reference_best = best_candidate_image
+                        if reference_best.shape[:2] != prediction.shape[:2]:
+                            reference_best = _resize_image(
+                                reference_best, prediction.shape[:2]
+                            )
+                        best_metrics = compute_metrics(reference_best, prediction)
+                        metric_cols = st.columns(2)
+                        metric_cols[0].markdown(
+                            _metric_badge_html(
+                                "Vs original reference",
+                                original_metrics.psnr,
+                                original_metrics.ssim,
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        metric_cols[1].markdown(
+                            _metric_badge_html(
+                                "Vs evolution best",
+                                best_metrics.psnr,
+                                best_metrics.ssim,
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        png_bytes = _image_to_png_bytes(prediction)
+                        download_png = _sanitize_filename(
+                            (uploaded_wav.name or "waveform"),
+                            "_prediction.png",
+                        )
+                        st.download_button(
+                            "Download predicted image",
+                            data=png_bytes,
+                            file_name=download_png,
+                            mime="image/png",
+                            key="download_predicted_image",
+                        )
+                        if run_id:
+                            if st.button("Save image artifact", key="save_prediction_artifact"):
+                                saved = run_store.save_image(run_id, download_png, prediction)
+                                st.success(f"Saved image artifact to {saved}")
+                        else:
+                            st.caption("Artifacts will be persisted once a run is active.")
+                    except ValueError as exc:
+                        st.error(f"Failed to decode audio: {exc}")
+                else:
+                    st.caption("Upload a WAV file to reconstruct an image.")
     else:
         with evolution_tab:
             st.info("Run at least one generation to visualise evolution progress.")
         with experiments_tab:
-            st.info("Experiments unlock after the first generation completes.")
+            st.info(
+                "Run at least one evolution cycle to unlock the signal codec workflow."
+            )
+
+    available_charts: list[tuple[str, Path]] = []
+    for key, path_str in chart_files.items():
+        if not isinstance(path_str, str):
+            continue
+        chart_path = Path(path_str)
+        if chart_path.exists():
+            available_charts.append((key, chart_path))
+
+    with st.sidebar.expander("Chart exports", expanded=False):
+        if available_charts:
+            label_map = {"trend": "Trend chart", "metrics": "Metrics chart"}
+            for key, chart_path in sorted(available_charts, key=lambda item: item[0]):
+                try:
+                    chart_bytes = chart_path.read_bytes()
+                except OSError:  # pragma: no cover - filesystem guard
+                    logger.exception("Failed to load chart %s for download", chart_path)
+                    continue
+                label = label_map.get(key, chart_path.stem.replace("_", " ").title())
+                st.download_button(
+                    label=f"Download {label}",
+                    data=chart_bytes,
+                    file_name=chart_path.name,
+                    mime="image/png",
+                    key=f"download_{key}_chart",
+                )
+        else:
+            st.caption("Charts will appear once evolution has enough history to plot.")
 
     export_payload = _session_export_payload(
         state=state,
