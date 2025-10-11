@@ -2109,7 +2109,7 @@ def run() -> None:
                         max_value=500,
                         value=int(state.get("sound_target_dwell", target_dwell)),
                         step=1,
-                        key="sound_target_dwell",
+                        key="sound_target_dwell_input",
                         help=(
                             "Number of evolution steps to spend matching the current sound-derived image before refreshing it with a new randomised scene."
                         ),
