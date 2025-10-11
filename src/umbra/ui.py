@@ -2766,6 +2766,8 @@ def run() -> None:
         runs_to_execute = min(pending_generations, _MAX_GENERATIONS_PER_TICK)
     elif state.get("run_infinite", False):
         runs_to_execute = 1
+    if state.get("run_infinite", False) and runs_to_execute == 0:
+        runs_to_execute = 1
 
     generations_ran = 0
     reseeded = False
