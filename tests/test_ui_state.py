@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import importlib
 import sys
 from types import SimpleNamespace
@@ -9,16 +7,7 @@ import numpy as np
 from umbra.evolution import EvolutionManager
 
 
-def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:
-    stub_state: dict[str, object] = {
-        "run_infinite": False,
-        "evolution_trees": {},
-        "shared_seed": 123,
-        "active_sound_seed": 99,
-        "current_sound_sample_rate": 48_000,
-        "current_sound_resolution": 128,
-        "active_parent_seeds": [],
-    }
+def _install_ui_stubs(monkeypatch, state: dict[str, object]) -> None:
     class _StubFrame:
         def __init__(self, data: object) -> None:
             self._data = list(data) if data is not None else []
@@ -36,16 +25,42 @@ def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:
     def _data_frame(data: object) -> _StubFrame:
         return _StubFrame(data)
 
-    fake_pandas = SimpleNamespace(DataFrame=_data_frame)
+    class _FakeConverter:
+        def convert(self, _spec, **_kwargs):
+            return b""
 
+    class _FakeVegaLite:
+        def __call__(self):
+            return _FakeConverter()
+
+    fake_pandas = SimpleNamespace(DataFrame=_data_frame)
+    fake_vl_convert = SimpleNamespace(
+        vl_convert=SimpleNamespace(vegalite_to_png=lambda _spec, **_opts: b""),
+        VegaLite=_FakeVegaLite,
+    )
     fake_streamlit = SimpleNamespace(
-        session_state=stub_state,
+        session_state=state,
         experimental_rerun=lambda: None,
         rerun=lambda: None,
+        sidebar=SimpleNamespace(info=lambda *_args, **_kwargs: None),
     )
 
     monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)
     monkeypatch.setitem(sys.modules, "pandas", fake_pandas)
+    monkeypatch.setitem(sys.modules, "vl_convert", fake_vl_convert)
+
+
+def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:
+    stub_state: dict[str, object] = {
+        "run_infinite": False,
+        "evolution_trees": {},
+        "shared_seed": 123,
+        "active_sound_seed": 99,
+        "current_sound_sample_rate": 48_000,
+        "current_sound_resolution": 128,
+        "active_parent_seeds": [],
+    }
+    _install_ui_stubs(monkeypatch, stub_state)
 
     ui = importlib.import_module("umbra.ui")
     try:
@@ -85,39 +100,89 @@ def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:
         sys.modules.pop("umbra.ui", None)
 
 
+def test_auto_pause_does_not_cancel_infinite_mode(monkeypatch) -> None:
+    stub_state: dict[str, object] = {
+        "run_infinite": True,
+        "pending_generations": 5,
+        "evolution_mode": "Infinite",
+    }
+    _install_ui_stubs(monkeypatch, stub_state)
+
+    ui = importlib.import_module("umbra.ui")
+    try:
+        message = ui._apply_auto_pause(
+            stub_state,
+            difficulty_progress=0.95,
+            pause_threshold=0.9,
+        )
+
+        assert message == (
+            "Difficulty spike detected – infinite mode will continue running; "
+            "refresh the scene manually if desired."
+        )
+        assert stub_state["run_infinite"] is True
+        assert stub_state["pending_generations"] == 5
+        assert stub_state["auto_pause_acknowledged"] is True
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_auto_pause_stops_finite_runs(monkeypatch) -> None:
+    stub_state: dict[str, object] = {
+        "run_infinite": False,
+        "pending_generations": 3,
+        "evolution_mode": "Finite",
+    }
+    _install_ui_stubs(monkeypatch, stub_state)
+
+    ui = importlib.import_module("umbra.ui")
+    try:
+        message = ui._apply_auto_pause(
+            stub_state,
+            difficulty_progress=0.95,
+            pause_threshold=0.9,
+        )
+
+        assert message == (
+            "Difficulty spike reached – evolution paused so a new scene can be prepared."
+        )
+        assert stub_state["run_infinite"] is False
+        assert stub_state["pending_generations"] == 0
+        assert stub_state["auto_pause_acknowledged"] is True
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_auto_pause_resets_acknowledgement(monkeypatch) -> None:
+    stub_state: dict[str, object] = {
+        "run_infinite": False,
+        "pending_generations": 0,
+        "evolution_mode": "Finite",
+        "auto_pause_acknowledged": True,
+    }
+    _install_ui_stubs(monkeypatch, stub_state)
+
+    ui = importlib.import_module("umbra.ui")
+    try:
+        message = ui._apply_auto_pause(
+            stub_state,
+            difficulty_progress=0.5,
+            pause_threshold=0.9,
+        )
+
+        assert message is None
+        assert stub_state["auto_pause_acknowledged"] is False
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
 def test_session_export_payload_contains_provenance(monkeypatch) -> None:
     from umbra.decoding import NoiseStreamDecoder
     from umbra.encoding import NoiseStreamEncoder
     from umbra.sound import generate_sound_art
 
     stub_state: dict[str, object] = {}
-
-    class _StubFrame:
-        def __init__(self, data: object) -> None:
-            self._data = list(data) if data is not None else []
-            self.empty = len(self._data) == 0
-
-        def replace(self, *_args, **_kwargs):
-            return self
-
-        def dropna(self, *_args, **_kwargs):
-            return self
-
-        def to_csv(self, *_args, **_kwargs) -> str:
-            return ""
-
-    def _data_frame(data: object) -> _StubFrame:
-        return _StubFrame(data)
-
-    fake_pandas = SimpleNamespace(DataFrame=_data_frame)
-    fake_streamlit = SimpleNamespace(
-        session_state=stub_state,
-        experimental_rerun=lambda: None,
-        rerun=lambda: None,
-    )
-
-    monkeypatch.setitem(sys.modules, "pandas", fake_pandas)
-    monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)
+    _install_ui_stubs(monkeypatch, stub_state)
 
     from umbra.ui import _session_export_payload
 

@@ -12,6 +12,7 @@ import time
 import zipfile
 from datetime import datetime
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -298,6 +299,42 @@ def _aggregate_reward_components(record: GenerationRecord) -> dict[str, float | 
     }
 
 
+def _apply_auto_pause(
+    state: MutableMapping[str, Any],
+    *,
+    difficulty_progress: float,
+    pause_threshold: float,
+) -> str | None:
+    """Update run state if adaptive difficulty requests a pause.
+
+    Returns a sidebar message describing the action taken. When ``None`` is
+    returned the caller should not display an alert.
+    """
+
+    if difficulty_progress < pause_threshold:
+        state["auto_pause_acknowledged"] = False
+        return None
+
+    if state.get("auto_pause_acknowledged", False):
+        return None
+
+    state["auto_pause_acknowledged"] = True
+
+    infinite_requested = bool(state.get("run_infinite", False)) or state.get(
+        "evolution_mode"
+    ) == "Infinite"
+
+    if infinite_requested:
+        return (
+            "Difficulty spike detected – infinite mode will continue running; "
+            "refresh the scene manually if desired."
+        )
+
+    state["run_infinite"] = False
+    state["pending_generations"] = 0
+    return "Difficulty spike reached – evolution paused so a new scene can be prepared."
+
+
 def _render_quick_controls(
     state: st.session_state,
     *,
@@ -359,16 +396,13 @@ def _render_quick_controls(
         state["show_advanced_controls"] = not state.get("show_advanced_controls", False)
 
     pause_threshold = auto_settings.get("pause_threshold", 0.9)
-    if difficulty_progress >= pause_threshold:
-        if not state.get("auto_pause_acknowledged", False):
-            state["run_infinite"] = False
-            state["pending_generations"] = 0
-            state["auto_pause_acknowledged"] = True
-            st.sidebar.info(
-                "Difficulty spike reached – evolution paused so a new scene can be prepared."
-            )
-    else:
-        state["auto_pause_acknowledged"] = False
+    pause_message = _apply_auto_pause(
+        state,
+        difficulty_progress=difficulty_progress,
+        pause_threshold=pause_threshold,
+    )
+    if pause_message:
+        st.sidebar.info(pause_message)
 
     return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
 
@@ -3279,6 +3313,34 @@ def run() -> None:
             st.info(
                 "Run at least one evolution cycle to unlock the signal codec workflow."
             )
+
+    available_charts: list[tuple[str, Path]] = []
+    for key, path_str in chart_files.items():
+        if not isinstance(path_str, str):
+            continue
+        chart_path = Path(path_str)
+        if chart_path.exists():
+            available_charts.append((key, chart_path))
+
+    with st.sidebar.expander("Chart exports", expanded=False):
+        if available_charts:
+            label_map = {"trend": "Trend chart", "metrics": "Metrics chart"}
+            for key, chart_path in sorted(available_charts, key=lambda item: item[0]):
+                try:
+                    chart_bytes = chart_path.read_bytes()
+                except OSError:  # pragma: no cover - filesystem guard
+                    logger.exception("Failed to load chart %s for download", chart_path)
+                    continue
+                label = label_map.get(key, chart_path.stem.replace("_", " ").title())
+                st.download_button(
+                    label=f"Download {label}",
+                    data=chart_bytes,
+                    file_name=chart_path.name,
+                    mime="image/png",
+                    key=f"download_{key}_chart",
+                )
+        else:
+            st.caption("Charts will appear once evolution has enough history to plot.")
 
     available_charts: list[tuple[str, Path]] = []
     for key, path_str in chart_files.items():
