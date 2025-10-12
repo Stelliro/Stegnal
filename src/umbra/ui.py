@@ -376,50 +376,27 @@ def _apply_auto_pause(
     return "Difficulty spike reached – evolution paused so a new scene can be prepared."
 
 
-def _render_quick_controls(
+def _render_control_panel(
     state: st.session_state,
     *,
     difficulty_progress: float,
     hyper_profile: HyperPerformanceProfile | None,
-) -> tuple[bool, bool, bool, bool, bool, dict[str, int]]:
-    """Render the compact sidebar controls and return control actions."""
+) -> tuple[bool, bool, bool, bool, bool, bool, dict[str, int]]:
+    """Render the sidebar controls with an Easy Mode toggle."""
 
-    st.sidebar.header("Quick experiment controls")
-    mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
-    default_mode = state.get("difficulty_mode")
-    if default_mode not in mode_names:
-        default_mode = mode_names[1] if len(mode_names) > 1 else mode_names[0]
-    difficulty_mode = st.sidebar.select_slider(
-        "Difficulty focus",
-        options=mode_names,
-        value=default_mode,
-        help="Single dial that steers all modelling settings and adaptive tuning.",
+    st.sidebar.header("Experiment controls")
+
+    easy_mode_default = bool(state.get("easy_mode", True))
+    defaults_applied = bool(state.get("_easy_mode_defaults_applied", False))
+    easy_mode = st.sidebar.toggle(
+        "Easy Mode",
+        value=easy_mode_default,
+        help=(
+            "Keep Umbra running continuously with balanced defaults. Toggle off to "
+            "expose fine-grained tuning controls."
+        ),
     )
-    state["difficulty_mode"] = difficulty_mode
-    profile = _DIFFICULTY_MODE_PRESETS[difficulty_mode]
-    auto_settings = _auto_run_parameters(
-        difficulty_progress=difficulty_progress,
-        profile=profile,
-        hyper_profile=hyper_profile,
-    )
-
-    if not state.get("show_advanced_controls", False) and hyper_profile is None:
-        state["population_size"] = auto_settings["population_size"]
-        state["generations_to_queue"] = auto_settings["generations_to_queue"]
-        state["autosave_interval"] = auto_settings["autosave_interval"]
-        state["sound_target_dwell"] = auto_settings["target_dwell"]
-        state["last_sound_target_dwell"] = auto_settings["target_dwell"]
-
-    desired_target = auto_settings["difficulty_target"]
-    state["difficulty_target_override"] = desired_target
-
-    metrics_cols = st.sidebar.columns(2)
-    metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
-    metrics_cols[1].metric("Difficulty target", f"{desired_target * 100:.0f}%")
-    st.sidebar.caption(
-        f"Auto-tuned for about {auto_settings['subjects_goal']} subjects with "
-        f"{auto_settings['population_size']} evolving in parallel."
-    )
+    state["easy_mode"] = easy_mode
 
     previous_infinite = bool(state.get("run_infinite", False))
     infinite_toggle = st.sidebar.toggle(
@@ -458,12 +435,66 @@ def _render_quick_controls(
     save_button = secondary_row[1].button("Save", use_container_width=True)
     reload_button = st.sidebar.button("Reload autosave", use_container_width=True)
 
-    advanced_toggle = st.sidebar.toggle(
-        "Advanced settings",
-        value=bool(state.get("show_advanced_controls", False)),
-        help="Reveal detailed controls for fine-tuning evolution and sound synthesis.",
+    balanced_name = "Balanced climb"
+    profile = _DIFFICULTY_MODE_PRESETS.get(balanced_name)
+    if profile is None:
+        # Fall back to the first available profile to avoid runtime errors.
+        profile = next(iter(_DIFFICULTY_MODE_PRESETS.values()))
+    auto_settings = _auto_run_parameters(
+        difficulty_progress=difficulty_progress,
+        profile=profile,
+        hyper_profile=hyper_profile,
     )
-    state["show_advanced_controls"] = bool(advanced_toggle)
+
+    if easy_mode:
+        auto_settings["population_size"] = 10
+        auto_settings["difficulty_target"] = 0.5
+        state["difficulty_mode"] = balanced_name
+        state["population_size"] = auto_settings["population_size"]
+        state["difficulty_target_override"] = auto_settings["difficulty_target"]
+        if not defaults_applied:
+            state["run_infinite"] = True
+        state["evolution_mode"] = "Infinite"
+        state["_easy_mode_defaults_applied"] = True
+        if hyper_profile is None:
+            state["generations_to_queue"] = auto_settings["generations_to_queue"]
+            state["autosave_interval"] = auto_settings["autosave_interval"]
+            state["sound_target_dwell"] = auto_settings["target_dwell"]
+            state["last_sound_target_dwell"] = auto_settings["target_dwell"]
+        guidance_text = (
+            "Easy Mode keeps evolution running with a balanced difficulty target and "
+            "10 candidates per generation."
+        )
+    else:
+        state["_easy_mode_defaults_applied"] = False
+        mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
+        default_mode = state.get("difficulty_mode")
+        if default_mode not in mode_names:
+            default_mode = mode_names[1] if len(mode_names) > 1 else mode_names[0]
+        difficulty_mode = st.sidebar.select_slider(
+            "Difficulty focus",
+            options=mode_names,
+            value=default_mode,
+            help="Single dial that steers all modelling settings and adaptive tuning.",
+        )
+        state["difficulty_mode"] = difficulty_mode
+        profile = _DIFFICULTY_MODE_PRESETS[difficulty_mode]
+        auto_settings = _auto_run_parameters(
+            difficulty_progress=difficulty_progress,
+            profile=profile,
+            hyper_profile=hyper_profile,
+        )
+        state["difficulty_target_override"] = auto_settings["difficulty_target"]
+        guidance_text = (
+            f"Auto-tuned for about {auto_settings['subjects_goal']} subjects with "
+            f"{auto_settings['population_size']} evolving in parallel."
+        )
+
+    desired_target = auto_settings["difficulty_target"]
+    metrics_cols = st.sidebar.columns(2)
+    metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
+    metrics_cols[1].metric("Difficulty target", f"{desired_target * 100:.0f}%")
+    st.sidebar.caption(guidance_text)
 
     pause_threshold = auto_settings.get("pause_threshold", 0.9)
     pause_message = _apply_auto_pause(
@@ -474,7 +505,15 @@ def _render_quick_controls(
     if pause_message:
         st.sidebar.info(pause_message)
 
-    return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
+    return (
+        easy_mode,
+        run_button,
+        stop_button,
+        reset_button,
+        save_button,
+        reload_button,
+        auto_settings,
+    )
 
 
 _IMAGE_MODEL_PRESETS: dict[str, dict[str, Any]] = {
@@ -2094,7 +2133,9 @@ def run() -> None:
     state.setdefault("difficulty_volatility", 0.0)
     state.setdefault("difficulty_reward", 0.0)
     state.setdefault("difficulty_reward_points", 0.0)
-    state.setdefault("show_advanced_controls", False)
+    state.setdefault("easy_mode", True)
+    state.setdefault("_easy_mode_defaults_applied", False)
+    state.pop("show_advanced_controls", None)
     state.setdefault("latest_generation_reward", 0.0)
     state.setdefault("latest_generation_peak", 0.0)
     state.setdefault("latest_generation_difficulty", 0.0)
@@ -2146,13 +2187,14 @@ def run() -> None:
 
     difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
     (
+        easy_mode,
         run_button,
         stop_button,
         reset_button,
         save_button,
         reload_button,
         auto_settings,
-    ) = _render_quick_controls(
+    ) = _render_control_panel(
         state,
         difficulty_progress=difficulty_progress,
         hyper_profile=hyper_profile,
@@ -2170,9 +2212,9 @@ def run() -> None:
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
-    show_advanced = bool(state.get("show_advanced_controls", False))
+    advanced_mode = not easy_mode
     load_button = False
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Session & autosave", expanded=False):
             st.text_input(
                 "Autosave directory",
@@ -2206,7 +2248,7 @@ def run() -> None:
     evolution_engines = ["Lineage & noise (classic)", "Neural lineage fusion"]
     selected_engine = state.get("_active_evolution_engine", evolution_engines[0])
 
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Model presets", expanded=False):
             engine_index = (
                 evolution_engines.index(selected_engine)
@@ -2268,12 +2310,12 @@ def run() -> None:
         )
         state["sound_target_dwell"] = target_dwell
         state["last_sound_target_dwell"] = target_dwell
-    elif not show_advanced:
+    elif not advanced_mode:
         target_dwell = int(auto_settings["target_dwell"])
         state["sound_target_dwell"] = target_dwell
         state["last_sound_target_dwell"] = target_dwell
 
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Sound cadence", expanded=False):
             if hyper_enabled and hyper_profile is not None:
                 subjects_per_cycle = int(
@@ -2342,7 +2384,7 @@ def run() -> None:
 
     forest = state.setdefault("evolution_trees", {})
     new_tree_requested = False
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Evolution trees", expanded=False):
             if forest:
                 tree_ids = list(forest.keys())
@@ -2375,7 +2417,7 @@ def run() -> None:
         state["pending_generations"] = 0
         state["run_infinite"] = False
         _sync_active_tree_state(state)
-        if show_advanced:
+        if advanced_mode:
             st.sidebar.info("Queued a new tree; it will initialise on the next evolution tick.")
 
     seed = int(state.get("shared_seed", 0))
@@ -2421,7 +2463,7 @@ def run() -> None:
         )
         state["current_sound_resolution"] = current_resolution
 
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Active configuration", expanded=False):
             st.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
             st.metric("Shared seed", str(seed))
@@ -2813,7 +2855,7 @@ def run() -> None:
             " reference-only structure, and neutral grayscale indicates shared content."
         )
 
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Evolution run controls", expanded=True):
             if hyper_enabled and hyper_profile is not None:
                 population_size = int(
@@ -2896,7 +2938,7 @@ def run() -> None:
                 state["generations_to_queue"] = generations_to_queue
                 state["autosave_interval"] = autosave_interval
 
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
             st.checkbox(
                 "Enable generator vs decoder co-evolution",
@@ -2952,7 +2994,7 @@ def run() -> None:
     _update_tree_label(state, tree_label)
     _refresh_active_parents(state, manager)
 
-    if show_advanced:
+    if advanced_mode:
         with st.sidebar.expander("Selective breeding", expanded=False):
             parent_entries = sorted(
                 manager.parent_lineage,
