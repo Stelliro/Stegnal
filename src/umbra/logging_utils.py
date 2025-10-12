@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import platform
 import subprocess
@@ -27,6 +28,24 @@ def _handler_config(filename: Path) -> dict[str, object]:
         "encoding": "utf-8",
         "formatter": "detailed",
     }
+
+
+class JsonFormatter(logging.Formatter):
+    """Emit log records as JSON payloads for metric aggregation."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key.startswith("_") or key in payload:
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                payload[key] = value
+        return json.dumps(payload, ensure_ascii=False)
 
 
 def configure_logging(
@@ -58,6 +77,9 @@ def configure_logging(
             "console": {
                 "format": "%(levelname)s - %(name)s: %(message)s",
             },
+            "json": {
+                "()": JsonFormatter,
+            },
         },
         "handlers": {
             "console": {
@@ -68,8 +90,8 @@ def configure_logging(
             "ui_file": _handler_config(directory / "ui.log"),
             "evolution_file": _handler_config(directory / "evolution.log"),
             "audio_file": _handler_config(directory / "audio.log"),
-            "pipeline_file": _handler_config(directory / "pipeline.log"),
-            "metrics_file": _handler_config(directory / "metrics.log"),
+            "pipeline_file": {**_handler_config(directory / "pipeline.log"), "formatter": "json"},
+            "metrics_file": {**_handler_config(directory / "metrics.log"), "formatter": "json"},
         },
         "loggers": {
             "umbra": {
@@ -230,5 +252,5 @@ def collect_provenance(config_hash: str | None = None) -> dict[str, object]:
     return provenance
 
 
-__all__ = ["configure_logging", "collect_provenance", "DEFAULT_LOG_DIR"]
+__all__ = ["configure_logging", "collect_provenance", "DEFAULT_LOG_DIR", "JsonFormatter"]
 

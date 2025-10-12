@@ -154,6 +154,16 @@ class NeuralRewardModel:
 
             grad_output = (2.0 / rewards.shape[0]) * error
             grad_output = np.clip(grad_output, -self._grad_clip, self._grad_clip)
+            if rewards.shape[0] > 1:
+                row_idx, col_idx = np.triu_indices(rewards.shape[0], k=1)
+                pred_diff = predictions[row_idx] - predictions[col_idx]
+                target_diff = rewards[row_idx] - rewards[col_idx]
+                contrastive_error = pred_diff - target_diff
+                scale = 2.0 / max(contrastive_error.size, 1)
+                contrastive_grad = np.zeros_like(predictions)
+                np.add.at(contrastive_grad, row_idx, scale * contrastive_error)
+                np.add.at(contrastive_grad, col_idx, -scale * contrastive_error)
+                grad_output += 0.1 * np.clip(contrastive_grad, -self._grad_clip, self._grad_clip)
             grads_w: list[np.ndarray] = [np.zeros_like(layer.weight) for layer in self._layers]
             grads_b: list[np.ndarray] = [np.zeros_like(layer.bias) for layer in self._layers]
             backprop = grad_output
