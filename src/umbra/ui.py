@@ -301,20 +301,49 @@ def _render_quick_controls(
         f"{auto_settings['population_size']} evolving in parallel."
     )
 
+    previous_infinite = bool(state.get("run_infinite", False))
+    infinite_toggle = st.sidebar.toggle(
+        "Run continuously",
+        value=previous_infinite,
+        help=(
+            "When enabled Umbra keeps evolving without additional clicks. "
+            "Use the pause button to halt the stream."
+        ),
+    )
+    state["run_infinite"] = bool(infinite_toggle)
+    if infinite_toggle:
+        state["evolution_mode"] = "Infinite"
+        if not previous_infinite:
+            logger.info("Infinite evolution toggle enabled")
+    else:
+        if previous_infinite:
+            logger.info("Infinite evolution toggle disabled")
+        if state.get("evolution_mode") == "Infinite":
+            state["evolution_mode"] = "Finite"
+
     controls_row = st.sidebar.columns(2)
-    run_button = controls_row[0].button("Start", use_container_width=True)
+    run_button = controls_row[0].button(
+        "Run finite batch",
+        use_container_width=True,
+        disabled=bool(state.get("run_infinite", False)),
+    )
     stop_button = controls_row[1].button("Pause", use_container_width=True)
+    if state.get("run_infinite", False):
+        st.sidebar.caption(
+            "Continuous mode streams live generations. Pause or disable the toggle to queue finite batches."
+        )
 
     secondary_row = st.sidebar.columns(2)
     reset_button = secondary_row[0].button("Reset", use_container_width=True)
     save_button = secondary_row[1].button("Save", use_container_width=True)
     reload_button = st.sidebar.button("Reload autosave", use_container_width=True)
 
-    toggle_label = (
-        "Show advanced settings" if not state.get("show_advanced_controls", False) else "Hide advanced settings"
+    advanced_toggle = st.sidebar.toggle(
+        "Advanced settings",
+        value=bool(state.get("show_advanced_controls", False)),
+        help="Reveal detailed controls for fine-tuning evolution and sound synthesis.",
     )
-    if st.sidebar.button(toggle_label, use_container_width=True):
-        state["show_advanced_controls"] = not state.get("show_advanced_controls", False)
+    state["show_advanced_controls"] = bool(advanced_toggle)
 
     pause_threshold = auto_settings.get("pause_threshold", 0.9)
     pause_message = _apply_auto_pause(
@@ -1875,6 +1904,10 @@ def run() -> None:
     if not isinstance(chart_files, dict):
         chart_files = {}
         state["_umbra_chart_files"] = chart_files
+    download_cache = state.get("_chart_download_cache")
+    if not isinstance(download_cache, dict):
+        download_cache = {}
+        state["_chart_download_cache"] = download_cache
 
     st.title("Project Umbra · Compact evolution console")
     st.caption(
@@ -1980,7 +2013,9 @@ def run() -> None:
         state.get("generations_to_queue", auto_settings["generations_to_queue"])
     )
     autosave_interval = int(state.get("autosave_interval", auto_settings["autosave_interval"]))
-    evolution_mode = state.get("evolution_mode", "Finite")
+    evolution_mode = (
+        "Infinite" if state.get("run_infinite", False) else state.get("evolution_mode", "Finite")
+    )
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
@@ -2550,44 +2585,42 @@ def run() -> None:
                 )
                 evolution_mode = "Finite"
             else:
-                population_size = int(
-                    st.number_input(
-                        "AI attempts per generation",
-                        min_value=1,
-                        max_value=32,
-                        value=population_size,
-                        step=1,
-                        key="population_size",
+                with st.sidebar.expander("Evolution cadence", expanded=False):
+                    population_size = int(
+                        st.number_input(
+                            "AI attempts per generation",
+                            min_value=1,
+                            max_value=32,
+                            value=population_size,
+                            step=1,
+                            key="population_size_input",
+                        )
                     )
-                )
-                generations_to_queue = int(
-                    st.number_input(
-                        "Generations to queue",
-                        min_value=1,
-                        value=generations_to_queue,
-                        step=1,
-                        key="generations_to_queue",
+                    generations_to_queue = int(
+                        st.number_input(
+                            "Generations to queue",
+                            min_value=1,
+                            value=generations_to_queue,
+                            step=1,
+                            key="generations_to_queue_input",
+                        )
                     )
-                )
-                evolution_mode = st.selectbox(
-                    "Evolution length",
-                    options=["Finite", "Infinite"],
-                    index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
-                    key="evolution_mode",
-                )
-                autosave_interval = int(
-                    st.number_input(
-                        "Autosave every N generations",
-                        min_value=1,
-                        value=autosave_interval,
-                        step=1,
-                        key="autosave_interval",
+                    autosave_interval = int(
+                        st.number_input(
+                            "Autosave every N generations",
+                            min_value=1,
+                            value=autosave_interval,
+                            step=1,
+                            key="autosave_interval_input",
+                        )
                     )
-                )
+                    st.caption(
+                        "Finite batches follow these values when you press Run finite batch. "
+                        "Continuous runs ignore the queue length and stream one generation at a time."
+                    )
                 state["population_size"] = population_size
                 state["generations_to_queue"] = generations_to_queue
                 state["autosave_interval"] = autosave_interval
-                state["evolution_mode"] = evolution_mode
 
     if show_advanced:
         with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
@@ -2697,18 +2730,16 @@ def run() -> None:
         st.sidebar.success(f"Saved evolution session to {save_path}")
 
     if run_button:
-        if evolution_mode == "Finite":
-            state["pending_generations"] = generations_to_queue
-            state["run_infinite"] = False
-            logger.info("Queued %d generations for finite evolution", generations_to_queue)
-        else:
-            state["run_infinite"] = True
-            logger.info("Activated infinite evolution mode")
+        state["pending_generations"] = generations_to_queue
+        state["run_infinite"] = False
+        state["evolution_mode"] = "Finite"
+        logger.info("Queued %d generations for finite evolution", generations_to_queue)
         _sync_active_tree_state(state)
 
     if stop_button:
         state["run_infinite"] = False
         state["pending_generations"] = 0
+        state["evolution_mode"] = "Finite"
         logger.info("Requested evolution stop")
         _sync_active_tree_state(state)
 
@@ -3086,11 +3117,25 @@ def run() -> None:
         if available_charts:
             label_map = {"trend": "Trend chart", "metrics": "Metrics chart"}
             for key, chart_path in sorted(available_charts, key=lambda item: item[0]):
+                cache_key = f"{key}:{chart_path}"
+                cached_entry = download_cache.get(cache_key)
                 try:
-                    chart_bytes = chart_path.read_bytes()
+                    stat_info = chart_path.stat()
+                    modified_ns = getattr(stat_info, "st_mtime_ns", int(stat_info.st_mtime * 1_000_000_000))
                 except OSError:  # pragma: no cover - filesystem guard
-                    logger.exception("Failed to load chart %s for download", chart_path)
+                    logger.exception("Failed to stat chart %s for download", chart_path)
+                    download_cache.pop(cache_key, None)
                     continue
+                if not cached_entry or cached_entry.get("mtime") != modified_ns:
+                    try:
+                        chart_bytes = chart_path.read_bytes()
+                    except OSError:  # pragma: no cover - filesystem guard
+                        logger.exception("Failed to load chart %s for download", chart_path)
+                        download_cache.pop(cache_key, None)
+                        continue
+                    cached_entry = {"mtime": modified_ns, "bytes": chart_bytes}
+                    download_cache[cache_key] = cached_entry
+                chart_bytes = cached_entry["bytes"]
                 label = label_map.get(key, chart_path.stem.replace("_", " ").title())
                 st.download_button(
                     label=f"Download {label}",
