@@ -194,6 +194,47 @@ def _ensure_page_config() -> None:
     _PAGE_CONFIGURED = True
 
 
+def _render_metric_visual(
+    label: str,
+    value: float,
+    *,
+    value_display: str,
+    scale_min: float,
+    scale_max: float,
+    good_range: tuple[float, float],
+    caption: str,
+    tooltip: str,
+) -> None:
+    """Render a beginner-friendly visual summary for a reconstruction metric."""
+
+    label_html = (
+        f'<div class="metric-label" title="{html.escape(tooltip)}">{html.escape(label)}</div>'
+    )
+    st.markdown(label_html, unsafe_allow_html=True)
+
+    if not math.isfinite(value) or not math.isfinite(scale_min) or not math.isfinite(scale_max):
+        st.markdown("**⚠️ Not available**")
+        st.caption(caption)
+        return
+
+    span = scale_max - scale_min
+    if span <= 0:
+        progress = 0.0
+    else:
+        progress = float(np.clip((value - scale_min) / span, 0.0, 1.0))
+
+    if value >= good_range[1]:
+        emoji, verdict = "🚀", "Excellent"
+    elif value >= good_range[0]:
+        emoji, verdict = "🙂", "Solid"
+    else:
+        emoji, verdict = "🛠️", "Needs work"
+
+    st.progress(progress)
+    st.markdown(f"**{emoji} {verdict}: {value_display}**")
+    st.caption(caption)
+
+
 def _quantize_slider_value(
     value: float,
     *,
@@ -2397,9 +2438,39 @@ def run() -> None:
 
         st.subheader("Reconstruction quality")
         ai_metrics_cols = st.columns(3)
-        ai_metrics_cols[0].metric("AI colour PSNR", f"{metrics.psnr:.2f} dB")
-        ai_metrics_cols[1].metric("AI colour SSIM", f"{metrics.ssim:.3f}")
-        ai_metrics_cols[2].metric("AI overlap", f"{ai_overlap_score:.1f}%")
+        with ai_metrics_cols[0]:
+            _render_metric_visual(
+                "How clear the AI picture looks",
+                float(metrics.psnr),
+                value_display=f"{metrics.psnr:.2f} dB",
+                scale_min=10.0,
+                scale_max=50.0,
+                good_range=(28.0, 35.0),
+                caption="Aim for 30 dB or more for a crisp-looking render.",
+                tooltip="PSNR compares brightness differences; higher numbers mean less noise.",
+            )
+        with ai_metrics_cols[1]:
+            _render_metric_visual(
+                "How closely the AI matches fine details",
+                float(metrics.ssim),
+                value_display=f"{metrics.ssim:.3f}",
+                scale_min=0.0,
+                scale_max=1.0,
+                good_range=(0.75, 0.9),
+                caption="Scores near 1.0 mean the textures and edges line up well.",
+                tooltip="SSIM checks structure and contrast; 1.0 is a perfect match.",
+            )
+        with ai_metrics_cols[2]:
+            _render_metric_visual(
+                "How much the AI shapes line up",
+                float(ai_overlap_score),
+                value_display=f"{ai_overlap_score:.1f}%",
+                scale_min=0.0,
+                scale_max=100.0,
+                good_range=(50.0, 70.0),
+                caption="Above 60% means the main forms overlap reliably.",
+                tooltip="Overlap highlights shared bright areas between original and AI images.",
+            )
 
         if state.get("adversarial_enabled", False):
             adv: AdversarialManager | None = state.get("adversarial")
@@ -2419,11 +2490,57 @@ def run() -> None:
             st.metric("Predicted overlap", f"{pred_overlap_score:.1f}%")
 
         sound_metrics_cols = st.columns(3)
-        sound_metrics_cols[0].metric("Sound colour PSNR", f"{sound_metrics.psnr:.2f} dB")
-        sound_metrics_cols[1].metric("Sound colour SSIM", f"{sound_metrics.ssim:.3f}")
-        sound_metrics_cols[2].metric("Sound overlap", f"{sound_overlap_score:.1f}%")
+        with sound_metrics_cols[0]:
+            _render_metric_visual(
+                "How clear the sound-guided picture looks",
+                float(sound_metrics.psnr),
+                value_display=f"{sound_metrics.psnr:.2f} dB",
+                scale_min=10.0,
+                scale_max=50.0,
+                good_range=(28.0, 35.0),
+                caption="30 dB+ suggests the audio reconstruction keeps things sharp.",
+                tooltip="PSNR for the sound-generated frame; higher is clearer.",
+            )
+        with sound_metrics_cols[1]:
+            _render_metric_visual(
+                "How closely sound colours follow the original",
+                float(sound_metrics.ssim),
+                value_display=f"{sound_metrics.ssim:.3f}",
+                scale_min=0.0,
+                scale_max=1.0,
+                good_range=(0.75, 0.9),
+                caption="Try to stay near 0.9 to keep hues and textures faithful.",
+                tooltip="SSIM for the sound reconstruction; 1.0 is identical.",
+            )
+        with sound_metrics_cols[2]:
+            _render_metric_visual(
+                "How much the sound shapes line up",
+                float(sound_overlap_score),
+                value_display=f"{sound_overlap_score:.1f}%",
+                scale_min=0.0,
+                scale_max=100.0,
+                good_range=(50.0, 70.0),
+                caption="Higher overlap means the sonic cues nailed the silhouettes.",
+                tooltip="Overlap measures shared highlights between original and audio-driven images.",
+            )
 
-        st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
+        _render_metric_visual(
+            "How similar the AI and sound colours feel",
+            float(ai_sound_alignment.ssim),
+            value_display=f"{ai_sound_alignment.ssim:.3f}",
+            scale_min=0.0,
+            scale_max=1.0,
+            good_range=(0.75, 0.9),
+            caption="Use this to judge if both methods agree on colour placement.",
+            tooltip="SSIM between the AI and sound reconstructions; closer to 1.0 means they align.",
+        )
+
+        with st.expander("What Does This Mean?"):
+            st.markdown(
+                "- **How clear the picture looks (PSNR):** Like judging if a photo is crisp or grainy—higher numbers mean clearer shots.\n"
+                "- **How closely the details match (SSIM):** Imagine comparing two LEGO builds; if every brick lines up, SSIM is close to 1.0.\n"
+                "- **How much the shapes line up (Overlap):** Think of tracing paper stacked together; more shared highlights mean better overlap."
+            )
 
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
