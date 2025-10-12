@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -13,6 +14,14 @@ except ImportError:  # pragma: no cover - fallback for older binaries
     _VegaLite = None
 
 
+def _sanitise_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied version of ``spec`` safe for static export."""
+
+    cleaned: dict[str, Any] = deepcopy(dict(spec))
+    cleaned.pop("params", None)
+    return cleaned
+
+
 def _render_png(spec: Mapping[str, Any], *, scale: float | None = None) -> bytes:
     """Return PNG bytes for ``spec`` using the fastest available backend."""
 
@@ -20,11 +29,12 @@ def _render_png(spec: Mapping[str, Any], *, scale: float | None = None) -> bytes
     if scale is not None:
         options["scale"] = scale
 
+    cleaned = _sanitise_spec(spec)
     if _VegaLite is not None:
         converter = _VegaLite()
-        return converter.convert(dict(spec), format="png", **options)
+        return converter.convert(cleaned, format="png", **options)
 
-    return vl_convert.vegalite_to_png(spec, **options)
+    return vl_convert.vegalite_to_png(cleaned, **options)
 
 
 def export_chart_png(
