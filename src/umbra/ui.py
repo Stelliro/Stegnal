@@ -15,13 +15,15 @@ from collections import OrderedDict
 from collections.abc import MutableMapping
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
+if TYPE_CHECKING:
+    from streamlit.delta_generator import DeltaGenerator
 
 from umbra.chart_export import export_chart_png
 from umbra.adversarial import AdversarialManager, apply_generator
@@ -43,7 +45,7 @@ from umbra.logging_utils import collect_provenance, configure_logging
 from umbra.metrics import ReconstructionMetrics, compute_metrics
 from umbra.neural import NeuralRewardModel
 from umbra.predictor import predict_image_from_waveform
-from umbra.progress import prepare_trend_chart, sanitize_progress_rows
+from umbra.progress import prepare_metrics_chart, prepare_trend_chart, sanitize_progress_rows
 from umbra.reconstruction import (
     ReconstructionResult,
     run_reconstruction_cycle,
@@ -52,6 +54,7 @@ from umbra.reconstruction import (
 from umbra.run_helpers import ensure_run_paths
 from umbra.sound import (
     ShapeGuess,
+    SyntheticSound,
     generate_sound_art,
     guess_shapes,
     load_waveform_from_wav,
@@ -177,6 +180,16 @@ def _load_uploaded_image(file) -> np.ndarray:
         return np.clip(array, 0.0, 1.0)
     except Exception as exc:  # pragma: no cover - defensive
         raise ValueError(f"Unable to read image: {exc}") from exc
+
+
+def _rgb_to_grayscale(image: np.ndarray) -> np.ndarray:
+    """Convert an RGB image in ``[0, 1]`` to a single-channel grayscale array."""
+
+    if image.ndim != 3 or image.shape[-1] != 3:
+        raise ValueError("Expected an RGB image shaped [H, W, 3]")
+    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    grayscale = np.tensordot(image.astype(np.float32), weights, axes=([-1], [0]))
+    return np.clip(grayscale, 0.0, 1.0).astype(np.float32)
 
 
 def _ensure_page_config() -> None:
@@ -378,62 +391,137 @@ def _apply_auto_pause(
 
 def _render_control_panel(
     state: st.session_state,
+    container: DeltaGenerator,
     *,
     difficulty_progress: float,
     hyper_profile: HyperPerformanceProfile | None,
-) -> tuple[bool, bool, bool, bool, bool, bool, dict[str, int]]:
-    """Render the sidebar controls with an Easy Mode toggle."""
+) -> tuple[bool, bool, bool, bool, bool, dict[str, int]]:
+    """Render the staged quick-start controls inside ``container``."""
 
-    st.sidebar.header("Experiment controls")
+    mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
+    if "difficulty_mode" not in state or state.get("difficulty_mode") not in mode_names:
+        default_idx = 1 if len(mode_names) > 1 else 0
+        state["difficulty_mode"] = mode_names[default_idx]
 
-    easy_mode_default = bool(state.get("easy_mode", True))
-    defaults_applied = bool(state.get("_easy_mode_defaults_applied", False))
-    easy_mode = st.sidebar.toggle(
-        "Easy Mode",
-        value=easy_mode_default,
-        help=(
-            "Keep Umbra running continuously with balanced defaults. Toggle off to "
-            "expose fine-grained tuning controls."
-        ),
+    media_source = state.get("quick_start_media_source", "auto")
+    if media_source not in ("auto", "upload"):
+        media_source = "auto"
+    state["quick_start_media_source"] = media_source
+
+    container.markdown("### Quick start wizard")
+    step_container = container.container()
+    step_cols = step_container.columns(3)
+    previous_status = state.get("quick_start_step_status", {})
+    step_status = {
+        "upload": bool(previous_status.get("upload", False)),
+        "mode": bool(previous_status.get("mode", False)),
+        "run": bool(previous_status.get("run", False)),
+    }
+
+    step_cols[0].markdown(
+        ("✅" if step_status["upload"] else "①") + " **Step 1** · Upload media"
     )
-    state["easy_mode"] = easy_mode
+    with step_cols[0]:
+        source_choice = st.radio(
+            "Media source",
+            options=("auto", "upload"),
+            index=0 if media_source == "auto" else 1,
+            format_func=lambda val: "Use generated scene" if val == "auto" else "Upload image",
+            key="quick_start_media_selector",
+        )
+        state["quick_start_media_source"] = source_choice
+        if source_choice == "upload":
+            uploaded = st.file_uploader(
+                "Choose an image",
+                type=("png", "jpg", "jpeg", "bmp"),
+                key="quick_start_image_upload",
+            )
+            if uploaded is not None:
+                try:
+                    uploaded.seek(0)
+                    image = _load_uploaded_image(uploaded)
+                except ValueError as exc:  # pragma: no cover - defensive
+                    st.error(str(exc))
+                else:
+                    state["quick_start_reference_image"] = image
+                    state["quick_start_reference_label"] = uploaded.name or "Uploaded image"
+                    state["quick_start_step1_timestamp"] = time.time()
+                    step_status["upload"] = True
+            elif state.get("quick_start_reference_image") is not None:
+                step_status["upload"] = True
+        else:
+            state.pop("quick_start_reference_image", None)
+            state.pop("quick_start_reference_label", None)
+            step_status["upload"] = True
 
-    previous_infinite = bool(state.get("run_infinite", False))
-    infinite_toggle = st.sidebar.toggle(
-        "Run continuously",
-        value=previous_infinite,
-        help=(
-            "When enabled Umbra keeps evolving without additional clicks. "
-            "Use the pause button to halt the stream."
-        ),
+    step_cols[1].markdown(
+        ("✅" if step_status["mode"] else "②") + " **Step 2** · Easy or tweak"
     )
-    state["run_infinite"] = bool(infinite_toggle)
-    if infinite_toggle:
-        state["evolution_mode"] = "Infinite"
-        if not previous_infinite:
-            logger.info("Infinite evolution toggle enabled")
-    else:
-        if previous_infinite:
-            logger.info("Infinite evolution toggle disabled")
-        if state.get("evolution_mode") == "Infinite":
-            state["evolution_mode"] = "Finite"
+    with step_cols[1]:
+        mode_choice = st.radio(
+            "Control style",
+            options=("easy", "tweak"),
+            index=0 if not state.get("show_advanced_controls", False) else 1,
+            format_func=lambda val: "Easy mode" if val == "easy" else "Let me tweak",
+            key="quick_start_mode_choice",
+        )
+        advanced = mode_choice == "tweak"
+        state["show_advanced_controls"] = advanced
+        step_status["mode"] = True
+        if advanced:
+            st.info("Open the **Tune It** tab to customise presets and evolution details.")
+        else:
+            st.caption("Automatic tuning keeps everything balanced for you.")
 
-    controls_row = st.sidebar.columns(2)
-    run_button = controls_row[0].button(
-        "Run finite batch",
-        use_container_width=True,
-        disabled=bool(state.get("run_infinite", False)),
+    profile = _DIFFICULTY_MODE_PRESETS[state["difficulty_mode"]]
+    auto_settings = _auto_run_parameters(
+        difficulty_progress=difficulty_progress,
+        profile=profile,
+        hyper_profile=hyper_profile,
     )
-    stop_button = controls_row[1].button("Pause", use_container_width=True)
-    if state.get("run_infinite", False):
-        st.sidebar.caption(
-            "Continuous mode streams live generations. Pause or disable the toggle to queue finite batches."
+    if not state.get("show_advanced_controls", False) and hyper_profile is None:
+        state["population_size"] = auto_settings["population_size"]
+        state["generations_to_queue"] = auto_settings["generations_to_queue"]
+        state["autosave_interval"] = auto_settings["autosave_interval"]
+        state["sound_target_dwell"] = auto_settings["target_dwell"]
+        state["last_sound_target_dwell"] = auto_settings["target_dwell"]
+
+    desired_target = auto_settings["difficulty_target"]
+    state["difficulty_target_override"] = desired_target
+
+    step_cols[2].markdown(
+        ("✅" if step_status["run"] else "③") + " **Step 3** · Launch evolution"
+    )
+    with step_cols[2]:
+        controls_row = st.columns(2)
+        run_button = controls_row[0].button("Start", use_container_width=True, key="quick_start_run")
+        stop_button = controls_row[1].button("Pause", use_container_width=True, key="quick_start_pause")
+        secondary_row = st.columns(2)
+        reset_button = secondary_row[0].button("Reset", use_container_width=True, key="quick_start_reset")
+        save_button = secondary_row[1].button("Save", use_container_width=True, key="quick_start_save")
+        reload_button = st.button("Reload autosave", use_container_width=True, key="quick_start_reload")
+
+        metrics_cols = st.columns(2)
+        metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
+        metrics_cols[1].metric("Difficulty target", f"{desired_target * 100:.0f}%")
+        st.caption(
+            f"Auto-tuned for about {auto_settings['subjects_goal']} subjects with "
+            f"{auto_settings['population_size']} evolving in parallel."
         )
 
-    secondary_row = st.sidebar.columns(2)
-    reset_button = secondary_row[0].button("Reset", use_container_width=True)
-    save_button = secondary_row[1].button("Save", use_container_width=True)
-    reload_button = st.sidebar.button("Reload autosave", use_container_width=True)
+        pause_threshold = auto_settings.get("pause_threshold", 0.9)
+        pause_message = _apply_auto_pause(
+            state,
+            difficulty_progress=difficulty_progress,
+            pause_threshold=pause_threshold,
+        )
+        if pause_message:
+            st.info(pause_message)
+        step_status["run"] = step_status["run"] or run_button
+        if not step_status["run"]:
+            step_status["run"] = bool(state.get("pending_generations", 0) > 0)
+        if not step_status["run"]:
+            step_status["run"] = bool(state.get("active_run_id"))
 
     balanced_name = "Balanced climb"
     profile = _DIFFICULTY_MODE_PRESETS.get(balanced_name)
@@ -2199,6 +2287,20 @@ def run() -> None:
         difficulty_progress=difficulty_progress,
         hyper_profile=hyper_profile,
     )
+    with quick_tab:
+        (
+            run_button,
+            stop_button,
+            reset_button,
+            save_button,
+            reload_button,
+            auto_settings,
+        ) = _render_quick_start_wizard(
+            state,
+            quick_tab,
+            difficulty_progress=difficulty_progress,
+            hyper_profile=hyper_profile,
+        )
     state["_latest_auto_settings"] = auto_settings
 
     population_size = int(state.get("population_size", auto_settings["population_size"]))
@@ -2489,12 +2591,36 @@ def run() -> None:
             )
     _sync_active_tree_state(state)
 
-    original_color, original, sound_clip, shape_specs = generate_sound_art(
-        seed=sound_seed,
-        image_size=(current_resolution, current_resolution),
-        sample_rate=current_sample_rate,
-    )
-    source_label = f"Sound seed {sound_seed}"
+    if (
+        state.get("quick_start_media_source") == "upload"
+        and isinstance(state.get("quick_start_reference_image"), np.ndarray)
+    ):
+        uploaded_image = np.asarray(state.get("quick_start_reference_image"), dtype=np.float32)
+        original_color = np.clip(uploaded_image, 0.0, 1.0)
+        try:
+            original = _rgb_to_grayscale(original_color)
+        except ValueError:
+            original = np.asarray(np.mean(original_color, axis=-1), dtype=np.float32)
+        band_volumes = {
+            "red": float(np.mean(original_color[..., 0])),
+            "green": float(np.mean(original_color[..., 1])),
+            "blue": float(np.mean(original_color[..., 2])),
+        }
+        sound_clip = SyntheticSound(
+            seed=int(sound_seed),
+            sample_rate=int(current_sample_rate),
+            samples=np.zeros(1, dtype=np.float32),
+            band_volumes=band_volumes,
+        )
+        shape_specs = []
+        source_label = state.get("quick_start_reference_label", "Uploaded image")
+    else:
+        original_color, original, sound_clip, shape_specs = generate_sound_art(
+            seed=sound_seed,
+            image_size=(current_resolution, current_resolution),
+            sample_rate=current_sample_rate,
+        )
+        source_label = f"Sound seed {sound_seed}"
     color_template = _build_color_template(original_color, original)
 
     encoder = NoiseStreamEncoder(sigma=encoder_sigma)
@@ -2531,21 +2657,23 @@ def run() -> None:
     sound_metrics = compute_metrics(colored_original, sound_colored)
     ai_sound_alignment = compute_metrics(ai_colored, sound_colored)
 
-    overview_tab, evolution_tab, experiments_tab = st.tabs(
-        ["Scene overview", "Evolution detail", "Experiments"]
-    )
-
-    with overview_tab:
+    with progress_tab:
         st.subheader("Sound profile")
         volume_cols = st.columns(3)
+        band_volumes = getattr(sound_clip, "band_volumes", {})
+        if not isinstance(band_volumes, MutableMapping):
+            band_volumes = {}
         for idx, color in enumerate(("red", "green", "blue")):
             volume_cols[idx].metric(
                 f"{color.title()} volume",
-                f"{sound_clip.band_volumes[color]:.2f}",
+                f"{float(band_volumes.get(color, 0.0)):.2f}",
                 help="Relative energy detected in the sound clip for this colour band.",
             )
+        samples = getattr(sound_clip, "samples", np.zeros(0, dtype=np.float32))
+        sample_count = samples.size if isinstance(samples, np.ndarray) else 0
+        sample_rate_display = int(getattr(sound_clip, "sample_rate", current_sample_rate))
         st.caption(
-            f"Waveform length: {sound_clip.samples.size} samples @ {sound_clip.sample_rate} Hz."
+            f"Waveform length: {sample_count} samples @ {sample_rate_display} Hz."
         )
 
         st.subheader("Reconstruction quality")
@@ -2792,7 +2920,7 @@ def run() -> None:
             help="Average reward captured across the most recent generation.",
         )
 
-    with overview_tab:
+    with progress_tab:
         st.write(
             "The overlap score measures agreement as ``1 - |original - reconstruction|``,"
             " so a perfect match reaches 100% while gaps in the prediction reduce the"
@@ -2832,7 +2960,8 @@ def run() -> None:
             "the generated patterns retained the intended geometric cues."
         )
 
-        st.subheader("Visual comparisons")
+    with quick_tab:
+        st.subheader("Live preview")
         overview_row = [
             (colored_original, f"Sound-derived image ({source_label})"),
             (packet_display, "Encoded packet (noise + signal)"),
@@ -2855,7 +2984,25 @@ def run() -> None:
             " reference-only structure, and neutral grayscale indicates shared content."
         )
 
-    if advanced_mode:
+    with tune_tab:
+        st.subheader("Difficulty presets")
+        mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
+        current_mode = state.get("difficulty_mode", mode_names[0])
+        if current_mode not in mode_names:
+            current_mode = mode_names[0]
+        selected_mode = st.select_slider(
+            "Difficulty focus",
+            options=mode_names,
+            value=current_mode,
+            help="Single dial that steers all modelling settings and adaptive tuning.",
+            disabled=not state.get("show_advanced_controls", False),
+            key="tune_difficulty_mode",
+        )
+        state["difficulty_mode"] = selected_mode
+        if not state.get("show_advanced_controls", False):
+            st.caption("Switch Step 2 to **Let me tweak** to adjust difficulty presets here.")
+
+    if show_advanced:
         with st.sidebar.expander("Evolution run controls", expanded=True):
             if hyper_enabled and hyper_profile is not None:
                 population_size = int(
@@ -3192,7 +3339,7 @@ def run() -> None:
     best_candidate_summary: dict[str, Any] | None = None
 
     if manager.generations:
-        with evolution_tab:
+        with tune_tab:
             st.subheader("Evolution progress")
             generation_progress_rows = []
             for record in manager.generations:
@@ -3383,7 +3530,7 @@ def run() -> None:
             ]
             st.table(summary_rows)
 
-        with experiments_tab:
+        with tune_tab:
             st.subheader("Signal codec laboratory")
             run_id = state.get("active_run_id")
             if run_id:
@@ -3587,9 +3734,9 @@ def run() -> None:
                 else:
                     st.caption("Upload a WAV file to reconstruct an image.")
     else:
-        with evolution_tab:
+        with tune_tab:
             st.info("Run at least one generation to visualise evolution progress.")
-        with experiments_tab:
+        with tune_tab:
             st.info(
                 "Run at least one evolution cycle to unlock the signal codec workflow."
             )
