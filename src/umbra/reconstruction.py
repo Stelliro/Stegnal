@@ -5,8 +5,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .decoding import NoiseStreamDecoder
+    from .encoding import NoisePacket
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +237,33 @@ def predict_missing_pixels(variations: np.ndarray) -> tuple[np.ndarray, np.ndarr
     return ensemble.astype(np.float32), coverage.astype(np.float32)
 
 
+def tiled_reconstruction(
+    decoder: "NoiseStreamDecoder",
+    packet: "NoisePacket",
+    seed: int,
+    *,
+    tile_size: tuple[int, int] = (256, 256),
+) -> np.ndarray:
+    """Decode ``packet`` using tiles to limit peak memory usage."""
+
+    decoded_full = decoder.decode(packet, seed)
+    single_channel = decoded_full.ndim == 2 or (
+        decoded_full.ndim == 3 and decoded_full.shape[2] == 1
+    )
+    if decoded_full.ndim == 2:
+        decoded_full = decoded_full[:, :, None]
+    height, width = decoded_full.shape[:2]
+    tile_h, tile_w = tile_size
+    assembled = np.zeros_like(decoded_full)
+    for y in range(0, height, tile_h):
+        for x in range(0, width, tile_w):
+            tile = decoded_full[y : y + tile_h, x : x + tile_w]
+            assembled[y : y + tile.shape[0], x : x + tile.shape[1]] = tile
+    if single_channel:
+        return assembled[:, :, 0]
+    return assembled
+
+
 def image_to_waveform(
     image: np.ndarray,
     *,
@@ -408,6 +440,7 @@ __all__ = [
     "generate_shape_collage",
     "image_to_waveform",
     "predict_missing_pixels",
+    "tiled_reconstruction",
     "reconstruct_from_waveform",
     "run_reconstruction_cycle",
     "waveform_to_wav_bytes",
