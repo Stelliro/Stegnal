@@ -181,8 +181,22 @@ def prepare_trend_chart(
 
 def prepare_metrics_chart(
     history: Sequence[Mapping[str, float]],
+    *,
+    markers: Sequence[int] | None = None,
+    window: int | None = None,
+    auto_follow: bool = True,
 ) -> dict[str, object] | None:
-    """Return a Vega-Lite spec visualising the performance history."""
+    """Return a Vega-Lite spec visualising the performance history.
+
+    Args:
+        history: Sanitised performance samples.
+        markers: Optional observation indices that highlight sound target
+            transitions.
+        window: Desired number of observations to keep visible when auto-
+            following. ``None`` disables windowing.
+        auto_follow: Whether the default chart view should stick to the most
+            recent observations.
+    """
 
     if len(history) < 2:
         return None
@@ -200,6 +214,7 @@ def prepare_metrics_chart(
 
     values: list[dict[str, float | str]] = []
     for index, entry in enumerate(history, start=1):
+        step = float(entry.get("step", index))
         for key, label in metric_labels.items():
             if key not in entry:
                 continue
@@ -209,7 +224,7 @@ def prepare_metrics_chart(
                 continue
             if not math.isfinite(numeric):
                 continue
-            values.append({"Step": float(index), "Metric": label, "Value": numeric})
+            values.append({"Step": step, "Metric": label, "Value": numeric})
 
     if not values:
         return None
@@ -229,21 +244,29 @@ def prepare_metrics_chart(
     step_values = [value["Step"] for value in values]
     score_values = [value["Value"] for value in values]
 
-    x_domain = [min(step_values), max(step_values)]
+    step_min = min(step_values)
+    step_max = max(step_values)
     y_domain = [min(score_values), max(score_values)]
     if y_domain[0] == y_domain[1]:
         return None
 
+    x_scale: dict[str, object] = {"nice": False}
+    if auto_follow and window:
+        window = max(int(window), 1)
+        domain_start = max(step_max - window + 1, step_min)
+        x_scale["domain"] = [domain_start, step_max]
+    else:
+        x_scale["domain"] = [step_min, step_max]
+
     spec: dict[str, object] = {
         "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
         "data": {"values": values},
-        "mark": {"type": "line", "point": True},
         "encoding": {
             "x": {
                 "field": "Step",
                 "type": "quantitative",
                 "title": "Observation",
-                "scale": {"domain": x_domain},
+                "scale": x_scale,
             },
             "y": {
                 "field": "Value",
@@ -258,8 +281,82 @@ def prepare_metrics_chart(
                 {"field": "Value", "type": "quantitative"},
             ],
         },
-        "config": {"legend": {"orient": "bottom", "title": ""}},
+        "layer": [{"mark": {"type": "line", "point": True}}],
+        "config": {
+            "legend": {"orient": "bottom", "title": ""},
+            "point": {"filled": True, "size": 30},
+        },
+        "params": [
+            {
+                "name": "history_view",
+                "select": {
+                    "type": "interval",
+                    "encodings": ["x"],
+                    "bind": "scales",
+                    "translate": "[mousedown[event.shiftKey], mousemove[event.shiftKey], mouseup]",
+                    "zoom": "wheel![event.shiftKey]",
+                },
+            }
+        ],
     }
+
+    marker_values: list[dict[str, float | str]] = []
+    if markers:
+        seen: set[int] = set()
+        ordered_markers: list[int] = []
+        for marker in markers:
+            if marker in seen:
+                continue
+            seen.add(marker)
+            ordered_markers.append(marker)
+        marker_values = [
+            {
+                "Step": float(marker),
+                "Label": "Sound target reseeded",
+            }
+            for marker in ordered_markers
+            if step_min <= float(marker) <= step_max
+        ]
+
+    if marker_values:
+        spec["layer"].append(
+            {
+                "data": {"values": marker_values},
+                "mark": {
+                    "type": "rule",
+                    "color": "#6b7280",
+                    "strokeDash": [4, 4],
+                    "size": 1,
+                },
+                "encoding": {
+                    "x": {"field": "Step", "type": "quantitative"},
+                    "tooltip": [
+                        {"field": "Label", "type": "nominal"},
+                        {"field": "Step", "type": "quantitative"},
+                    ],
+                },
+            }
+        )
+        spec["layer"].append(
+            {
+                "data": {"values": marker_values},
+                "mark": {
+                    "type": "point",
+                    "shape": "triangle-down",
+                    "color": "#6b7280",
+                    "filled": True,
+                    "size": 80,
+                },
+                "encoding": {
+                    "x": {"field": "Step", "type": "quantitative"},
+                    "y": {"value": y_domain[1]},
+                    "tooltip": [
+                        {"field": "Label", "type": "nominal"},
+                        {"field": "Step", "type": "quantitative"},
+                    ],
+                },
+            }
+        )
 
     return spec
 

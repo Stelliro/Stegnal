@@ -1205,6 +1205,7 @@ def _migrate_legacy_state(state: st.session_state) -> None:
 
 _SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (64, 96, 128, 160, 192, 224, 256)
 _PERFORMANCE_HISTORY = 60
+_PERFORMANCE_CHART_WINDOW = 48
 _RECENT_PERFORMANCE = 8
 _MAX_GENERATIONS_PER_TICK = 3
 
@@ -1476,18 +1477,41 @@ def _record_performance_history(
     """Track recent reconstruction metrics for adaptive scheduling."""
 
     history: list[dict[str, float]] = list(state.get("performance_history", []))
+    observation = int(state.get("_performance_observation", 0)) + 1
+    state["_performance_observation"] = observation
     history.append(
         {
             "ai_overlap": float(ai_overlap),
             "ai_ssim": float(ai_ssim),
             "ai_psnr": float(ai_psnr),
             "sound_overlap": float(sound_overlap),
+            "step": float(observation),
         }
     )
     if len(history) > _PERFORMANCE_HISTORY:
         history = history[-_PERFORMANCE_HISTORY:]
+    earliest_step = float(history[0].get("step", 1.0)) if history else 1.0
+    markers: list[int] = list(state.get("_sound_target_markers", []))
+    if markers:
+        state["_sound_target_markers"] = [
+            int(marker) for marker in markers if marker >= earliest_step
+        ]
     state["performance_history"] = history
     return history
+
+
+def _mark_sound_target_transition(state: st.session_state) -> None:
+    """Record the observation index where the sound target changed."""
+
+    observation = int(state.get("_performance_observation", 0))
+    if observation <= 0:
+        return
+
+    markers: list[int] = list(state.get("_sound_target_markers", []))
+    markers.append(observation)
+    if len(markers) > _PERFORMANCE_HISTORY:
+        markers = markers[-_PERFORMANCE_HISTORY:]
+    state["_sound_target_markers"] = markers
 
 
 def _derive_difficulty_metrics(
@@ -1928,6 +1952,9 @@ def run() -> None:
         state["shared_seed"] = int(np.random.default_rng().integers(0, np.iinfo(np.int32).max))
     state.setdefault("encoder_sigma_base", 0.2)
     state.setdefault("decoder_sigma_base", 1.0)
+    state.setdefault("_performance_observation", 0)
+    state.setdefault("_sound_target_markers", [])
+    state.setdefault("metrics_autofollow_toggle", True)
     if "active_sound_seed" not in state:
         state["active_sound_seed"] = int(
             np.random.default_rng().integers(0, np.iinfo(np.int32).max)
@@ -2385,6 +2412,53 @@ def run() -> None:
 
         st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
 
+        st.subheader("Performance signals")
+        control_cols = st.columns([4, 1])
+        auto_follow = bool(state.get("metrics_autofollow_toggle", True))
+        with control_cols[1]:
+            if st.button("Snap to latest", key="metrics_snap_latest"):
+                state["metrics_autofollow_toggle"] = True
+                auto_follow = True
+        with control_cols[0]:
+            auto_follow = st.toggle(
+                "Auto-follow latest",
+                value=auto_follow,
+                key="metrics_autofollow_toggle",
+                help=(
+                    "When enabled the chart automatically tracks the newest "
+                    "observations. Hold Shift and use the scroll wheel to pan "
+                    "left or right."
+                ),
+            )
+        auto_follow = bool(auto_follow)
+        metrics_spec = prepare_metrics_chart(
+            history,
+            markers=markers,
+            window=_PERFORMANCE_CHART_WINDOW,
+            auto_follow=auto_follow,
+        )
+        if metrics_spec:
+            st.vega_lite_chart(metrics_spec, use_container_width=True)
+            st.caption(
+                "Hold Shift while scrolling to move horizontally. The view pauses "
+                "where you leave it when auto-follow is disabled; click Snap to "
+                "latest to rejoin the live stream."
+            )
+            try:
+                metrics_path = run_paths.charts / "metrics.png"
+                export_chart_png(metrics_spec, metrics_path)
+            except Exception:  # pragma: no cover - defensive
+                chart_files.pop("metrics", None)
+                logger.exception("Failed to export metrics chart")
+            else:
+                chart_files["metrics"] = str(metrics_path)
+        else:
+            chart_files.pop("metrics", None)
+            st.caption(
+                "Performance chart will appear once multiple observations contain "
+                "varying values."
+            )
+
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
     max_overlap_so_far = float(state["max_overlap_seen"])
@@ -2406,18 +2480,7 @@ def run() -> None:
         float(metrics.psnr),
         float(sound_overlap_score),
     )
-    metrics_spec = prepare_metrics_chart(history)
-    if metrics_spec:
-        try:
-            metrics_path = run_paths.charts / "metrics.png"
-            export_chart_png(metrics_spec, metrics_path)
-        except Exception:  # pragma: no cover - defensive
-            chart_files.pop("metrics", None)
-            logger.exception("Failed to export metrics chart")
-        else:
-            chart_files["metrics"] = str(metrics_path)
-    else:
-        chart_files.pop("metrics", None)
+    markers: list[int] = list(state.get("_sound_target_markers", []))
     target_progress, improvement_signal, volatility_signal, reward_signal = _derive_difficulty_metrics(
         history
     )
@@ -2818,6 +2881,7 @@ def run() -> None:
         state["sound_generations_left"] = remaining_after
 
         if remaining_after == 0:
+            _mark_sound_target_transition(state)
             new_seed, next_rate, next_resolution = _refresh_sound_scene(
                 state,
                 float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
