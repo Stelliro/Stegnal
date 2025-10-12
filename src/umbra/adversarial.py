@@ -13,6 +13,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
+try:  # pragma: no cover - optional acceleration
+    from numba import njit
+except ImportError:  # pragma: no cover - fallback
+    def njit(*_args, **_kwargs):  # type: ignore
+        def decorator(func):
+            return func
+
+        return decorator
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,20 +41,48 @@ def _gaussian_kernel1d(sigma: float) -> np.ndarray:
     return kernel
 
 
+@njit(cache=True)
+def _blur_channel(data: np.ndarray, kernel: np.ndarray) -> np.ndarray:  # pragma: no cover - compiled
+    radius = kernel.shape[0] // 2
+    rows, cols = data.shape
+    tmp = np.zeros_like(data)
+    out = np.zeros_like(data)
+    for r in range(rows):
+        for c in range(cols):
+            acc = 0.0
+            for k in range(kernel.shape[0]):
+                col = c + k - radius
+                if col < 0:
+                    col = 0
+                elif col >= cols:
+                    col = cols - 1
+                acc += kernel[k] * data[r, col]
+            tmp[r, c] = acc
+    for r in range(rows):
+        for c in range(cols):
+            acc = 0.0
+            for k in range(kernel.shape[0]):
+                row = r + k - radius
+                if row < 0:
+                    row = 0
+                elif row >= rows:
+                    row = rows - 1
+                acc += kernel[k] * tmp[row, c]
+            out[r, c] = acc
+    return out
+
+
 def _separable_gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
     if sigma <= 0.05:
         return np.asarray(image, dtype=np.float32)
-    kernel = _gaussian_kernel1d(sigma)
+    kernel = _gaussian_kernel1d(sigma).astype(np.float32)
     arr = np.asarray(image, dtype=np.float32)
     if arr.ndim == 3:
-        channels = arr.shape[2]
         out = np.empty_like(arr)
-        for c in range(channels):
-            tmp = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 0, arr[..., c])
-            out[..., c] = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 1, tmp)
+        for channel in range(arr.shape[2]):
+            out[..., channel] = _blur_channel(arr[..., channel], kernel)
         return out
-    tmp = np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 0, arr)
-    return np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 1, tmp)
+    return _blur_channel(arr, kernel)
 
 
 def apply_generator(original: np.ndarray, params: GeneratorParams) -> np.ndarray:
@@ -139,6 +176,17 @@ class AdversarialManager:
             self.state.decoder_sigma,
         )
         return self.state.generator, float(best_score), float(self.state.decoder_sigma)
+
+    def inject_burst_noise(self, image: np.ndarray, *, severity: float = 0.2) -> np.ndarray:
+        """Simulate adversarial jamming by injecting burst noise."""
+
+        arr = np.asarray(image, dtype=np.float32)
+        bursts = max(1, int(0.05 * arr.size))
+        flat = arr.reshape(-1)
+        indices = self.rng.integers(0, flat.size, size=bursts)
+        noise = self.rng.normal(0.0, severity, size=bursts)
+        flat[indices] = np.clip(flat[indices] + noise, 0.0, 1.0)
+        return flat.reshape(arr.shape)
 
 
 __all__ = [

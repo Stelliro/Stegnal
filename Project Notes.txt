@@ -92,6 +92,7 @@ This is a **proof-of-possibility** initiative. The goal is to demonstrate that �
 * Introduce adversarial jamming in simulation.
 * Evaluate diffusion and contrastive learning models for decoding.
 * Conduct physical layer tests using ultrasonic transducers or SDR radios.
+* Evaluate MP4 ↔ WAV ↔ MP4 translation pipelines for future audiovisual experiments.
 
 ---
 
