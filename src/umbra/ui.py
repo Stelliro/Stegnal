@@ -2412,53 +2412,6 @@ def run() -> None:
 
         st.metric("AI ↔ Sound colour SSIM", f"{ai_sound_alignment.ssim:.3f}")
 
-        st.subheader("Performance signals")
-        control_cols = st.columns([4, 1])
-        auto_follow = bool(state.get("metrics_autofollow_toggle", True))
-        with control_cols[1]:
-            if st.button("Snap to latest", key="metrics_snap_latest"):
-                state["metrics_autofollow_toggle"] = True
-                auto_follow = True
-        with control_cols[0]:
-            auto_follow = st.toggle(
-                "Auto-follow latest",
-                value=auto_follow,
-                key="metrics_autofollow_toggle",
-                help=(
-                    "When enabled the chart automatically tracks the newest "
-                    "observations. Hold Shift and use the scroll wheel to pan "
-                    "left or right."
-                ),
-            )
-        auto_follow = bool(auto_follow)
-        metrics_spec = prepare_metrics_chart(
-            history,
-            markers=markers,
-            window=_PERFORMANCE_CHART_WINDOW,
-            auto_follow=auto_follow,
-        )
-        if metrics_spec:
-            st.vega_lite_chart(metrics_spec, use_container_width=True)
-            st.caption(
-                "Hold Shift while scrolling to move horizontally. The view pauses "
-                "where you leave it when auto-follow is disabled; click Snap to "
-                "latest to rejoin the live stream."
-            )
-            try:
-                metrics_path = run_paths.charts / "metrics.png"
-                export_chart_png(metrics_spec, metrics_path)
-            except Exception:  # pragma: no cover - defensive
-                chart_files.pop("metrics", None)
-                logger.exception("Failed to export metrics chart")
-            else:
-                chart_files["metrics"] = str(metrics_path)
-        else:
-            chart_files.pop("metrics", None)
-            st.caption(
-                "Performance chart will appear once multiple observations contain "
-                "varying values."
-            )
-
     overlap_pct = float(ai_overlap_score)
     state["max_overlap_seen"] = max(state.get("max_overlap_seen", 0.0), overlap_pct)
     max_overlap_so_far = float(state["max_overlap_seen"])
@@ -2513,6 +2466,53 @@ def run() -> None:
         latest["difficulty_target"] = blended_target * 100.0
         latest["reward_signal"] = reward_signal * 100.0
         latest["reward_points"] = float(state.get("difficulty_reward_points", 0.0))
+
+    st.subheader("Performance signals")
+    control_cols = st.columns([4, 1])
+    auto_follow = bool(state.get("metrics_autofollow_toggle", True))
+    with control_cols[1]:
+        if st.button("Snap to latest", key="metrics_snap_latest"):
+            state["metrics_autofollow_toggle"] = True
+            auto_follow = True
+    with control_cols[0]:
+        auto_follow = st.toggle(
+            "Auto-follow latest",
+            value=auto_follow,
+            key="metrics_autofollow_toggle",
+            help=(
+                "When enabled the chart automatically tracks the newest "
+                "observations. Hold Shift and use the scroll wheel to pan "
+                "left or right."
+            ),
+        )
+    auto_follow = bool(auto_follow)
+    metrics_spec = prepare_metrics_chart(
+        history,
+        markers=markers,
+        window=_PERFORMANCE_CHART_WINDOW,
+        auto_follow=auto_follow,
+    )
+    if metrics_spec:
+        st.vega_lite_chart(metrics_spec, use_container_width=True)
+        st.caption(
+            "Hold Shift while scrolling to move horizontally. The view pauses "
+            "where you leave it when auto-follow is disabled; click Snap to "
+            "latest to rejoin the live stream."
+        )
+        try:
+            metrics_path = run_paths.charts / "metrics.png"
+            export_chart_png(metrics_spec, metrics_path)
+        except Exception:  # pragma: no cover - defensive
+            chart_files.pop("metrics", None)
+            logger.exception("Failed to export metrics chart")
+        else:
+            chart_files["metrics"] = str(metrics_path)
+    else:
+        chart_files.pop("metrics", None)
+        st.caption(
+            "Performance chart will appear once multiple observations contain "
+            "varying values."
+        )
 
     difficulty_box = st.sidebar.expander("Difficulty signals", expanded=False)
     with difficulty_box:
