@@ -274,6 +274,7 @@ def _auto_run_parameters(
 
     queue = _blend_range(tuple(profile.get("queue", (4, 8))), weight)
     autosave = _blend_range(tuple(profile.get("autosave", (6, 10))), weight)
+    shapes = _blend_range(tuple(profile.get("shapes", (3, 6))), weight)
 
     return {
         "population_size": max(1, population),
@@ -281,6 +282,7 @@ def _auto_run_parameters(
         "autosave_interval": max(1, autosave),
         "target_dwell": max(1, dwell),
         "subjects_goal": max(1, subjects_goal),
+        "shape_count": max(3, shapes),
         "pause_threshold": float(profile.get("pause_threshold", 0.9)),
         "difficulty_target": base_target,
     }
@@ -443,7 +445,7 @@ def _render_quick_start_wizard(
         hyper_profile=hyper_profile,
     )
 
-    stats_cols = mode_col.columns(2)
+    stats_cols = mode_col.columns(3)
     stats_cols[0].metric(
         "AI attempts/gen",
         auto_settings["population_size"],
@@ -452,6 +454,7 @@ def _render_quick_start_wizard(
         "Gen queue",
         auto_settings["generations_to_queue"],
     )
+    stats_cols[2].metric("Scene shapes", auto_settings["shape_count"])
     mode_col.metric("Sound dwell (gens)", auto_settings["target_dwell"])
     if hyper_profile is None:
         state["population_size"] = auto_settings["population_size"]
@@ -459,6 +462,7 @@ def _render_quick_start_wizard(
         state["autosave_interval"] = auto_settings["autosave_interval"]
         state["sound_target_dwell"] = auto_settings["target_dwell"]
         state["last_sound_target_dwell"] = auto_settings["target_dwell"]
+    state["target_shape_count"] = int(auto_settings["shape_count"])
 
     desired_target = auto_settings["difficulty_target"]
     state["difficulty_target_override"] = desired_target
@@ -500,7 +504,8 @@ def _render_quick_start_wizard(
     metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
     metrics_cols[1].metric("Difficulty target", f"{desired_target * 100:.0f}%")
     run_col.caption(
-        f"Auto-tuned for about {auto_settings['subjects_goal']} subjects with "
+        f"Auto-tuned for about {auto_settings['subjects_goal']} subjects "
+        f"across {auto_settings['shape_count']} shapes with "
         f"{auto_settings['population_size']} evolving in parallel."
     )
 
@@ -614,6 +619,7 @@ _DIFFICULTY_MODE_PRESETS: OrderedDict[str, dict[str, Any]] = OrderedDict(
                 "queue": (3, 6),
                 "autosave": (5, 8),
                 "dwell": (12, 18),
+                "shapes": (3, 6),
                 "pause_threshold": 0.82,
             },
         ),
@@ -626,6 +632,7 @@ _DIFFICULTY_MODE_PRESETS: OrderedDict[str, dict[str, Any]] = OrderedDict(
                 "queue": (4, 9),
                 "autosave": (6, 10),
                 "dwell": (14, 22),
+                "shapes": (8, 16),
                 "pause_threshold": 0.86,
             },
         ),
@@ -638,6 +645,7 @@ _DIFFICULTY_MODE_PRESETS: OrderedDict[str, dict[str, Any]] = OrderedDict(
                 "queue": (5, 10),
                 "autosave": (6, 11),
                 "dwell": (18, 28),
+                "shapes": (16, 24),
                 "pause_threshold": 0.9,
             },
         ),
@@ -650,6 +658,7 @@ _DIFFICULTY_MODE_PRESETS: OrderedDict[str, dict[str, Any]] = OrderedDict(
                 "queue": (6, 12),
                 "autosave": (7, 12),
                 "dwell": (20, 34),
+                "shapes": (22, 30),
                 "pause_threshold": 0.92,
             },
         ),
@@ -2371,10 +2380,13 @@ def run() -> None:
         shape_specs = []
         source_label = state.get("quick_start_reference_label", "Uploaded image")
     else:
+        shape_target = int(state.get("target_shape_count", auto_settings["shape_count"]))
+        shape_target = int(np.clip(shape_target, 3, 60))
         original_color, original, sound_clip, shape_specs = generate_sound_art(
             seed=sound_seed,
             image_size=(current_resolution, current_resolution),
             sample_rate=current_sample_rate,
+            shape_count=shape_target,
         )
         source_label = f"Sound seed {sound_seed}"
     color_template = _build_color_template(original_color, original)
