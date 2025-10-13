@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from .decoding import NoiseStreamDecoder
+from .decoding import DiffusionInpainter, NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
 from .metrics import ReconstructionMetrics, compute_metrics
+from .sound import messy_key_hash_from_overlap
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,7 @@ class PipelineResult:
     packet_path: Path | None
     reconstruction_path: Path | None
     metrics: ReconstructionMetrics
+    messy_key: str | None
 
 
 def run_pipeline(
@@ -33,7 +36,7 @@ def run_pipeline(
     """Execute the encode/decode process and return reconstruction metrics."""
 
     encoder = NoiseStreamEncoder(sigma=sigma)
-    decoder = NoiseStreamDecoder(denoise_sigma=denoise_sigma)
+    decoder = NoiseStreamDecoder(denoise_sigma=denoise_sigma, inpainter=DiffusionInpainter())
 
     logger.info(
         "Running pipeline with seed=%d sigma=%.3f denoise=%.3f", seed, sigma, denoise_sigma
@@ -53,6 +56,9 @@ def run_pipeline(
         logger.debug("Saved reconstruction to %s", reconstruction_path)
 
     metrics = compute_metrics(original, reconstructed)
+    messy_key = None
+    if packet.messy_latent is not None:
+        messy_key = messy_key_hash_from_overlap(reconstructed)
     logger.info(
         "Pipeline metrics for %s: PSNR %.2f SSIM %.3f",
         image_path,
@@ -63,6 +69,7 @@ def run_pipeline(
         packet_path=Path(packet_path) if packet_path else None,
         reconstruction_path=Path(reconstruction_path) if reconstruction_path else None,
         metrics=metrics,
+        messy_key=messy_key,
     )
 
 
@@ -74,4 +81,34 @@ def replay_packet(packet_path: str | Path, seed: int, denoise_sigma: float | Non
     return decoder.decode(packet, seed)
 
 
-__all__ = ["run_pipeline", "replay_packet", "PipelineResult"]
+def run_pipeline_async(
+    jobs: list[tuple[str | Path, int]],
+    *,
+    sigma: float = 0.2,
+    denoise_sigma: float | None = 1.0,
+    max_workers: int = 4,
+) -> list[PipelineResult]:
+    """Evaluate multiple encode/decode tasks asynchronously."""
+
+    results: list[PipelineResult] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                run_pipeline,
+                image_path,
+                seed,
+                sigma=sigma,
+                denoise_sigma=denoise_sigma,
+            ): (image_path, seed)
+            for image_path, seed in jobs
+        }
+        for future in as_completed(future_map):
+            try:
+                results.append(future.result())
+            except Exception as exc:  # pragma: no cover - defensive logging
+                image_path, seed = future_map[future]
+                logger.exception("Pipeline job failed for %s seed=%s: %s", image_path, seed, exc)
+    return results
+
+
+__all__ = ["run_pipeline", "replay_packet", "run_pipeline_async", "PipelineResult"]

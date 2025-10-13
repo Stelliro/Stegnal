@@ -16,6 +16,39 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class MessyKeyArtifact:
+    """Container describing the noisy latent used for diffusion guidance."""
+
+    hash: str
+    latent: np.ndarray
+
+    @classmethod
+    def from_samples(cls, samples: np.ndarray) -> MessyKeyArtifact:
+        buffer = np.asarray(samples, dtype=np.float32).reshape(-1)
+        digest = hashlib.sha1(buffer.tobytes()).hexdigest()
+        return cls(hash=digest, latent=buffer)
+
+
+def derive_messy_latent(artifact: MessyKeyArtifact, shape: tuple[int, ...]) -> np.ndarray:
+    """Broadcast a :class:`MessyKeyArtifact` to ``shape`` for diffusion guidance."""
+
+    if artifact.latent.size == 0:
+        return np.zeros(shape, dtype=np.float32)
+    repeats = int(np.ceil(np.prod(shape) / artifact.latent.size))
+    tiled = np.tile(artifact.latent, repeats)
+    return tiled[: int(np.prod(shape))].reshape(shape).astype(np.float32)
+
+
+def messy_key_hash_from_overlap(overlap_map: np.ndarray) -> str:
+    """Create a reproducible messy-key hash from an overlap activation map."""
+
+    array = np.asarray(overlap_map, dtype=np.float32)
+    normalized = (array - float(array.min())) / (float(np.ptp(array)) + 1e-6)
+    digest = hashlib.sha1(normalized.tobytes()).hexdigest()
+    return digest
+
+
+@dataclass(frozen=True)
 class SyntheticSound:
     """Representation of a randomly generated sound clip."""
 
@@ -341,6 +374,23 @@ def generate_sound_art_from_waveform(
     return color_canvas, grayscale, sound, shapes
 
 
+def generate_sound_art_gallery(
+    sounds: Sequence[SyntheticSound],
+    *,
+    resolution: tuple[int, int] = (192, 192),
+) -> list[np.ndarray]:
+    """Create FFT-guided canvases for a collection of sounds."""
+
+    gallery: list[np.ndarray] = []
+    for sound in sounds:
+        spectrum = np.fft.rfft(sound.samples)
+        priors = _normalized_band_volumes(np.abs(spectrum))
+        rng = np.random.default_rng(int(sound.seed))
+        image, _, _ = _synthesise_sound_image(rng, priors, resolution)
+        gallery.append(image)
+    return gallery
+
+
 def guess_shapes(image: np.ndarray, threshold: float = 0.2) -> list[ShapeGuess]:
     """Attempt to recover geometric primitives from ``image`` on a per-channel basis."""
 
@@ -422,4 +472,8 @@ __all__ = [
     "generate_sound_art_from_waveform",
     "guess_shapes",
     "load_waveform_from_wav",
+    "MessyKeyArtifact",
+    "derive_messy_latent",
+    "messy_key_hash_from_overlap",
+    "generate_sound_art_gallery",
 ]
