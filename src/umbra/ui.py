@@ -59,7 +59,7 @@ from umbra.sound import (
     guess_shapes,
     load_waveform_from_wav,
 )
-from umbra.packaging import build_demo_package
+from umbra.demo_packager import build_demo_package
 from umbra.visualization import (
     colorize_comparison,
     multiplicative_overlap,
