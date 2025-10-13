@@ -389,9 +389,9 @@ def _apply_auto_pause(
     return "Difficulty spike reached – evolution paused so a new scene can be prepared."
 
 
-def _render_control_panel(
+def _render_quick_start_wizard(
     state: st.session_state,
-    container: DeltaGenerator,
+    container: DeltaGenerator | None = None,
     *,
     difficulty_progress: float,
     hyper_profile: HyperPerformanceProfile | None,
@@ -591,7 +591,14 @@ def _render_control_panel(
         pause_threshold=pause_threshold,
     )
     if pause_message:
-        st.sidebar.info(pause_message)
+        run_col.info(pause_message)
+    step_status["run"] = step_status["run"] or run_button
+    if not step_status["run"]:
+        step_status["run"] = bool(state.get("pending_generations", 0) > 0)
+    if not step_status["run"]:
+        step_status["run"] = bool(state.get("active_run_id"))
+
+    state["quick_start_step_status"] = step_status
 
     return (
         easy_mode,
@@ -601,6 +608,24 @@ def _render_control_panel(
         save_button,
         reload_button,
         auto_settings,
+    )
+
+
+def _render_control_panel(
+    state: st.session_state,
+    container: DeltaGenerator | None = None,
+    *,
+    difficulty_progress: float,
+    hyper_profile: HyperPerformanceProfile | None,
+) -> tuple[bool, bool, bool, bool, bool, dict[str, int]]:
+    """Compatibility shim delegating legacy control calls to the wizard layout."""
+
+    target_container = container or st.sidebar
+    return _render_quick_start_wizard(
+        state,
+        target_container,
+        difficulty_progress=difficulty_progress,
+        hyper_profile=hyper_profile,
     )
 
 
@@ -2274,6 +2299,9 @@ def run() -> None:
         hyper_profile = None
 
     difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
+    quick_tab, tune_tab, progress_tab = st.tabs(
+        ["Quick Start", "Tune It", "Watch Progress"]
+    )
     (
         easy_mode,
         run_button,
@@ -2284,6 +2312,7 @@ def run() -> None:
         auto_settings,
     ) = _render_control_panel(
         state,
+        quick_tab,
         difficulty_progress=difficulty_progress,
         hyper_profile=hyper_profile,
     )
