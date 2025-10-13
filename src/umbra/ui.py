@@ -831,8 +831,9 @@ def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None =
                 )
 
     if package_blob:
-        package_container.download_button(
-            "Download demo archive",
+        _render_download_link(
+            package_container,
+            label="Download demo archive",
             data=package_blob,
             file_name=package_name or "umbra_demo.pyz",
             mime="application/octet-stream",
@@ -893,8 +894,9 @@ def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None =
 
     if wav_bytes is not None and isinstance(wav_bytes, (bytes, bytearray)):
         _render_audio(demo_container, bytes(wav_bytes))
-        demo_container.download_button(
-            "Download WAV",
+        _render_download_link(
+            demo_container,
+            label="Download WAV",
             data=wav_bytes,
             file_name=state.get("demo_wav_label", "demo.wav"),
             mime="audio/wav",
@@ -1771,6 +1773,58 @@ def _render_audio(column: st.delta_generator.DeltaGenerator, data: bytes) -> Non
         f"<audio controls style=\"width:100%;\">"
         f"<source src=\"{audio_url}\" type=\"audio/wav\" />"
         "</audio>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_download_link(
+    container: st.delta_generator.DeltaGenerator,
+    *,
+    label: str,
+    data: bytes | bytearray,
+    file_name: str,
+    mime: str,
+    key: str | None = None,
+) -> None:
+    """Render a Streamlit-styled download link backed by a data URL.
+
+    Streamlit's :func:`download_button` stores payloads in an in-memory cache that
+    is frequently invalidated during rapid reruns. When a rerun happens before the
+    browser downloads the file the request fails with noisy ``MediaFileHandler``
+    errors. Embedding the payload in a ``data:`` URL sidesteps the cache entirely
+    while preserving the download experience.
+    """
+
+    if not isinstance(data, (bytes, bytearray)):
+        container.caption("Download unavailable: no data generated yet.")
+        return
+
+    payload = bytes(data)
+    if not payload:
+        container.caption("Download unavailable: payload is empty.")
+        return
+
+    encoded = base64.b64encode(payload).decode("ascii")
+    safe_label = html.escape(label)
+    safe_name = html.escape(file_name or "download")
+    element_id = html.escape(key) if key else f"download-{uuid4().hex}"
+
+    container.markdown(
+        (
+            "<a id=\"{element_id}\" "
+            "class=\"st-emotion-cache-3a2x2s e1nzilvr5\" "
+            "style=\"display:inline-block;padding:0.4rem 0.9rem;margin:0.25rem 0;"
+            "text-decoration:none;border-radius:0.5rem;background:#1f2937;color:#f5f6fa;"
+            "border:1px solid #374151;font-weight:600;\" "
+            "download=\"{safe_name}\" href=\"data:{mime};base64,{encoded}\">"
+            "{safe_label}</a>"
+        ).format(
+            element_id=element_id,
+            safe_name=safe_name,
+            mime=html.escape(mime or "application/octet-stream"),
+            encoded=encoded,
+            safe_label=safe_label,
+        ),
         unsafe_allow_html=True,
     )
 
@@ -4005,8 +4059,9 @@ def run() -> None:
                         source_label or "image",
                         f"_{sample_rate_choice}hz.wav",
                     )
-                    st.download_button(
-                        "Download waveform",
+                    _render_download_link(
+                        st,
+                        label="Download waveform",
                         data=wav_bytes,
                         file_name=download_name,
                         mime="audio/wav",
@@ -4089,8 +4144,9 @@ def run() -> None:
                             (uploaded_wav.name or "waveform"),
                             "_prediction.png",
                         )
-                        st.download_button(
-                            "Download predicted image",
+                        _render_download_link(
+                            st,
+                            label="Download predicted image",
                             data=png_bytes,
                             file_name=download_png,
                             mime="image/png",
@@ -4146,7 +4202,8 @@ def run() -> None:
                     download_cache[cache_key] = cached_entry
                 chart_bytes = cached_entry["bytes"]
                 label = label_map.get(key, chart_path.stem.replace("_", " ").title())
-                st.download_button(
+                _render_download_link(
+                    st,
                     label=f"Download {label}",
                     data=chart_bytes,
                     file_name=chart_path.name,
