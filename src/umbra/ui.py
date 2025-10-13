@@ -3493,9 +3493,10 @@ def run() -> None:
                     " the channel, while the decoder adapts its denoise level."
                 ),
             )
-        autosave_interval = int(
-            max(1, hyper_profile.autosave_interval or autosave_interval)
-        )
+        if hyper_enabled and hyper_profile is not None:
+            autosave_interval = int(
+                max(1, hyper_profile.autosave_interval or autosave_interval)
+            )
         state["population_size"] = population_size
         state["generations_to_queue"] = generations_to_queue
         state["autosave_interval"] = autosave_interval
