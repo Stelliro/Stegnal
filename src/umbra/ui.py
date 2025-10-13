@@ -744,10 +744,10 @@ def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None =
                 )
 
     if demo_image is not None:
-        demo_container.image(
+        _render_image(
+            demo_container,
             normalize_for_display(demo_image),
-            caption=state.get("demo_image_label", "Uploaded image"),
-            use_column_width=True,
+            state.get("demo_image_label", "Uploaded image"),
         )
 
     wav_bytes = state.get("demo_wav_bytes")
@@ -755,7 +755,7 @@ def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None =
     resolution = state.get("demo_resolution")
 
     if wav_bytes is not None and isinstance(wav_bytes, (bytes, bytearray)):
-        demo_container.audio(wav_bytes, format="audio/wav")
+        _render_audio(demo_container, bytes(wav_bytes))
         demo_container.download_button(
             "Download WAV",
             data=wav_bytes,
@@ -785,10 +785,10 @@ def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None =
 
     translated = state.get("demo_translated_image")
     if isinstance(translated, np.ndarray):
-        demo_container.image(
+        _render_image(
+            demo_container,
             normalize_for_display(translated),
-            caption="Translated image",
-            use_column_width=True,
+            "Translated image",
         )
 
 def _render_control_panel(
@@ -1098,35 +1098,35 @@ def _render_reconstruction_result(result: ReconstructionResult) -> None:
         caption="Ground truth collage",
         use_column_width=True,
     )
-    base_cols[1].image(
-        to_uint8_image(result.ensemble_prediction),
-        caption="Ensemble prediction",
-        use_column_width=True,
+    _render_image(
+        base_cols[1],
+        result.ensemble_prediction,
+        "Ensemble prediction",
     )
-    base_cols[2].image(
-        to_uint8_image(result.hybrid_prediction),
-        caption="Hybrid fill (ensemble + audio)",
-        use_column_width=True,
+    _render_image(
+        base_cols[2],
+        result.hybrid_prediction,
+        "Hybrid fill (ensemble + audio)",
     )
 
     comparison_cols = st.columns(2)
-    comparison_cols[0].image(
-        to_uint8_image(result.audio_reconstruction),
-        caption="Audio-derived reconstruction",
-        use_column_width=True,
+    _render_image(
+        comparison_cols[0],
+        result.audio_reconstruction,
+        "Audio-derived reconstruction",
     )
     overlay = colorize_comparison(result.base_image, result.hybrid_prediction)
-    comparison_cols[1].image(
-        to_uint8_image(overlay),
-        caption="Overlay vs. ground truth",
-        use_column_width=True,
+    _render_image(
+        comparison_cols[1],
+        overlay,
+        "Overlay vs. ground truth",
     )
 
     diff = np.abs(result.base_image - result.hybrid_prediction)
-    st.image(
-        to_uint8_image(normalize_for_display(diff)),
-        caption="Residual difference heatmap",
-        use_column_width=True,
+    _render_image(
+        st,
+        normalize_for_display(diff),
+        "Residual difference heatmap",
     )
 
     coverage_map = normalize_for_display(result.coverage)
@@ -1134,10 +1134,10 @@ def _render_reconstruction_result(result: ReconstructionResult) -> None:
         [coverage_map, np.zeros_like(coverage_map), 1.0 - coverage_map],
         axis=2,
     )
-    st.image(
-        to_uint8_image(coverage_rgb),
-        caption="Coverage confidence (red = uncertain, blue = confident)",
-        use_column_width=True,
+    _render_image(
+        st,
+        coverage_rgb,
+        "Coverage confidence (red = uncertain, blue = confident)",
     )
 
     variation_count = result.variations.shape[0]
@@ -1149,10 +1149,10 @@ def _render_reconstruction_result(result: ReconstructionResult) -> None:
             value=0,
             key="reconstruction_variation_index",
         )
-        st.image(
-            to_uint8_image(result.variations[index]),
-            caption=f"Variation sample {index + 1} of {variation_count}",
-            use_column_width=True,
+        _render_image(
+            st,
+            result.variations[index],
+            f"Variation sample {index + 1} of {variation_count}",
         )
 
     try:
@@ -1160,7 +1160,7 @@ def _render_reconstruction_result(result: ReconstructionResult) -> None:
     except ValueError as exc:
         st.warning(f"Unable to render waveform audio: {exc}")
     else:
-        st.audio(wav_bytes, format="audio/wav")
+        _render_audio(st, wav_bytes)
 
     shape_rows = [
         {
@@ -1581,6 +1581,13 @@ def _image_to_data_url(image: np.ndarray) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+def _audio_to_data_url(data: bytes, *, mime: str = "audio/wav") -> str:
+    """Convert raw audio ``data`` into a self-contained data URL."""
+
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def _render_image(column: st.delta_generator.DeltaGenerator, image: np.ndarray, caption: str) -> None:
     """Render ``image`` inside ``column`` with a semantic caption."""
 
@@ -1594,6 +1601,18 @@ def _render_image(column: st.delta_generator.DeltaGenerator, image: np.ndarray, 
           <figcaption style=\"font-size:0.8rem;color:var(--text-color,#666);\">{caption_html}</figcaption>
         </figure>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_audio(column: st.delta_generator.DeltaGenerator, data: bytes) -> None:
+    """Render ``data`` as an inline HTML5 audio player."""
+
+    audio_url = _audio_to_data_url(bytes(data))
+    column.markdown(
+        f"<audio controls style=\"width:100%;\">"
+        f"<source src=\"{audio_url}\" type=\"audio/wav\" />"
+        "</audio>",
         unsafe_allow_html=True,
     )
 
@@ -2139,132 +2158,6 @@ def _session_export_payload(
     best_candidate_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Assemble the export payload used by the session snapshot."""
-
-    hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
-
-    if manager.generations:
-        last_generation = manager.generations[-1]
-        difficulty_raw = float(last_generation.difficulty_raw)
-        difficulty_target = float(np.clip(last_generation.difficulty_level, 0.0, 1.0))
-    else:
-        difficulty_raw = float(state.get("latest_generation_difficulty_raw", 0.0))
-        difficulty_target = float(
-            np.clip(state.get("latest_generation_difficulty", 0.0), 0.0, 1.0)
-        )
-    difficulty_normalized = normalize_difficulty(difficulty_raw)
-
-    config_snapshot = {
-        "population_size": manager.population_size,
-        "autosave_interval": manager.autosave_interval,
-        "encoder_sigma": float(encoder_sigma),
-        "decoder_sigma": float(denoise_sigma),
-        "base_encoder_sigma": float(base_encoder_sigma),
-        "base_decoder_sigma": float(base_decoder_sigma),
-        "sample_rate": int(current_sample_rate),
-        "resolution": int(current_resolution),
-        "difficulty_target": difficulty_target,
-        "shared_seed": int(seed),
-        "sound_seed": int(sound_seed),
-    }
-
-    config_hash_value = hashlib.sha256(
-        json.dumps(config_snapshot, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    provenance = collect_provenance(config_hash=f"sha256:{config_hash_value}")
-    provenance["random_seeds"] = {"session": int(seed), "sound": int(sound_seed)}
-
-    best_psnr = float(metrics.psnr)
-    best_ssim = float(metrics.ssim)
-    if best_candidate_summary is not None:
-        best_psnr = float(best_candidate_summary.get("psnr", best_psnr))
-        best_ssim = float(best_candidate_summary.get("ssim", best_ssim))
-
-    metrics_block = {
-        "ai_vs_reference": metrics.as_dict(),
-        "sound_vs_reference": sound_metrics.as_dict(),
-        "ai_vs_sound": ai_sound_alignment.as_dict(),
-        "overlap": {
-            "ai_vs_reference": float(ai_overlap_score),
-            "sound_vs_reference": float(sound_overlap_score),
-        },
-        "global_pooled": {
-            "psnr": float(metrics.psnr),
-            "ssim": float(metrics.ssim),
-            "desc": "pooled/global comparator",
-        },
-        "per_candidate_strict": {
-            "psnr": best_psnr,
-            "ssim": best_ssim,
-            "desc": "gallery/best-candidate strict comparator",
-        },
-    }
-
-    payload = {
-        "hardware_backend": hardware_backend,
-        "difficulty": {
-            "current": float(state.get("difficulty_progress", 0.0)),
-            "max_overlap": float(state.get("max_overlap_seen", 0.0)),
-            "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
-            "dwell_generations": int(target_dwell),
-            "score_budget": float(state.get("sound_target_score", 0.0)),
-            "score_remaining": float(state.get("sound_score_remaining", 0.0)),
-            "momentum": float(state.get("difficulty_improvement", 0.0)),
-            "volatility": float(state.get("difficulty_volatility", 0.0)),
-            "raw": difficulty_raw,
-            "normalized": difficulty_normalized,
-            "target": difficulty_target,
-        },
-        "seeds": {
-            "shared": int(seed),
-            "sound": int(sound_seed),
-        },
-        "noise": {
-            "base_encoder_sigma": float(base_encoder_sigma),
-            "base_decoder_sigma": float(base_decoder_sigma),
-            "active_encoder_sigma": float(encoder_sigma),
-            "active_decoder_sigma": float(denoise_sigma),
-        },
-        "sound": {
-            "current_sample_rate": int(current_sample_rate),
-            "current_resolution": int(current_resolution),
-            "sample_rate_window": [int(sample_rate_range[0]), int(sample_rate_range[1])],
-            "resolution_window": [int(resolution_range[0]), int(resolution_range[1])],
-            "band_volumes": dict(getattr(sound_clip, "band_volumes", {})),
-            "generator_seed": int(getattr(sound_clip, "seed", sound_seed)),
-            "generator_sample_rate": int(
-                getattr(sound_clip, "sample_rate", current_sample_rate)
-            ),
-        },
-        "metrics": metrics_block,
-        "performance_history": list(state.get("performance_history", [])),
-        "manager": {
-            "population_size": int(manager.population_size),
-            "autosave_interval": int(manager.autosave_interval),
-            "generation_count": len(manager.generations),
-            "best_candidate": best_candidate_summary,
-            "mutation_boost": int(manager.mutation_boost),
-        },
-        "provenance": provenance,
-    }
-    if manager.hyper_profile.enabled:
-        profile = manager.hyper_profile
-        payload["hyper_performance"] = {
-            "target_subjects": int(profile.target_subjects),
-            "batch_size": int(profile.batch_size),
-            "dwell_generations": int(profile.dwell_generations),
-            "queue_generations": int(profile.queue_generations),
-            "autosave_interval": int(profile.autosave_interval),
-            "mean_generation_duration": float(profile.mean_duration),
-            "subjects_per_second": float(profile.throughput),
-        }
-    return payload
-
-
-def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, Any]]) -> bytes:
-    """Create a zipped export containing session metrics and progress curves.
-
-    Returns raw bytes so downloads don't rely on Streamlit's transient media storage.
-    """
 
     hardware_backend = state.get("hardware_backend", "CPU (NumPy)")
 
@@ -3473,10 +3366,10 @@ def run() -> None:
                             st.error(str(exc))
 
                 if source_image is not None:
-                    st.image(
-                        to_uint8_image(source_image),
-                        caption=f"Source · {source_label}" if source_label else "Source image",
-                        use_column_width=True,
+                    _render_image(
+                        st,
+                        source_image,
+                        f"Source · {source_label}" if source_label else "Source image",
                     )
                     waveform = encode_image_to_waveform(
                         source_image,
@@ -3491,11 +3384,7 @@ def run() -> None:
                         sample_rate=sample_rate_choice,
                         resolution=source_image.shape[:2],
                     )
-                    st.image(
-                        to_uint8_image(roundtrip),
-                        caption="Heuristic round-trip",
-                        use_column_width=True,
-                    )
+                    _render_image(st, roundtrip, "Heuristic round-trip")
                     metrics_roundtrip = compute_metrics(source_image, roundtrip)
                     st.markdown(
                         _metric_badge_html(
@@ -3505,7 +3394,7 @@ def run() -> None:
                         ),
                         unsafe_allow_html=True,
                     )
-                    st.audio(wav_bytes, format="audio/wav")
+                    _render_audio(st, wav_bytes)
                     download_name = _sanitize_filename(
                         source_label or "image",
                         f"_{sample_rate_choice}hz.wav",
@@ -3553,15 +3442,11 @@ def run() -> None:
                             sample_rate=detected_rate,
                             resolution=(target_resolution, target_resolution),
                         )
-                        st.audio(wav_bytes, format="audio/wav")
+                        _render_audio(st, wav_bytes)
                         st.markdown(
                             f"**Detected sample rate** — {detected_rate:,} Hz, {waveform.size} samples"
                         )
-                        st.image(
-                            to_uint8_image(prediction),
-                            caption="Predicted image",
-                            use_column_width=True,
-                        )
+                        _render_image(st, prediction, "Predicted image")
                         reference_original = colored_original
                         if reference_original.shape[:2] != prediction.shape[:2]:
                             reference_original = _resize_image(
