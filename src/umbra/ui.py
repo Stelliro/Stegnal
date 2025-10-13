@@ -1459,9 +1459,18 @@ def _finite_or_none(value: Any) -> float | None:
 
 def _attempt_autoload(autosave_dir: Path) -> None:
     state = st.session_state
+    autosave_path = _autosave_path(autosave_dir)
     try:
         manager = EvolutionManager.load(autosave_dir)
     except FileNotFoundError:
+        return
+    except EOFError:
+        logger.warning("Autosave at %s appears to be truncated; ignoring", autosave_path)
+        try:
+            autosave_path.unlink()
+        except OSError:
+            logger.debug("Failed to remove corrupted autosave at %s", autosave_path, exc_info=True)
+        st.warning("Autosave data was incomplete and has been discarded.")
         return
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("Failed to load autosave from %s", autosave_dir)
@@ -3080,7 +3089,8 @@ def run() -> None:
         float(metrics.psnr),
         float(sound_overlap_score),
     )
-    metrics_spec = prepare_metrics_chart(history)
+    markers: list[int] = list(state.get("_sound_target_markers", []))
+    metrics_spec = prepare_metrics_chart(history, markers=markers)
     if metrics_spec:
         try:
             metrics_path = run_paths.charts / "metrics.png"
