@@ -139,11 +139,23 @@ def colorize_comparison(
     if ref.shape != cand.shape:
         raise ValueError("Reference and candidate images must share the same shape")
 
-    overlap = np.minimum(ref, cand)
-    ref_only = np.clip(ref - overlap, 0.0, 1.0)
-    cand_only = np.clip(cand - overlap, 0.0, 1.0)
+    if ref.ndim == 2:
+        spatial_shape = ref.shape
+        ref_luma = ref
+        cand_luma = cand
+    elif ref.ndim == 3 and ref.shape[2] == 3:
+        spatial_shape = ref.shape[:2]
+        luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        ref_luma = np.tensordot(ref, luma_weights, axes=([-1], [0]))
+        cand_luma = np.tensordot(cand, luma_weights, axes=([-1], [0]))
+    else:
+        raise ValueError("Expected 2D grayscale or 3-channel RGB inputs")
 
-    color = np.zeros((*ref.shape, 3), dtype=np.float32)
+    overlap = np.minimum(ref_luma, cand_luma)
+    ref_only = np.clip(ref_luma - overlap, 0.0, 1.0)
+    cand_only = np.clip(cand_luma - overlap, 0.0, 1.0)
+
+    color = np.zeros((*spatial_shape, 3), dtype=np.float32)
     color[..., :] = overlap[..., None]
     color[..., 0] += cand_only  # red channel emphasises candidate-only content
     color[..., 2] += ref_only   # blue channel emphasises reference-only content

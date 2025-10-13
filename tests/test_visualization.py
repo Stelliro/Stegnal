@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 
-from umbra.visualization import multiplicative_overlap, normalize_for_display, to_uint8_image
+from umbra.visualization import (
+    colorize_comparison,
+    multiplicative_overlap,
+    normalize_for_display,
+    to_uint8_image,
+)
 
 
 def test_normalize_for_display_scales_between_zero_and_one():
@@ -44,3 +49,15 @@ def test_to_uint8_image_converts_range():
     assert converted.dtype == np.uint8
     assert converted[0, 0] == 0
     assert converted[1, 0] == 255
+
+
+def test_colorize_comparison_rgb_overlay_has_expected_shape():
+    height, width = 4, 5
+    reference = np.linspace(0.0, 1.0, height * width * 3, dtype=np.float32).reshape(height, width, 3)
+    candidate = reference[::-1]
+
+    overlay = colorize_comparison(reference, candidate)
+
+    assert overlay.shape == (height, width, 3)
+    assert overlay.dtype == np.float32
+    assert np.isfinite(overlay).all()
