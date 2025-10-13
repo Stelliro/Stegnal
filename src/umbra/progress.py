@@ -258,11 +258,23 @@ def prepare_trend_chart(
 
 def prepare_metrics_chart(
     history: Sequence[Mapping[str, float]],
+    *,
+    markers: Sequence[float | int] | None = None,
+    window: int | None = None,
+    auto_follow: bool = True,
 ) -> dict[str, object] | None:
     """Return a Vega-Lite spec visualising the performance history."""
 
     if len(history) < 2:
         return None
+
+    if window is not None and window <= 0:
+        window = None
+
+    start_index = 0
+    if window is not None and len(history) > window and auto_follow:
+        start_index = len(history) - window
+    sliced_history = history[start_index:]
 
     metric_labels = {
         "ai_overlap": "AI overlap (%)",
@@ -272,7 +284,7 @@ def prepare_metrics_chart(
     }
 
     values: list[dict[str, float | str]] = []
-    for index, entry in enumerate(history, start=1):
+    for offset, entry in enumerate(sliced_history, start=start_index + 1):
         for key, label in metric_labels.items():
             if key not in entry:
                 continue
@@ -282,7 +294,7 @@ def prepare_metrics_chart(
                 continue
             if not math.isfinite(numeric):
                 continue
-            values.append({"Step": float(index), "Metric": label, "Value": numeric})
+            values.append({"Step": float(offset), "Metric": label, "Value": numeric})
 
     if not values:
         return None
@@ -307,8 +319,8 @@ def prepare_metrics_chart(
     if y_domain[0] == y_domain[1]:
         return None
 
-    spec: dict[str, object] = {
-        "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+    schema = "https://vega.github.io/schema/vega-lite/v6.json"
+    base_layer: dict[str, object] = {
         "data": {"values": values},
         "mark": {"type": "line", "point": True},
         "encoding": {
@@ -331,8 +343,64 @@ def prepare_metrics_chart(
                 {"field": "Value", "type": "quantitative"},
             ],
         },
-        "config": {"legend": {"orient": "bottom", "title": ""}},
     }
+
+    config = {"legend": {"orient": "bottom", "title": ""}}
+
+    marker_values: list[dict[str, float]] = []
+    if markers:
+        seen_steps: set[float] = set()
+        x_min, x_max = x_domain
+        for raw_marker in markers:
+            try:
+                step = float(raw_marker)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(step):
+                continue
+            if step < x_min or step > x_max:
+                continue
+            if step in seen_steps:
+                continue
+            seen_steps.add(step)
+            marker_values.append({"Step": step})
+
+    if marker_values:
+        marker_layer = {
+            "data": {"values": marker_values},
+            "mark": {
+                "type": "rule",
+                "color": "#ff6f61",
+                "strokeWidth": 1.5,
+                "strokeDash": [6, 4],
+            },
+            "encoding": {
+                "x": {
+                    "field": "Step",
+                    "type": "quantitative",
+                    "title": "Observation",
+                },
+                "tooltip": [
+                    {
+                        "field": "Step",
+                        "type": "quantitative",
+                        "title": "Sound target",
+                    }
+                ],
+            },
+        }
+        spec: dict[str, object] = {
+            "$schema": schema,
+            "config": config,
+            "layer": [base_layer, marker_layer],
+            "resolve": {"scale": {"y": "shared"}},
+        }
+    else:
+        spec = {
+            "$schema": schema,
+            "config": config,
+            **base_layer,
+        }
 
     return spec
 
