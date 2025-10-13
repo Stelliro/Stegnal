@@ -313,13 +313,35 @@ def prepare_metrics_chart(
     if not varying_metrics:
         return None
 
+    values = [value for value in values if str(value["Metric"]) in varying_metrics]
+    if not values:
+        return None
+
     step_values = [value["Step"] for value in values]
-    score_values = [value["Value"] for value in values]
+
+    metric_stats: dict[str, tuple[float, float]] = {}
+    for entry in values:
+        label = str(entry["Metric"])
+        value = float(entry["Value"])
+        if label in metric_stats:
+            current_min, current_max = metric_stats[label]
+            metric_stats[label] = (min(current_min, value), max(current_max, value))
+        else:
+            metric_stats[label] = (value, value)
+
+    for entry in values:
+        label = str(entry["Metric"])
+        value = float(entry["Value"])
+        metric_min, metric_max = metric_stats[label]
+        span = metric_max - metric_min
+        if span <= 0:
+            scaled = 0.5
+        else:
+            scaled = (value - metric_min) / span
+        entry["ScaledValue"] = scaled
 
     x_domain = [min(step_values), max(step_values)]
-    y_domain = [min(score_values), max(score_values)]
-    if y_domain[0] == y_domain[1]:
-        return None
+    y_domain = [0.0, 1.0]
 
     schema = "https://vega.github.io/schema/vega-lite/v6.json"
     base_layer: dict[str, object] = {
@@ -332,16 +354,25 @@ def prepare_metrics_chart(
                 "scale": {"domain": x_domain},
             },
             "y": {
-                "field": "Value",
+                "field": "ScaledValue",
                 "type": "quantitative",
-                "title": "Score",
-                "scale": {"domain": y_domain},
+                "title": "Normalised score",
+                "scale": {"domain": y_domain, "nice": False},
             },
             "color": {"field": "Metric", "type": "nominal", "title": "Metric"},
             "tooltip": [
                 {"field": "Step", "type": "quantitative"},
                 {"field": "Metric", "type": "nominal"},
-                {"field": "Value", "type": "quantitative"},
+                {
+                    "field": "Value",
+                    "type": "quantitative",
+                    "title": "Score",
+                },
+                {
+                    "field": "ScaledValue",
+                    "type": "quantitative",
+                    "title": "Normalised score",
+                },
             ],
         },
     }

@@ -101,3 +101,39 @@ def test_prepare_metrics_chart_uses_root_dataset() -> None:
     marker_layer = spec["layer"][1]
     assert "data" not in base_layer
     assert marker_layer.get("data", {}).get("values") == [{"Step": 1.0}]
+    encoding = base_layer["encoding"]
+    assert encoding["y"]["field"] == "ScaledValue"
+    assert encoding["y"]["title"].lower().startswith("normalised")
+    assert encoding["y"]["scale"]["domain"] == [0.0, 1.0]
+    tooltip_titles = {item.get("title", item.get("field")) for item in encoding["tooltip"]}
+    assert "Score" in tooltip_titles
+    assert "Normalised score" in tooltip_titles
+
+
+def test_prepare_metrics_chart_scales_per_metric() -> None:
+    history = [
+        {
+            "ai_overlap": 80.0,
+            "ai_ssim": 0.50,
+            "ai_psnr": 30.0,
+            "sound_overlap": 82.0,
+        },
+        {
+            "ai_overlap": 81.0,
+            "ai_ssim": 0.51,
+            "ai_psnr": 31.0,
+            "sound_overlap": 82.1,
+        },
+    ]
+
+    spec = prepare_metrics_chart(history)
+
+    assert spec is not None
+    values = spec.get("data", {}).get("values", [])
+    assert values, "expected chart values"
+    metrics = {value["Metric"] for value in values}
+    assert "AI SSIM" in metrics
+    ssim_values = [value for value in values if value["Metric"] == "AI SSIM"]
+    overlap_values = [value for value in values if value["Metric"] == "AI overlap (%)"]
+    assert {entry["ScaledValue"] for entry in ssim_values} == {0.0, 1.0}
+    assert {entry["ScaledValue"] for entry in overlap_values} == {0.0, 1.0}
