@@ -4126,62 +4126,6 @@ def run() -> None:
         if available_charts:
             label_map = {"trend": "Trend chart", "metrics": "Metrics chart"}
             for key, chart_path in sorted(available_charts, key=lambda item: item[0]):
-                try:
-                    chart_bytes = chart_path.read_bytes()
-                except OSError:  # pragma: no cover - filesystem guard
-                    logger.exception("Failed to load chart %s for download", chart_path)
-                    continue
-                label = label_map.get(key, chart_path.stem.replace("_", " ").title())
-                st.download_button(
-                    label=f"Download {label}",
-                    data=chart_bytes,
-                    file_name=chart_path.name,
-                    mime="image/png",
-                    key=f"download_{key}_chart",
-                )
-        else:
-            st.caption("Charts will appear once evolution has enough history to plot.")
-
-    available_charts: list[tuple[str, Path]] = []
-    for key, path_str in chart_files.items():
-        if not isinstance(path_str, str):
-            continue
-        chart_path = Path(path_str)
-        if chart_path.exists():
-            available_charts.append((key, chart_path))
-
-    with st.sidebar.expander("Chart exports", expanded=False):
-        if available_charts:
-            label_map = {"trend": "Trend chart", "metrics": "Metrics chart"}
-            for key, chart_path in sorted(available_charts, key=lambda item: item[0]):
-                try:
-                    chart_bytes = chart_path.read_bytes()
-                except OSError:  # pragma: no cover - filesystem guard
-                    logger.exception("Failed to load chart %s for download", chart_path)
-                    continue
-                label = label_map.get(key, chart_path.stem.replace("_", " ").title())
-                st.download_button(
-                    label=f"Download {label}",
-                    data=chart_bytes,
-                    file_name=chart_path.name,
-                    mime="image/png",
-                    key=f"download_{key}_chart",
-                )
-        else:
-            st.caption("Charts will appear once evolution has enough history to plot.")
-
-    available_charts: list[tuple[str, Path]] = []
-    for key, path_str in chart_files.items():
-        if not isinstance(path_str, str):
-            continue
-        chart_path = Path(path_str)
-        if chart_path.exists():
-            available_charts.append((key, chart_path))
-
-    with st.sidebar.expander("Chart exports", expanded=False):
-        if available_charts:
-            label_map = {"trend": "Trend chart", "metrics": "Metrics chart"}
-            for key, chart_path in sorted(available_charts, key=lambda item: item[0]):
                 cache_key = f"{key}:{chart_path}"
                 cached_entry = download_cache.get(cache_key)
                 try:
