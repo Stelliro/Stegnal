@@ -3374,7 +3374,6 @@ def run() -> None:
                     " the channel, while the decoder adapts its denoise level."
                 ),
             )
-        )
         autosave_interval = int(
             max(1, hyper_profile.autosave_interval or autosave_interval)
         )
