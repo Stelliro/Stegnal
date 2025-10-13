@@ -26,24 +26,40 @@ def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
         return np.asarray(channel, dtype=np.float32)
 
     arr = np.asarray(channel, dtype=np.float32)
-    h, w = arr.shape
+
+    if arr.ndim not in (2, 3):
+        raise ValueError("Expected a 2D array or an RGB image for block averaging")
+
+    h, w = arr.shape[:2]
+    channels = 1 if arr.ndim == 2 else arr.shape[2]
 
     pad_h = (block_size - (h % block_size)) % block_size
     pad_w = (block_size - (w % block_size)) % block_size
+
+    pad_width = ((0, pad_h), (0, pad_w)) + (() if arr.ndim == 2 else ((0, 0),))
     if pad_h or pad_w:
-        pad = np.pad(
-            arr,
-            ((0, pad_h), (0, pad_w)),
-            mode="edge",
-        )
+        pad = np.pad(arr, pad_width, mode="edge")
     else:
         pad = arr
 
-    ph, pw = pad.shape
-    reshaped = pad.reshape(ph // block_size, block_size, pw // block_size, block_size)
+    ph, pw = pad.shape[:2]
+    if arr.ndim == 2:
+        reshaped = pad.reshape(ph // block_size, block_size, pw // block_size, block_size)
+        block_means = reshaped.mean(axis=(1, 3))
+        expanded = np.repeat(np.repeat(block_means, block_size, axis=0), block_size, axis=1)
+        result = expanded[:h, :w]
+        return result.astype(np.float32)
+
+    reshaped = pad.reshape(
+        ph // block_size,
+        block_size,
+        pw // block_size,
+        block_size,
+        channels,
+    )
     block_means = reshaped.mean(axis=(1, 3))
     expanded = np.repeat(np.repeat(block_means, block_size, axis=0), block_size, axis=1)
-    result = expanded[:h, :w]
+    result = expanded[:h, :w, :]
     return result.astype(np.float32)
 
 
@@ -140,11 +156,9 @@ def colorize_comparison(
         raise ValueError("Reference and candidate images must share the same shape")
 
     if ref.ndim == 2:
-        spatial_shape = ref.shape
         ref_luma = ref
         cand_luma = cand
     elif ref.ndim == 3 and ref.shape[2] == 3:
-        spatial_shape = ref.shape[:2]
         luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
         ref_luma = np.tensordot(ref, luma_weights, axes=([-1], [0]))
         cand_luma = np.tensordot(cand, luma_weights, axes=([-1], [0]))
@@ -155,17 +169,14 @@ def colorize_comparison(
     ref_only = np.clip(ref_luma - overlap, 0.0, 1.0)
     cand_only = np.clip(cand_luma - overlap, 0.0, 1.0)
 
-    color = np.zeros((*spatial_shape, 3), dtype=np.float32)
-    color[..., :] = overlap[..., None]
-    color[..., 0] += cand_only  # red channel emphasises candidate-only content
-    color[..., 2] += ref_only   # blue channel emphasises reference-only content
-    color = np.clip(color, 0.0, 1.0)
+    color = np.repeat(overlap[..., None], 3, axis=-1)
+    color[..., 0] = np.clip(color[..., 0] + cand_only, 0.0, 1.0)
+    color[..., 2] = np.clip(color[..., 2] + ref_only, 0.0, 1.0)
 
     if block_size > 1:
-        for channel in range(3):
-            color[..., channel] = _block_average(color[..., channel], block_size)
+        color = _block_average(color, block_size)
 
-    return color.astype(np.float32)
+    return np.clip(color, 0.0, 1.0).astype(np.float32)
 
 
 __all__ = [

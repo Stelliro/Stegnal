@@ -61,3 +61,15 @@ def test_colorize_comparison_rgb_overlay_has_expected_shape():
     assert overlay.shape == (height, width, 3)
     assert overlay.dtype == np.float32
     assert np.isfinite(overlay).all()
+
+
+def test_colorize_comparison_block_average_preserves_rgb_shape():
+    height, width = 6, 6
+    reference = np.linspace(0.0, 1.0, height * width, dtype=np.float32).reshape(height, width)
+    candidate = reference.T
+
+    overlay = colorize_comparison(reference, candidate, block_size=3)
+
+    assert overlay.shape == (height, width, 3)
+    assert overlay.dtype == np.float32
+    assert np.isfinite(overlay).all()
