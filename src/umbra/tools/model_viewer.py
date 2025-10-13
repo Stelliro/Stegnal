@@ -177,22 +177,33 @@ def _summarise_stats(stats: Mapping[str, Any]) -> str:
                     float(ai.get("ssim", 0.0)),
                 )
             )
-        sound = metrics.get("sound_vs_reference")
-        if isinstance(sound, Mapping):
+        sound_ai = metrics.get("sound_vs_ai")
+        if isinstance(sound_ai, Mapping):
+            sections.append(
+                "Sound vs AI: PSNR={:.2f} dB, SSIM={:.3f}".format(
+                    float(sound_ai.get("psnr", 0.0)),
+                    float(sound_ai.get("ssim", 0.0)),
+                )
+            )
+        sound_ref = metrics.get("sound_vs_reference")
+        if isinstance(sound_ref, Mapping):
             sections.append(
                 "Sound vs reference: PSNR={:.2f} dB, SSIM={:.3f}".format(
-                    float(sound.get("psnr", 0.0)),
-                    float(sound.get("ssim", 0.0)),
+                    float(sound_ref.get("psnr", 0.0)),
+                    float(sound_ref.get("ssim", 0.0)),
                 )
             )
         overlap = metrics.get("overlap")
         if isinstance(overlap, Mapping):
-            sections.append(
-                "Overlap: AI={:.1f}%, Sound={:.1f}%".format(
-                    float(overlap.get("ai_vs_reference", 0.0)),
-                    float(overlap.get("sound_vs_reference", 0.0)),
-                )
-            )
+            ai_overlap = float(overlap.get("ai_vs_reference", 0.0))
+            sound_ai_overlap = overlap.get("sound_vs_ai")
+            sound_ref_overlap = overlap.get("sound_vs_reference")
+            parts = [f"AI={ai_overlap:.1f}%"]
+            if sound_ai_overlap is not None:
+                parts.append(f"Sound↔AI={float(sound_ai_overlap):.1f}%")
+            if sound_ref_overlap is not None:
+                parts.append(f"Sound↔Ref={float(sound_ref_overlap):.1f}%")
+            sections.append("Overlap: " + ", ".join(parts))
     manager = stats.get("manager")
     if isinstance(manager, Mapping):
         sections.append(

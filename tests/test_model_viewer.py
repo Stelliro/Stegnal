@@ -9,7 +9,12 @@ def test_compute_total_score_with_metrics() -> None:
     stats = {
         "metrics": {
             "ai_vs_reference": {"psnr": 14.0, "ssim": 0.82},
-            "overlap": {"ai_vs_reference": 67.0, "sound_vs_reference": 65.0},
+            "sound_vs_ai": {"psnr": 13.2, "ssim": 0.78},
+            "overlap": {
+                "ai_vs_reference": 67.0,
+                "sound_vs_ai": 66.0,
+                "sound_vs_reference": 65.0,
+            },
             "global_pooled": {"psnr": 13.5},
         },
         "manager": {

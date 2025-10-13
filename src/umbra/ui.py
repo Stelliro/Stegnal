@@ -530,6 +530,7 @@ def _render_quick_start_wizard(
 
     target_container = container or st.container()
     easy_mode = bool(state.get("easy_mode", True))
+    state.setdefault("quick_start_infinite_preference", False)
 
     easy_mode = target_container.toggle(
         "Easy mode",
@@ -669,6 +670,20 @@ def _render_quick_start_wizard(
         save_button = secondary_row[1].button("Save", use_container_width=True, key="quick_start_save")
         reload_button = st.button("Reload autosave", use_container_width=True, key="quick_start_reload")
 
+        infinite_preference = st.toggle(
+            "Keep running until I press Pause",
+            value=bool(state.get("quick_start_infinite_preference", False)),
+            help=(
+                "Schedule new generations automatically without a queue so Umbra runs continuously"
+                " until you hit Pause."
+            ),
+            key="quick_start_infinite_toggle",
+        )
+        state["quick_start_infinite_preference"] = bool(infinite_preference)
+        if not infinite_preference and state.get("run_infinite", False):
+            state["run_infinite"] = False
+            state["evolution_mode"] = "Finite"
+
         metrics_cols = st.columns(2)
         metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
         metrics_cols[1].metric("Difficulty target", f"{desired_target * 100:.0f}%")
@@ -708,8 +723,6 @@ def _render_quick_start_wizard(
         state["difficulty_mode"] = balanced_name
         state["population_size"] = auto_settings["population_size"]
         state["difficulty_target_override"] = auto_settings["difficulty_target"]
-        state["run_infinite"] = False
-        state["evolution_mode"] = "Finite"
         state["_easy_mode_defaults_applied"] = True
         if hyper_profile is None:
             state["generations_to_queue"] = auto_settings["generations_to_queue"]
@@ -2183,21 +2196,24 @@ def _record_performance_history(
     ai_ssim: float,
     ai_psnr: float,
     sound_overlap: float,
+    *,
+    sound_reference_overlap: float | None = None,
 ) -> list[dict[str, float]]:
     """Track recent reconstruction metrics for adaptive scheduling."""
 
     history: list[dict[str, float]] = list(state.get("performance_history", []))
     observation = int(state.get("_performance_observation", 0)) + 1
     state["_performance_observation"] = observation
-    history.append(
-        {
-            "ai_overlap": float(ai_overlap),
-            "ai_ssim": float(ai_ssim),
-            "ai_psnr": float(ai_psnr),
-            "sound_overlap": float(sound_overlap),
-            "step": float(observation),
-        }
-    )
+    record = {
+        "ai_overlap": float(ai_overlap),
+        "ai_ssim": float(ai_ssim),
+        "ai_psnr": float(ai_psnr),
+        "sound_overlap": float(sound_overlap),
+        "step": float(observation),
+    }
+    if sound_reference_overlap is not None:
+        record["sound_reference_overlap"] = float(sound_reference_overlap)
+    history.append(record)
     if len(history) > _PERFORMANCE_HISTORY:
         history = history[-_PERFORMANCE_HISTORY:]
     earliest_step = float(history[0].get("step", 1.0)) if history else 1.0
@@ -2374,9 +2390,11 @@ def _session_export_payload(
     manager: EvolutionManager,
     metrics: ReconstructionMetrics,
     sound_metrics: ReconstructionMetrics,
+    sound_reference_metrics: ReconstructionMetrics,
     ai_sound_alignment: ReconstructionMetrics,
     ai_overlap_score: float,
     sound_overlap_score: float,
+    sound_reference_overlap: float,
     sound_clip: Any,
     base_encoder_sigma: float,
     base_decoder_sigma: float,
@@ -2434,11 +2452,13 @@ def _session_export_payload(
 
     metrics_block = {
         "ai_vs_reference": metrics.as_dict(),
-        "sound_vs_reference": sound_metrics.as_dict(),
+        "sound_vs_ai": sound_metrics.as_dict(),
+        "sound_vs_reference": sound_reference_metrics.as_dict(),
         "ai_vs_sound": ai_sound_alignment.as_dict(),
         "overlap": {
             "ai_vs_reference": float(ai_overlap_score),
-            "sound_vs_reference": float(sound_overlap_score),
+            "sound_vs_ai": float(sound_overlap_score),
+            "sound_vs_reference": float(sound_reference_overlap),
         },
         "global_pooled": {
             "psnr": float(metrics.psnr),
@@ -3043,13 +3063,15 @@ def run() -> None:
 
     _, ai_overlap_score = multiplicative_overlap(original, reconstructed)
     ai_overlap_color = colorize_comparison(original, reconstructed)
-    _, sound_overlap_score = multiplicative_overlap(original, sound_reconstruction)
-    sound_overlap_color = colorize_comparison(original, sound_reconstruction)
-    cross_overlap_color = colorize_comparison(reconstructed, sound_reconstruction)
+    _, sound_reference_overlap = multiplicative_overlap(original, sound_reconstruction)
+    sound_reference_overlap_color = colorize_comparison(original, sound_reconstruction)
+    _, sound_overlap_score = multiplicative_overlap(reconstructed, sound_reconstruction)
+    sound_overlap_color = colorize_comparison(reconstructed, sound_reconstruction)
 
     metrics = compute_metrics(colored_original, ai_colored)
-    sound_metrics = compute_metrics(colored_original, sound_colored)
     ai_sound_alignment = compute_metrics(ai_colored, sound_colored)
+    sound_reference_metrics = compute_metrics(colored_original, sound_colored)
+    sound_metrics = ai_sound_alignment
 
     with progress_tab:
         st.subheader("Sound profile")
@@ -3126,36 +3148,36 @@ def run() -> None:
         sound_metrics_cols = st.columns(3)
         with sound_metrics_cols[0]:
             _render_metric_visual(
-                "How clear the sound-guided picture looks",
+                "How closely the sound picture tracks the AI",
                 float(sound_metrics.psnr),
                 value_display=f"{sound_metrics.psnr:.2f} dB",
                 scale_min=10.0,
                 scale_max=50.0,
-                good_range=(28.0, 35.0),
-                caption="30 dB+ suggests the audio reconstruction keeps things sharp.",
-                tooltip="PSNR for the sound-generated frame; higher is clearer.",
+                good_range=(26.0, 32.0),
+                caption="Higher PSNR means the sound-driven reconstruction preserves the AI's brightness cues.",
+                tooltip="PSNR between the sound-only reconstruction and the AI reconstruction.",
             )
         with sound_metrics_cols[1]:
             _render_metric_visual(
-                "How closely sound colours follow the original",
+                "How closely sound details follow the AI",
                 float(sound_metrics.ssim),
                 value_display=f"{sound_metrics.ssim:.3f}",
                 scale_min=0.0,
                 scale_max=1.0,
                 good_range=(0.75, 0.9),
-                caption="Try to stay near 0.9 to keep hues and textures faithful.",
-                tooltip="SSIM for the sound reconstruction; 1.0 is identical.",
+                caption="Staying near 0.9 means the audio reconstruction mirrors the AI's structure.",
+                tooltip="SSIM between the sound-only reconstruction and the AI reconstruction.",
             )
         with sound_metrics_cols[2]:
             _render_metric_visual(
-                "How much the sound shapes line up",
+                "How much the sound shapes line up with the AI",
                 float(sound_overlap_score),
                 value_display=f"{sound_overlap_score:.1f}%",
                 scale_min=0.0,
                 scale_max=100.0,
-                good_range=(50.0, 70.0),
-                caption="Higher overlap means the sonic cues nailed the silhouettes.",
-                tooltip="Overlap measures shared highlights between original and audio-driven images.",
+                good_range=(60.0, 85.0),
+                caption="Higher overlap means the sonic cues align with the AI prediction.",
+                tooltip="Overlap measures shared highlights between the sound-only and AI reconstructions.",
             )
 
         _render_metric_visual(
@@ -3196,6 +3218,7 @@ def run() -> None:
         float(metrics.ssim),
         float(metrics.psnr),
         float(sound_overlap_score),
+        sound_reference_overlap=float(sound_reference_overlap),
     )
     markers: list[int] = list(state.get("_sound_target_markers", []))
     metrics_spec = prepare_metrics_chart(history, markers=markers)
@@ -3366,8 +3389,8 @@ def run() -> None:
         overlay_row = [
             (noise_display, "Predicted noise contribution"),
             (ai_overlap_color, "Colour overlap: AI vs original"),
-            (sound_overlap_color, "Colour overlap: Sound vs original"),
-            (cross_overlap_color, "Colour overlap: AI vs sound"),
+            (sound_overlap_color, "Colour overlap: Sound vs AI"),
+            (sound_reference_overlap_color, "Colour overlap: Sound vs original"),
         ]
 
         for columns, content in ((st.columns(4), overview_row), (st.columns(4), overlay_row)):
@@ -3497,7 +3520,7 @@ def run() -> None:
         state["population_size"] = population_size
         state["generations_to_queue"] = generations_to_queue
         state["autosave_interval"] = autosave_interval
-        state["evolution_mode"] = "Finite"
+        state["evolution_mode"] = "Infinite" if state.get("run_infinite", False) else "Finite"
     if state.get("adversarial_enabled", False) and "adversarial" not in state:
         state["adversarial"] = AdversarialManager()
 
@@ -3604,10 +3627,17 @@ def run() -> None:
     run_store: RunStore = state["run_store"]
 
     if run_button:
-        state["pending_generations"] = generations_to_queue
-        state["run_infinite"] = False
-        state["evolution_mode"] = "Finite"
-        logger.info("Queued %d generations for finite evolution", generations_to_queue)
+        infinite_preference = bool(state.get("quick_start_infinite_preference", False))
+        if infinite_preference:
+            state["pending_generations"] = 0
+            state["run_infinite"] = True
+            state["evolution_mode"] = "Infinite"
+            logger.info("Starting continuous evolution; will run until paused")
+        else:
+            state["pending_generations"] = generations_to_queue
+            state["run_infinite"] = False
+            state["evolution_mode"] = "Finite"
+            logger.info("Queued %d generations for finite evolution", generations_to_queue)
         _sync_active_tree_state(state)
         if not state.get("active_run_id"):
             new_run_id = run_store.start_run()
@@ -4212,9 +4242,11 @@ def run() -> None:
         manager=manager,
         metrics=metrics,
         sound_metrics=sound_metrics,
+        sound_reference_metrics=sound_reference_metrics,
         ai_sound_alignment=ai_sound_alignment,
         ai_overlap_score=ai_overlap_score,
         sound_overlap_score=sound_overlap_score,
+        sound_reference_overlap=sound_reference_overlap,
         sound_clip=sound_clip,
         base_encoder_sigma=base_encoder_sigma,
         base_decoder_sigma=base_decoder_sigma,

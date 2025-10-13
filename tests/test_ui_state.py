@@ -225,9 +225,11 @@ def test_session_export_payload_contains_provenance(monkeypatch) -> None:
         manager=manager,
         metrics=metrics,
         sound_metrics=metrics,
+        sound_reference_metrics=metrics,
         ai_sound_alignment=metrics,
         ai_overlap_score=best_candidate.overlap_score,
         sound_overlap_score=best_candidate.overlap_score,
+        sound_reference_overlap=best_candidate.overlap_score,
         sound_clip=sound_clip,
         base_encoder_sigma=0.2,
         base_decoder_sigma=1.0,
@@ -252,6 +254,9 @@ def test_session_export_payload_contains_provenance(monkeypatch) -> None:
     assert "provenance" in payload
     assert "random_seeds" in payload["provenance"]
     metrics_block = payload["metrics"]
+    assert "sound_vs_ai" in metrics_block
+    assert "sound_vs_reference" in metrics_block
+    assert "sound_vs_ai" in metrics_block["overlap"]
     assert metrics_block["global_pooled"]["desc"] == "pooled/global comparator"
     assert metrics_block["per_candidate_strict"]["desc"] == "gallery/best-candidate strict comparator"
     difficulty_block = payload["difficulty"]
