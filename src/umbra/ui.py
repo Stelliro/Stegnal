@@ -1699,6 +1699,52 @@ def _record_performance_history(
     return history
 
 
+def _append_global_progress_row(
+    state: st.session_state,
+    manager: EvolutionManager,
+    row: Mapping[str, Any],
+) -> None:
+    """Persist a generation summary in a cumulative timeline across runs."""
+
+    history: list[dict[str, Any]] = list(state.get("_global_progress_history", []))
+    index_map: dict[str, int] = dict(state.get("_global_progress_index", {}))
+
+    try:
+        run_generation = int(row.get("Generation", len(history)))
+    except (TypeError, ValueError):
+        run_generation = len(history)
+
+    progress_key = f"{manager.run_id}:{run_generation}"
+
+    base_entry: dict[str, Any] = dict(row)
+    base_entry["_run_id"] = manager.run_id
+    base_entry["_run_generation"] = run_generation
+    base_entry["_run_seed"] = int(getattr(manager, "base_seed", 0))
+
+    existing_index = index_map.get(progress_key)
+    if existing_index is not None and 0 <= existing_index < len(history):
+        preserved_step = history[existing_index].get("Generation", existing_index + 1)
+        merged = dict(history[existing_index])
+        merged.update(base_entry)
+        merged["Generation"] = preserved_step
+        history[existing_index] = merged
+        state["_global_progress_history"] = history
+        state["_global_progress_index"] = index_map
+        return
+    if existing_index is not None:
+        index_map.pop(progress_key, None)
+
+    global_step = int(state.get("_global_progress_step", 0)) + 1
+    state["_global_progress_step"] = global_step
+
+    base_entry["Generation"] = float(global_step)
+    history.append(base_entry)
+    index_map[progress_key] = len(history) - 1
+
+    state["_global_progress_history"] = history
+    state["_global_progress_index"] = index_map
+
+
 def _derive_difficulty_metrics(
     history: list[dict[str, float]]
 ) -> tuple[float, float, float, float]:
@@ -2872,13 +2918,13 @@ def run() -> None:
                     ),
                 }
                 if record.checkpoint_tag:
-                    row["checkpoint_tag"] = record.checkpoint_tag
+                    row["_checkpoint_tag"] = record.checkpoint_tag
                 generation_progress_rows.append(row)
+                _append_global_progress_row(state, manager, row)
 
-            if generation_progress_rows:
-                sanitized_rows, dropped_values = sanitize_progress_rows(
-                    generation_progress_rows
-                )
+            global_history: list[dict[str, Any]] = state.get("_global_progress_history", [])
+            if global_history:
+                sanitized_rows, dropped_values = sanitize_progress_rows(global_history)
                 spec, message = prepare_trend_chart(
                     sanitized_rows, had_non_finite=dropped_values
                 )
@@ -2899,6 +2945,8 @@ def run() -> None:
                     chart_files.pop("trend", None)
                 if message:
                     st.caption(message)
+            else:
+                chart_files.pop("trend", None)
 
             gen_indices = [record.index for record in manager.generations]
             default_gen = gen_indices[-1]

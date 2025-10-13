@@ -30,6 +30,8 @@ def sanitize_progress_rows(
         for key, value in row.items():
             if key == "Generation":
                 continue
+            if key.startswith("_"):
+                continue
             try:
                 numeric = float(value)
             except (TypeError, ValueError):
@@ -83,18 +85,41 @@ def prepare_trend_chart(
     if not metrics:
         return None, "Trend chart requires metric columns to display."
 
-    values: list[dict[str, float]] = []
+    values: list[dict[str, object]] = []
     for row in rows:
         generation = row["Generation"]
+        if generation is None:
+            continue
+        try:
+            generation_value = float(generation)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(generation_value) or generation_value < 0:
+            logger.debug("Skipping negative generation value: %s", generation)
+            continue
         for metric in metrics:
             if metric in row:
-                values.append(
-                    {
-                        "Generation": generation,
-                        "Metric": metric,
-                        "Value": row[metric],
-                    }
-                )
+                entry: dict[str, object] = {
+                    "Generation": generation_value,
+                    "Metric": metric,
+                    "Value": row[metric],
+                }
+                run_id = row.get("_run_id")
+                if run_id is not None:
+                    entry["Run"] = str(run_id)
+                run_generation = row.get("_run_generation")
+                if run_generation is not None:
+                    try:
+                        entry["Run generation"] = float(run_generation)
+                    except (TypeError, ValueError):
+                        pass
+                run_seed = row.get("_run_seed")
+                if run_seed is not None:
+                    try:
+                        entry["Run seed"] = float(run_seed)
+                    except (TypeError, ValueError):
+                        pass
+                values.append(entry)
 
     filtered_values = []
     for entry in values:
@@ -119,8 +144,8 @@ def prepare_trend_chart(
     if not metrics_with_data:
         return None, "Trend chart requires metric columns to display."
 
-    generation_values = [entry["Generation"] for entry in filtered_values]
-    unique_generations = len(set(generation_values))
+    raw_generations = [entry["Generation"] for entry in filtered_values]
+    unique_generations = len(set(raw_generations))
 
     metric_variations = [
         len({entry["Value"] for entry in filtered_values if entry["Metric"] == metric}) > 1
@@ -131,12 +156,58 @@ def prepare_trend_chart(
         return None, "Trend chart will appear once multiple non-identical generations are available."
 
     score_values = [entry["Value"] for entry in filtered_values]
-    x_domain = [min(generation_values), max(generation_values)]
+    x_min_raw = min(raw_generations)
+    x_max_raw = max(raw_generations)
+    use_log_scale = x_max_raw >= 10
+
+    generation_values = list(raw_generations)
+    if use_log_scale and generation_values:
+        if x_min_raw <= 0:
+            shift = 1.0 - x_min_raw
+            for entry in filtered_values:
+                entry["Generation"] = float(entry["Generation"]) + shift
+            generation_values = [entry["Generation"] for entry in filtered_values]
+        x_min = min(generation_values)
+        x_max = max(generation_values)
+    else:
+        x_min = x_min_raw
+        x_max = x_max_raw
+        use_log_scale = False
+
+    x_domain = [x_min, x_max]
     y_min = min(score_values)
     y_max = max(score_values)
 
     if y_min == y_max:
         return None, "Trend chart will appear once multiple non-identical generations are available."
+
+    tooltip_fields = [
+        {
+            "field": "Generation",
+            "type": "quantitative",
+            "title": "Cumulative generation",
+        },
+        {"field": "Metric", "type": "nominal", "title": "Metric"},
+        {"field": "Value", "type": "quantitative", "title": "Score"},
+    ]
+
+    if any("Run" in entry for entry in filtered_values):
+        tooltip_fields.append({"field": "Run", "type": "nominal", "title": "Run"})
+    if any("Run generation" in entry for entry in filtered_values):
+        tooltip_fields.append(
+            {"field": "Run generation", "type": "quantitative", "title": "Run generation"}
+        )
+    if any("Run seed" in entry for entry in filtered_values):
+        tooltip_fields.append(
+            {"field": "Run seed", "type": "quantitative", "title": "Run seed"}
+        )
+
+    log_min = math.floor(math.log10(x_min)) if x_min > 0 else 0
+    log_max = math.ceil(math.log10(x_max)) if x_max > 0 else 0
+    tick_values = [10 ** power for power in range(log_min, log_max + 1)]
+    tick_values = [value for value in tick_values if x_min <= value <= x_max]
+    if use_log_scale and not tick_values:
+        tick_values = [x_min, x_max]
 
     spec = {
         "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
@@ -144,14 +215,14 @@ def prepare_trend_chart(
         "autosize": {"type": "fit", "contains": "padding"},
         "mark": {"type": "line", "point": True},
         "encoding": {
-            "x": {"field": "Generation", "type": "quantitative", "title": "Generation"},
+            "x": {
+                "field": "Generation",
+                "type": "quantitative",
+                "title": "Cumulative generation",
+            },
             "y": {"field": "Value", "type": "quantitative", "title": "Score"},
             "color": {"field": "Metric", "type": "nominal", "title": "Metric"},
-            "tooltip": [
-                {"field": "Generation", "type": "quantitative"},
-                {"field": "Metric", "type": "nominal"},
-                {"field": "Value", "type": "quantitative"},
-            ],
+            "tooltip": tooltip_fields,
         },
         "config": {"legend": {"orient": "bottom", "title": ""}},
         "usermeta": {
@@ -168,7 +239,13 @@ def prepare_trend_chart(
         },
     }
 
-    spec["encoding"]["x"]["scale"] = {"domain": x_domain}
+    if use_log_scale:
+        x_scale: dict[str, object] = {"domain": x_domain, "type": "log", "base": 10}
+        spec["encoding"]["x"]["scale"] = x_scale
+        if tick_values:
+            spec["encoding"]["x"]["axis"] = {"values": tick_values, "format": "s"}
+    else:
+        spec["encoding"]["x"]["scale"] = {"domain": x_domain}
     spec["encoding"]["y"]["scale"] = {"domain": [y_min, y_max]}
 
     logger.debug(
