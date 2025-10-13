@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from streamlit.delta_generator import DeltaGenerator
 
 from umbra.chart_export import export_chart_png
-# Removed: from umbra.adversarial import...
+from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.codec import (
     decode_waveform_to_image,
     encode_image_to_waveform,
@@ -43,7 +43,7 @@ from umbra.evolution import (
 )
 from umbra.logging_utils import collect_provenance, configure_logging
 from umbra.metrics import ReconstructionMetrics, compute_metrics
-# Removed: from umbra.neural import...
+from umbra.neural import NeuralRewardModel
 from umbra.predictor import predict_image_from_waveform
 from umbra.progress import prepare_metrics_chart, prepare_trend_chart, sanitize_progress_rows
 from umbra.reconstruction import (
@@ -465,7 +465,7 @@ def _apply_auto_pause(
 
     if infinite_requested:
         return (
-            "Difficulty spike detected – Keep Improving will continue running; "
+            "Difficulty spike detected – infinite mode will continue running; "
             "refresh the scene manually if desired."
         )
 
@@ -1718,8 +1718,8 @@ def _should_schedule_rerun(
 ) -> bool:
     """Return ``True`` when the Streamlit app should immediately rerun.
 
-    The previous implementation only considered Keep Improving when no finite work had
-    been scheduled for the current tick. If a user switched to Keep Improving while a
+    The previous implementation only considered infinite mode when no finite work had
+    been scheduled for the current tick. If a user switched to infinite mode while a
     finite backlog was still draining, the rerun condition short-circuited and the UI
     stopped scheduling additional generations once the backlog reached zero. By
     checking the infinite flag independently of the finite queue we guarantee that the
@@ -3570,7 +3570,7 @@ def run() -> None:
         unsafe_allow_html=True,
     )
 
-    # Ensure Keep Improving keeps ticking by scheduling a rerun after work
+    # Ensure infinite mode keeps ticking by scheduling a rerun after work
     if trigger_rerun:
         logger.debug("Scheduling rerun for continued evolution")
         _trigger_rerun()
@@ -3591,5 +3591,3 @@ def main() -> None:  # pragma: no cover - delegated to Streamlit runtime
 
 if __name__ == "__main__":  # pragma: no cover - CLI hook
     main()
-
-
