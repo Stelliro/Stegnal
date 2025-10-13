@@ -2558,20 +2558,6 @@ def run() -> None:
         difficulty_progress=difficulty_progress,
         hyper_profile=hyper_profile,
     )
-    with quick_tab:
-        (
-            run_button,
-            stop_button,
-            reset_button,
-            save_button,
-            reload_button,
-            auto_settings,
-        ) = _render_quick_start_wizard(
-            state,
-            quick_tab,
-            difficulty_progress=difficulty_progress,
-            hyper_profile=hyper_profile,
-        )
     state["_latest_auto_settings"] = auto_settings
 
     _render_demo_lab(state, demo_tab)
