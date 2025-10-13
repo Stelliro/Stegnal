@@ -525,6 +525,19 @@ def _render_quick_start_wizard(
     """Render the staged quick-start controls inside ``container``."""
 
     target_container = container or st.container()
+    defaults_applied = bool(state.get("_easy_mode_defaults_applied", False))
+    easy_mode = bool(state.get("easy_mode", True))
+
+    easy_mode = target_container.toggle(
+        "Easy mode",
+        value=easy_mode,
+        help=(
+            "Keep Umbra in guided mode with balanced difficulty and autosave pacing. "
+            "Disable to unlock manual control over evolution settings."
+        ),
+        key="quick_start_easy_mode",
+    )
+    state["easy_mode"] = easy_mode
     mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
     if "difficulty_mode" not in state or state.get("difficulty_mode") not in mode_names:
         default_idx = 1 if len(mode_names) > 1 else 0
