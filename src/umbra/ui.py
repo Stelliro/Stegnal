@@ -117,6 +117,7 @@ download_cache: dict[str, dict[str, Any]] = {}
 
 
 _PINTEREST_DEFAULT_FEEDS: tuple[str, ...] = (
+    "https://au.pinterest.com/search/pins/?q=space&rs=typed",
     "https://www.pinterest.com/pinterest/official-news.rss",
     "https://www.pinterest.com/pinterest/engagement.rss",
     "https://www.pinterest.com/pinterest/creative.rss",
@@ -125,6 +126,15 @@ _PINTEREST_DEFAULT_FEEDS: tuple[str, ...] = (
 _PINTEREST_IMAGE_PATTERN = re.compile(
     r"(?:src|data-pin-media)=\"(https://i\.pinimg\.com[^\"]+)\"",
     flags=re.IGNORECASE,
+)
+_PINTEREST_IMAGE_TAG_PATTERN = re.compile(
+    r"<img[^>]+(?:data-pin-media|data-src|src)=['\"](?P<url>https://i\.pinimg\.com[^'\"]+)['\"][^>]*"
+    r"(?:alt=['\"](?P<title>[^'\"]+)['\"])?",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_PINTEREST_JSON_SCRIPT_PATTERN = re.compile(
+    r"<script[^>]*type=['\"]application/json['\"][^>]*>(.*?)</script>",
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 _PINTEREST_USER_AGENT = (
@@ -238,17 +248,33 @@ def _normalize_pinterest_source(source: str | None) -> str:
 
 
 def _parse_pinterest_feed(feed_data: bytes | str) -> list[tuple[str, str]]:
-    """Extract ``(image_url, title)`` pairs from Pinterest RSS content."""
+    """Extract ``(image_url, title)`` pairs from Pinterest RSS or HTML content."""
 
     if isinstance(feed_data, bytes):
         text = feed_data.decode("utf-8", errors="replace")
     else:
         text = feed_data
 
+    candidates = _parse_pinterest_feed_xml(text)
+    if not candidates:
+        candidates = _parse_pinterest_html(text)
+
+    if not candidates:
+        raise ValueError("Unable to parse Pinterest feed XML")
+
+    deduped: OrderedDict[str, str] = OrderedDict()
+    for url, label in candidates:
+        normalized_url = _normalize_pinterest_url(url)
+        if normalized_url not in deduped:
+            deduped[normalized_url] = label
+    return list(deduped.items())
+
+
+def _parse_pinterest_feed_xml(text: str) -> list[tuple[str, str]]:
     try:
         root = ET.fromstring(text)
-    except ET.ParseError as exc:
-        raise ValueError("Unable to parse Pinterest feed XML") from exc
+    except ET.ParseError:
+        return []
 
     channel = root.find("channel")
     items = channel.findall("item") if channel is not None else root.findall(".//item")
@@ -265,12 +291,63 @@ def _parse_pinterest_feed(feed_data: bytes | str) -> list[tuple[str, str]]:
         description = item.findtext("description") or ""
         for match in _PINTEREST_IMAGE_PATTERN.findall(description):
             candidates.append((match, title))
+    return candidates
 
-    deduped: OrderedDict[str, str] = OrderedDict()
-    for url, label in candidates:
-        if url not in deduped:
-            deduped[url] = label
-    return list(deduped.items())
+
+def _parse_pinterest_html(text: str) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+
+    for snippet in _PINTEREST_JSON_SCRIPT_PATTERN.findall(text):
+        snippet = snippet.strip()
+        if not snippet:
+            continue
+        try:
+            payload = json.loads(html.unescape(snippet))
+        except json.JSONDecodeError:
+            continue
+        for node in _collect_pinterest_nodes(payload):
+            if not isinstance(node, Mapping):
+                continue
+            images = node.get("images")
+            if isinstance(images, Mapping):
+                orig = images.get("orig")
+                if isinstance(orig, Mapping):
+                    url_value = orig.get("url")
+                    if isinstance(url_value, str):
+                        title_value = node.get("title") or node.get("name") or node.get("description")
+                        label = str(title_value).strip() if title_value else "Pinterest inspiration"
+                        candidates.append((_normalize_pinterest_url(url_value), label))
+
+    for match in _PINTEREST_IMAGE_TAG_PATTERN.finditer(text):
+        url = _normalize_pinterest_url(match.group("url"))
+        title = match.group("title")
+        label = html.unescape(title).strip() if title else "Pinterest inspiration"
+        candidates.append((url, label))
+
+    # Fallback: generic pinimg URLs without metadata
+    if not candidates:
+        for url in re.findall(r"https://i\.pinimg\.com/[^'\"\s>]+", text):
+            candidates.append((_normalize_pinterest_url(url), "Pinterest inspiration"))
+
+    return candidates
+
+
+def _normalize_pinterest_url(url: str) -> str:
+    cleaned = html.unescape(url)
+    return cleaned.replace("\\u002F", "/").replace("\\/", "/")
+
+
+def _collect_pinterest_nodes(payload: object) -> list[Mapping[str, object]]:
+    stack = [payload]
+    collected: list[Mapping[str, object]] = []
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            collected.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return collected
 
 
 def _fetch_random_pinterest_image(
@@ -293,9 +370,6 @@ def _fetch_random_pinterest_image(
     except ValueError as exc:
         raise RuntimeError(f"Pinterest feed at {feed_url} is invalid: {exc}") from exc
 
-    if not candidates:
-        raise RuntimeError("Pinterest feed did not contain any downloadable images")
-
     image_url, title = random.choice(candidates)
     try:
         image_bytes = downloader(image_url, timeout)
@@ -310,6 +384,33 @@ def _fetch_random_pinterest_image(
 
     label = (title or "Pinterest inspiration").strip() or "Pinterest inspiration"
     return np.clip(array, 0.0, 1.0), f"{label} (Pinterest)"
+
+
+def _auto_refresh_pinterest_reference(
+    state: MutableMapping[str, Any],
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Refresh the active Pinterest inspiration image if Pinterest is selected."""
+
+    active_source = state.get("quick_start_media_source")
+    reference_source = state.get("quick_start_reference_source")
+    if active_source != "pinterest" and reference_source != "pinterest":
+        return False
+
+    board_input = state.get("quick_start_pinterest_source") or None
+    try:
+        image, label = _fetch_random_pinterest_image(board_input, timeout=timeout)
+    except RuntimeError as exc:
+        logger.warning("Pinterest auto-refresh failed: %s", exc)
+        return False
+
+    state["quick_start_reference_image"] = image
+    state["quick_start_reference_label"] = label
+    state["quick_start_reference_source"] = "pinterest"
+    state["quick_start_step1_timestamp"] = time.time()
+    state["_last_pinterest_refresh"] = time.time()
+    return True
 
 
 def _rgb_to_grayscale(image: np.ndarray) -> np.ndarray:
@@ -771,7 +872,10 @@ def _render_quick_start_wizard(
                 step_status["upload"] = True
         elif state.get("quick_start_reference_source") == "pinterest":
             step_status["upload"] = True
-        upload_col.caption("Pinterest images refresh when you press the fetch button.")
+        upload_col.caption(
+            "Pinterest images refresh automatically when targets are met or when you press "
+            "the fetch button."
+        )
     else:
         state.pop("quick_start_reference_image", None)
         state.pop("quick_start_reference_label", None)
@@ -3948,6 +4052,11 @@ def run() -> None:
                 f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px; "
                 f"new target ≈ {state.get('sound_target_score', target_score):.1f})."
             )
+            if _auto_refresh_pinterest_reference(state):
+                st.info(
+                    "Fetched a new Pinterest inspiration image after meeting the target "
+                    "so the AI keeps adapting to fresh art."
+                )
 
     else:
         state["sound_score_remaining"] = score_remaining_before

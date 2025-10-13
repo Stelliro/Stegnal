@@ -219,6 +219,28 @@ def test_parse_pinterest_feed_extracts_images(monkeypatch) -> None:
         sys.modules.pop("umbra.ui", None)
 
 
+def test_parse_pinterest_feed_accepts_html(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        html_doc = r"""
+        <html><head><title>Space Pins</title></head>
+        <body>
+          <script type="application/json">{"title":"Galaxy","images":{"orig":{"url":"https:\/\/i.pinimg.com\/originals\/galaxy.jpg"}}}</script>
+          <img src="https://i.pinimg.com/736x/starfield.jpg" alt="Star Field" />
+        </body>
+        </html>
+        """
+        pairs = ui._parse_pinterest_feed(html_doc)
+        urls = {url for url, _ in pairs}
+        assert "https://i.pinimg.com/originals/galaxy.jpg" in urls
+        assert "https://i.pinimg.com/736x/starfield.jpg" in urls
+        assert any("Galaxy" in label for _, label in pairs)
+        assert len(pairs) >= 2
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
 def test_fetch_random_pinterest_image_uses_downloader(monkeypatch) -> None:
     _install_ui_stubs(monkeypatch, {})
     ui = importlib.import_module("umbra.ui")
@@ -256,6 +278,32 @@ def test_fetch_random_pinterest_image_uses_downloader(monkeypatch) -> None:
         assert label.endswith("(Pinterest)")
         assert any(url.endswith(".rss") for url in requested)
         assert any(url.endswith("sample.jpg") for url in requested)
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_auto_refresh_pinterest_reference_updates_state(monkeypatch) -> None:
+    stub_state: dict[str, object] = {
+        "quick_start_media_source": "pinterest",
+        "quick_start_reference_source": "pinterest",
+        "quick_start_pinterest_source": "space/inspiration",
+    }
+
+    _install_ui_stubs(monkeypatch, stub_state)
+    ui = importlib.import_module("umbra.ui")
+
+    try:
+        def fake_fetch(source: str | None, *, timeout: float = 10.0, download=None):
+            return np.ones((4, 4, 3), dtype=np.float32), "Galaxy (Pinterest)"
+
+        monkeypatch.setattr(ui, "_fetch_random_pinterest_image", fake_fetch)
+
+        refreshed = ui._auto_refresh_pinterest_reference(stub_state)
+        assert refreshed is True
+        assert np.array_equal(stub_state["quick_start_reference_image"], np.ones((4, 4, 3)))
+        assert stub_state["quick_start_reference_label"] == "Galaxy (Pinterest)"
+        assert stub_state["quick_start_reference_source"] == "pinterest"
+        assert isinstance(stub_state.get("_last_pinterest_refresh"), float)
     finally:
         sys.modules.pop("umbra.ui", None)
 
