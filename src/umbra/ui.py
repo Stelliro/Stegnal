@@ -418,26 +418,23 @@ def _render_quick_start_wizard(
         step_status["upload"] = True
 
     mode_col.markdown(
-        ("✅" if step_status["mode"] else "②") + " **Step 2** · Easy or tweak"
+        ("✅" if step_status["mode"] else "②") + " **Step 2** · Pick your pace"
     )
-    default_easy_mode = state.get("quick_start_easy_mode")
-    if default_easy_mode is None:
-        default_easy_mode = not state.get("show_advanced_controls", False)
-    mode_choice = mode_col.radio(
-        "Control style",
-        options=("easy", "tweak"),
-        index=0 if default_easy_mode is not False else 1,
-        format_func=lambda val: "Easy mode" if val == "easy" else "Let me tweak",
-        key="quick_start_mode_choice",
+    mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
+    current_mode = state.get("difficulty_mode", mode_names[0])
+    if current_mode not in mode_names:
+        current_mode = mode_names[0]
+        state["difficulty_mode"] = current_mode
+    difficulty_choice = mode_col.select_slider(
+        "Difficulty focus",
+        options=mode_names,
+        value=current_mode,
+        help="Single dial that sets cadence, autosave, and dwell automatically.",
+        key="quick_start_difficulty",
     )
-    advanced = mode_choice == "tweak"
-    state["show_advanced_controls"] = advanced
-    state["quick_start_easy_mode"] = not advanced
+    state["difficulty_mode"] = difficulty_choice
     step_status["mode"] = True
-    if advanced:
-        mode_col.info("Open the **Tune It** tab to customise presets and evolution details.")
-    else:
-        mode_col.caption("Automatic tuning keeps everything balanced for you.")
+    mode_col.caption("Difficulty drives every setting—no advanced mode required.")
 
     profile = _DIFFICULTY_MODE_PRESETS[state["difficulty_mode"]]
     auto_settings = _auto_run_parameters(
@@ -445,7 +442,18 @@ def _render_quick_start_wizard(
         profile=profile,
         hyper_profile=hyper_profile,
     )
-    if not state.get("show_advanced_controls", False) and hyper_profile is None:
+
+    stats_cols = mode_col.columns(2)
+    stats_cols[0].metric(
+        "AI attempts/gen",
+        auto_settings["population_size"],
+    )
+    stats_cols[1].metric(
+        "Gen queue",
+        auto_settings["generations_to_queue"],
+    )
+    mode_col.metric("Sound dwell (gens)", auto_settings["target_dwell"])
+    if hyper_profile is None:
         state["population_size"] = auto_settings["population_size"]
         state["generations_to_queue"] = auto_settings["generations_to_queue"]
         state["autosave_interval"] = auto_settings["autosave_interval"]
@@ -458,6 +466,15 @@ def _render_quick_start_wizard(
     run_col.markdown(
         ("✅" if step_status["run"] else "③") + " **Step 3** · Launch evolution"
     )
+    infinite_default = bool(state.get("quick_start_infinite_preference", False))
+    infinite_toggle = run_col.checkbox(
+        "Run infinitely",
+        value=infinite_default,
+        key="quick_start_infinite_toggle",
+        help="When enabled, Umbra keeps evolving new generations without stopping.",
+    )
+    state["quick_start_infinite_preference"] = infinite_toggle
+    state["evolution_mode"] = "Infinite" if infinite_toggle else "Finite"
     controls_row = run_col.columns(2)
     run_button = controls_row[0].button(
         "Start", use_container_width=True, key="quick_start_run"
@@ -475,6 +492,9 @@ def _render_quick_start_wizard(
     reload_button = run_col.button(
         "Reload autosave", use_container_width=True, key="quick_start_reload"
     )
+
+    if state.get("run_infinite", False) or state.get("pending_generations", 0) > 0:
+        step_status["run"] = True
 
     metrics_cols = run_col.columns(2)
     metrics_cols[0].metric("Adaptive progress", f"{difficulty_progress * 100:.0f}%")
@@ -557,6 +577,29 @@ _SOUND_MODEL_PRESETS: dict[str, dict[str, Any]] = {
         "resolution": (128, 224),
         "target_dwell": 16,
         "description": "Wide spectrum exploration with longer dwell for evolving harmonic washes.",
+    },
+}
+
+_DIFFICULTY_PRESET_LINKS: dict[str, dict[str, str]] = {
+    "Calm focus": {
+        "image": "Geometric Echo (balanced)",
+        "sound": "Ambient Skyline",
+        "engine": "Lineage & noise (classic)",
+    },
+    "Balanced climb": {
+        "image": "Nocturne Bloom (soft focus)",
+        "sound": "Aurora Sweep",
+        "engine": "Lineage & noise (classic)",
+    },
+    "Edge runner": {
+        "image": "Solar Cascade (high contrast)",
+        "sound": "Pulse Forge",
+        "engine": "Neural lineage fusion",
+    },
+    "Apex trial": {
+        "image": "Solar Cascade (high contrast)",
+        "sound": "Pulse Forge",
+        "engine": "Neural lineage fusion",
     },
 }
 
@@ -1005,7 +1048,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         return
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("Failed to load autosave from %s", autosave_dir)
-        st.sidebar.warning(f"Failed to load autosave: {exc}")
+        st.warning(f"Failed to load autosave: {exc}")
         return
 
     previous_scene = state.get("adaptive_scene")
@@ -1063,7 +1106,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     state["pending_generations"] = 0
     state["run_infinite"] = False
     _sync_active_tree_state(state)
-    st.sidebar.success("Loaded autosaved evolution session.")
+    st.success("Loaded autosaved evolution session.")
     logger.info(
         "Restored autosave from %s with %d generations",
         autosave_dir,
@@ -2099,7 +2142,6 @@ def run() -> None:
     state.setdefault("difficulty_volatility", 0.0)
     state.setdefault("difficulty_reward", 0.0)
     state.setdefault("difficulty_reward_points", 0.0)
-    state.setdefault("show_advanced_controls", False)
     state.setdefault("latest_generation_reward", 0.0)
     state.setdefault("latest_generation_peak", 0.0)
     state.setdefault("latest_generation_difficulty", 0.0)
@@ -2177,18 +2219,6 @@ def run() -> None:
 
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
-    show_advanced = bool(state.get("show_advanced_controls", False))
-    load_button = False
-    if show_advanced:
-        with st.sidebar.expander("Session & autosave", expanded=False):
-            st.text_input(
-                "Autosave directory",
-                value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
-                help="Evolution checkpoints are saved here as evolution_state.pkl.",
-                key="autosave_dir",
-            )
-            load_button = st.button("Load autosave")
-
     autosave_dir = Path(state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))).expanduser()
     normalized_autosave_dir = str(autosave_dir)
     if state.get("last_autosave_dir") != normalized_autosave_dir:
@@ -2201,9 +2231,6 @@ def run() -> None:
             _attempt_autoload(autosave_dir)
         state["autosave_checked"] = True
 
-    if load_button:
-        _attempt_autoload(autosave_dir)
-
     image_model_names = list(_IMAGE_MODEL_PRESETS.keys())
     current_image_model = state.get("_active_image_model", image_model_names[0])
     selected_image_model = current_image_model
@@ -2212,42 +2239,17 @@ def run() -> None:
     selected_sound_model = current_sound_model
     evolution_engines = ["Lineage & noise (classic)", "Neural lineage fusion"]
     selected_engine = state.get("_active_evolution_engine", evolution_engines[0])
+    linked_presets = _DIFFICULTY_PRESET_LINKS.get(state.get("difficulty_mode", ""), {})
+    linked_image = linked_presets.get("image")
+    linked_sound = linked_presets.get("sound")
+    linked_engine = linked_presets.get("engine")
 
-    if show_advanced:
-        with st.sidebar.expander("Model presets", expanded=False):
-            engine_index = (
-                evolution_engines.index(selected_engine)
-                if selected_engine in evolution_engines
-                else 0
-            )
-            selected_image_model = st.selectbox(
-                "Image evolution preset",
-                image_model_names,
-                index=image_model_names.index(current_image_model),
-                key="image_model_select",
-            )
-            st.caption(_IMAGE_MODEL_PRESETS[selected_image_model]["description"])
-            selected_sound_model = st.selectbox(
-                "Sound scene preset",
-                sound_model_names,
-                index=sound_model_names.index(current_sound_model),
-                key="sound_model_select",
-            )
-            st.caption(_SOUND_MODEL_PRESETS[selected_sound_model]["description"])
-            selected_engine = st.selectbox(
-                "Evolution engine",
-                evolution_engines,
-                index=engine_index,
-                key="evolution_engine_select",
-            )
-            if selected_engine == "Neural lineage fusion":
-                st.caption(
-                    "Neural advisor boosts high performers while preserving elite lineages for deep selective breeding."
-                )
-            else:
-                st.caption(
-                    "Classic stochastic evolution that prioritises lineage parents and their direct noise descendants."
-                )
+    if linked_image in image_model_names:
+        selected_image_model = linked_image
+    if linked_sound in sound_model_names:
+        selected_sound_model = linked_sound
+    if linked_engine in evolution_engines:
+        selected_engine = linked_engine
 
     if state.get("_active_image_model") != selected_image_model:
         preset = _IMAGE_MODEL_PRESETS[selected_image_model]
@@ -2268,64 +2270,16 @@ def run() -> None:
         state["_active_evolution_engine"] = selected_engine
 
     target_dwell = int(state.get("sound_target_dwell", auto_settings["target_dwell"]))
-    manual_refresh = False
     if hyper_enabled and hyper_profile is not None:
         target_dwell = int(
             max(1, hyper_profile.dwell_generations or target_dwell)
         )
         state["sound_target_dwell"] = target_dwell
         state["last_sound_target_dwell"] = target_dwell
-    elif not show_advanced:
+    else:
         target_dwell = int(auto_settings["target_dwell"])
         state["sound_target_dwell"] = target_dwell
         state["last_sound_target_dwell"] = target_dwell
-
-    if show_advanced:
-        with st.sidebar.expander("Sound cadence", expanded=False):
-            if hyper_enabled and hyper_profile is not None:
-                subjects_per_cycle = int(
-                    max(
-                        hyper_profile.target_subjects,
-                        target_dwell * max(state.get("population_size", 1), 1),
-                    )
-                )
-                st.metric("Generations per sound target", target_dwell)
-                st.metric("Subjects scheduled this cycle", subjects_per_cycle)
-                st.caption(
-                    "Hyper performance mode rotates the sound scene automatically once the dwell window completes."
-                )
-            else:
-                target_dwell = int(
-                    st.number_input(
-                        "Generations per sound target",
-                        min_value=1,
-                        max_value=500,
-                        value=int(state.get("sound_target_dwell", target_dwell)),
-                        step=1,
-                        key="sound_target_dwell",
-                        help=(
-                            "Number of evolution steps to spend matching the current sound-derived image before refreshing it with a new randomised scene."
-                        ),
-                    )
-                )
-            manual_refresh = st.button(
-                "Refresh sound scene",
-                key="refresh_sound_scene",
-                help="Force an immediate reseed using the current difficulty profile.",
-            )
-            if manual_refresh:
-                new_seed, new_rate, new_resolution = _refresh_sound_scene(
-                    state,
-                    difficulty_progress,
-                    target_dwell,
-                    improvement=float(state.get("difficulty_improvement", 0.0)),
-                    volatility=float(state.get("difficulty_volatility", 0.0)),
-                    max_overlap=float(state.get("max_overlap_seen", max_overlap_so_far)),
-                )
-                st.info(
-                    "Forced refresh triggered new scene "
-                    f"(seed {new_seed}, {new_rate:,} Hz, {new_resolution}×{new_resolution} px)."
-                )
 
     if state.get("last_sound_target_dwell") != target_dwell:
         state["last_sound_target_dwell"] = target_dwell
@@ -2346,43 +2300,7 @@ def run() -> None:
         state["sound_generations_left"] = target_dwell
     remaining_before = int(state.get("sound_generations_left", target_dwell))
 
-    forest = state.setdefault("evolution_trees", {})
-    new_tree_requested = False
-    if show_advanced:
-        with st.sidebar.expander("Evolution trees", expanded=False):
-            if forest:
-                tree_ids = list(forest.keys())
-                active_tree_id = state.get("active_tree_id", tree_ids[0])
-                if active_tree_id not in forest:
-                    active_tree_id = tree_ids[0]
-                    _activate_tree(state, active_tree_id)
-                selected_tree_id = st.selectbox(
-                    "Stored branches",
-                    tree_ids,
-                    index=tree_ids.index(active_tree_id),
-                    format_func=lambda tid: _format_tree_label(forest[tid]),
-                )
-                if selected_tree_id != active_tree_id:
-                    _activate_tree(state, selected_tree_id)
-                    forest = state.setdefault("evolution_trees", {})
-                st.caption(
-                    "Switch between stored evolution branches to revisit previous sound scenes."
-                )
-            else:
-                st.caption("Branches will appear here after your first evolution run.")
-
-            new_tree_requested = st.button(
-                "Create new evolution tree",
-                key="spawn_new_tree",
-                help="Start a fresh branch with the current presets and sound scene.",
-            )
-    if new_tree_requested:
-        state["_spawn_new_tree_requested"] = True
-        state["pending_generations"] = 0
-        state["run_infinite"] = False
-        _sync_active_tree_state(state)
-        if show_advanced:
-            st.sidebar.info("Queued a new tree; it will initialise on the next evolution tick.")
+    state.setdefault("evolution_trees", {})
 
     seed = int(state.get("shared_seed", 0))
     sound_seed = int(state.get("active_sound_seed", seed))
@@ -2427,30 +2345,6 @@ def run() -> None:
         )
         state["current_sound_resolution"] = current_resolution
 
-    if show_advanced:
-        with st.sidebar.expander("Active configuration", expanded=False):
-            st.metric("Hardware backend", state.get("hardware_backend", "CPU (NumPy)"))
-            st.metric("Shared seed", str(seed))
-            st.metric("Sound seed", str(sound_seed))
-            st.metric(
-                "Sound sample window", f"{sample_rate_range[0]:,}–{sample_rate_range[1]:,} Hz"
-            )
-            st.metric(
-                "Image resolution window",
-                f"{resolution_range[0]}–{resolution_range[1]} px",
-            )
-            st.metric("Active sample rate", f"{current_sample_rate:,} Hz")
-            st.metric(
-                "Active image resolution",
-                f"{current_resolution}×{current_resolution} px",
-            )
-
-            noise_cols = st.columns(2)
-            noise_cols[0].metric("Active encoder σ", f"{encoder_sigma:.3f}")
-            noise_cols[1].metric("Active denoise σ", f"{denoise_sigma:.3f}")
-            st.caption(
-                "Adaptive noise scales increase encoder randomness while tempering decoder blur as the system improves."
-            )
     _sync_active_tree_state(state)
 
     if (
@@ -2727,109 +2621,28 @@ def run() -> None:
             options=mode_names,
             value=current_mode,
             help="Single dial that steers all modelling settings and adaptive tuning.",
-            disabled=not state.get("show_advanced_controls", False),
             key="tune_difficulty_mode",
         )
         state["difficulty_mode"] = selected_mode
-        if not state.get("show_advanced_controls", False):
-            st.caption("Switch Step 2 to **Let me tweak** to adjust difficulty presets here.")
+        st.caption("Adjusting this slider updates every auto-tuned parameter instantly.")
 
-    if show_advanced:
-        with st.sidebar.expander("Evolution run controls", expanded=True):
-            if hyper_enabled and hyper_profile is not None:
-                population_size = int(
-                    max(1, hyper_profile.batch_size or population_size)
-                )
-                generations_to_queue = int(
-                    max(
-                        1,
-                        hyper_profile.queue_generations
-                        or hyper_profile.dwell_generations
-                        or generations_to_queue,
-                    )
-                )
-                autosave_interval = int(
-                    max(1, hyper_profile.autosave_interval or autosave_interval)
-                )
-                target_subjects = int(
-                    max(
-                        hyper_profile.target_subjects,
-                        population_size * max(hyper_profile.dwell_generations, 1),
-                    )
-                )
-                state["population_size"] = population_size
-                state["generations_to_queue"] = generations_to_queue
-                state["autosave_interval"] = autosave_interval
-                state["evolution_mode"] = "Finite"
-
-                col_top, col_bottom = st.columns(2)
-                col_top.metric("Subjects per generation", population_size)
-                col_top.metric("Queued generations", generations_to_queue)
-                col_bottom.metric("Subjects per sound cycle", target_subjects)
-                col_bottom.metric("Autosave interval", autosave_interval)
-                if hyper_profile.mean_duration > 0.0:
-                    throughput = hyper_profile.throughput
-                    timing_text = (
-                        f"Avg generation {hyper_profile.mean_duration:.2f}s • {throughput:.1f} subjects/s"
-                        if throughput > 0.0
-                        else f"Avg generation {hyper_profile.mean_duration:.2f}s"
-                    )
-                    st.caption(timing_text)
-                st.caption(
-                    "Hyper performance mode tunes these parameters from runtime throughput and the current difficulty so you can focus on results."
-                )
-                evolution_mode = "Finite"
-            else:
-                population_size = int(
-                    st.number_input(
-                        "AI attempts per generation",
-                        min_value=1,
-                        max_value=32,
-                        value=population_size,
-                        step=1,
-                        key="population_size",
-                    )
-                )
-                generations_to_queue = int(
-                    st.number_input(
-                        "Generations to queue",
-                        min_value=1,
-                        value=generations_to_queue,
-                        step=1,
-                        key="generations_to_queue",
-                    )
-                )
-                evolution_mode = st.selectbox(
-                    "Evolution length",
-                    options=["Finite", "Infinite"],
-                    index=0 if state.get("evolution_mode", "Finite") == "Finite" else 1,
-                    key="evolution_mode",
-                )
-                autosave_interval = int(
-                    st.number_input(
-                        "Autosave every N generations",
-                        min_value=1,
-                        value=autosave_interval,
-                        step=1,
-                        key="autosave_interval",
-                    )
-                )
-                state["population_size"] = population_size
-                state["generations_to_queue"] = generations_to_queue
-                state["autosave_interval"] = autosave_interval
-                state["evolution_mode"] = evolution_mode
-
-    if show_advanced:
-        with st.sidebar.expander("Adversarial mode (beta)", expanded=False):
-            st.checkbox(
-                "Enable generator vs decoder co-evolution",
-                key="adversarial_enabled",
-                value=bool(state.get("adversarial_enabled", False)),
-                help=(
-                    "Trains a predictive generator to approximate the decoder's output without passing through"
-                    " the channel, while the decoder adapts its denoise level."
-                ),
+    if hyper_enabled and hyper_profile is not None:
+        population_size = int(max(1, hyper_profile.batch_size or population_size))
+        generations_to_queue = int(
+            max(
+                1,
+                hyper_profile.queue_generations
+                or hyper_profile.dwell_generations
+                or generations_to_queue,
             )
+        )
+        autosave_interval = int(
+            max(1, hyper_profile.autosave_interval or autosave_interval)
+        )
+        state["population_size"] = population_size
+        state["generations_to_queue"] = generations_to_queue
+        state["autosave_interval"] = autosave_interval
+        state["evolution_mode"] = "Finite"
     if state.get("adversarial_enabled", False) and "adversarial" not in state:
         state["adversarial"] = AdversarialManager()
 
@@ -2846,7 +2659,8 @@ def run() -> None:
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
         state["active_parent_seeds"] = []
-        st.sidebar.info("Cleared evolution history.")
+        state["quick_start_infinite_preference"] = False
+        st.info("Cleared evolution history.")
 
     if reload_button:
         state.pop("evolution_manager", None)
@@ -2875,61 +2689,9 @@ def run() -> None:
     _update_tree_label(state, tree_label)
     _refresh_active_parents(state, manager)
 
-    if show_advanced:
-        with st.sidebar.expander("Selective breeding", expanded=False):
-            parent_entries = sorted(
-                manager.parent_lineage,
-                key=lambda entry: (entry.origin_generation, -entry.metrics.ssim),
-            )
-            parent_labels = {
-                entry.seed: (
-                    f"Gen {entry.origin_generation} • seed {entry.seed} "
-                    f"(SSIM {entry.metrics.ssim:.3f}, overlap {entry.overlap_score:.1f}%)"
-                )
-                for entry in parent_entries
-            }
-            parent_options = list(parent_labels.keys())
-            default_selection = [
-                seed for seed in state.get("active_parent_seeds", []) if seed in parent_labels
-            ]
-            if not default_selection and parent_options:
-                default_selection = [parent_options[-1]]
-            parent_selection = st.multiselect(
-                "Active parent seeds",
-                parent_options,
-                default=default_selection,
-                key="parent_seed_select",
-                format_func=lambda seed: parent_labels.get(seed, f"Seed {seed}"),
-                help=(
-                    "Selected parent seeds remain in every generation and act as anchors for "
-                    "new child mutations. Leave the selection empty to use the full lineage."
-                ),
-            )
-            state["active_parent_seeds"] = [int(seed) for seed in parent_selection]
-            _sync_active_tree_state(state)
-
-            if parent_entries:
-                active_parent_set = {int(seed) for seed in state.get("active_parent_seeds", [])}
-                summary_rows = [
-                    {
-                        "Seed": entry.seed,
-                        "Generation": entry.origin_generation,
-                        "SSIM": f"{entry.metrics.ssim:.3f}",
-                        "Overlap (%)": f"{entry.overlap_score:.1f}",
-                        "Appearances": entry.appearances,
-                        "Reward": f"{entry.cumulative_reward:.2f}",
-                        "Peak reward": f"{entry.peak_reward:.2f}",
-                        "Active": "★" if entry.seed in active_parent_set else "",
-                    }
-                    for entry in parent_entries
-                ]
-                st.table(summary_rows)
-            else:
-                st.info("Run at least one generation to populate the parent lineage.")
-
     if save_button:
         save_path = manager.save(autosave_dir)
-        st.sidebar.success(f"Saved evolution session to {save_path}")
+        st.success(f"Saved evolution session to {save_path}")
 
     run_store: RunStore = state["run_store"]
 
@@ -3045,7 +2807,7 @@ def run() -> None:
             current_resolution = next_resolution
             state["sound_generations_left"] = int(target_dwell)
             reseeded = True
-            st.sidebar.info(
+            st.info(
                 "Auto-randomised sound scene after completing the dwell window "
                 f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
             )
@@ -3062,7 +2824,7 @@ def run() -> None:
 
     if generations_ran and len(manager.generations) % manager.autosave_interval == 0:
         save_path = manager.save(autosave_dir)
-        st.sidebar.success(f"Autosaved evolution session to {save_path}")
+        st.success(f"Autosaved evolution session to {save_path}")
         logger.info("Autosaved evolution session to %s", save_path)
 
     st.sidebar.metric(
