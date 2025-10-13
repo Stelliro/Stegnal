@@ -38,7 +38,11 @@ def export_chart_png(
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    png_bytes = _render_png(spec, scale=scale)
+
+    sanitized = dict(spec)
+    sanitized.pop("params", None)
+
+    png_bytes = _render_png(sanitized, scale=scale)
     path.write_bytes(png_bytes)
     return path
 

@@ -1,8 +1,10 @@
 import importlib
 import sys
+from io import BytesIO
 from types import SimpleNamespace
 
 import numpy as np
+from PIL import Image
 
 from umbra.evolution import EvolutionManager
 
@@ -172,6 +174,88 @@ def test_auto_pause_resets_acknowledgement(monkeypatch) -> None:
 
         assert message is None
         assert stub_state["auto_pause_acknowledged"] is False
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_normalize_pinterest_source(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        assert (
+            ui._normalize_pinterest_source("umbra/research")
+            == "https://www.pinterest.com/umbra/research.rss"
+        )
+        assert (
+            ui._normalize_pinterest_source("https://example.com/feed.rss")
+            == "https://example.com/feed.rss"
+        )
+        assert ui._normalize_pinterest_source("") in ui._PINTEREST_DEFAULT_FEEDS
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_parse_pinterest_feed_extracts_images(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        feed_xml = """<?xml version='1.0' encoding='UTF-8'?>
+        <rss version='2.0' xmlns:media='http://search.yahoo.com/mrss/'>
+          <channel>
+            <item>
+              <title>Test Pin</title>
+              <media:content url='https://i.pinimg.com/originals/example.jpg' />
+              <description><![CDATA[<img src=\"https://i.pinimg.com/originals/example-desc.jpg\"/>]]></description>
+            </item>
+          </channel>
+        </rss>
+        """
+        pairs = ui._parse_pinterest_feed(feed_xml)
+        urls = {url for url, _ in pairs}
+        assert "https://i.pinimg.com/originals/example.jpg" in urls
+        assert "https://i.pinimg.com/originals/example-desc.jpg" in urls
+        assert all(label for _, label in pairs)
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_fetch_random_pinterest_image_uses_downloader(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        with BytesIO() as buffer:
+            Image.new("RGB", (2, 2), color=(200, 10, 10)).save(buffer, format="PNG")
+            png_bytes = buffer.getvalue()
+
+        feed_xml = """<?xml version='1.0' encoding='UTF-8'?>
+        <rss version='2.0' xmlns:media='http://search.yahoo.com/mrss/'>
+          <channel>
+            <item>
+              <title>Sample Pin</title>
+              <media:content url='https://i.pinimg.com/originals/sample.jpg' />
+            </item>
+          </channel>
+        </rss>
+        """
+
+        requested: list[str] = []
+
+        def fake_download(url: str, timeout: float) -> bytes:
+            requested.append(url)
+            if url.endswith(".rss"):
+                return feed_xml.encode("utf-8")
+            return png_bytes
+
+        image, label = ui._fetch_random_pinterest_image(
+            "umbra/research",
+            timeout=0.1,
+            download=fake_download,
+        )
+
+        assert image.shape == (2, 2, 3)
+        assert label.endswith("(Pinterest)")
+        assert any(url.endswith(".rss") for url in requested)
+        assert any(url.endswith("sample.jpg") for url in requested)
     finally:
         sys.modules.pop("umbra.ui", None)
 

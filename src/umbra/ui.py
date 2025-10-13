@@ -8,14 +8,20 @@ import html
 import json
 import logging
 import math
+import random
+import re
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from collections import OrderedDict
 from collections.abc import Mapping, MutableMapping
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -110,6 +116,24 @@ _DARK_STYLE = """
 download_cache: dict[str, dict[str, Any]] = {}
 
 
+_PINTEREST_DEFAULT_FEEDS: tuple[str, ...] = (
+    "https://www.pinterest.com/pinterest/official-news.rss",
+    "https://www.pinterest.com/pinterest/engagement.rss",
+    "https://www.pinterest.com/pinterest/creative.rss",
+)
+
+_PINTEREST_IMAGE_PATTERN = re.compile(
+    r"(?:src|data-pin-media)=\"(https://i\.pinimg\.com[^\"]+)\"",
+    flags=re.IGNORECASE,
+)
+
+_PINTEREST_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+
+
 class RunStore:
     """Persist run-specific artifacts to disk."""
 
@@ -185,6 +209,107 @@ def _load_uploaded_image(file) -> np.ndarray:
         return np.clip(array, 0.0, 1.0)
     except Exception as exc:  # pragma: no cover - defensive
         raise ValueError(f"Unable to read image: {exc}") from exc
+
+
+def _download_bytes(url: str, *, timeout: float = 10.0) -> bytes:
+    """Download ``url`` returning the raw bytes."""
+
+    request = urllib.request.Request(url, headers={"User-Agent": _PINTEREST_USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.URLError as exc:  # pragma: no cover - network safeguard
+        raise RuntimeError(f"Unable to download {url}: {exc}") from exc
+
+
+def _normalize_pinterest_source(source: str | None) -> str:
+    """Return a usable Pinterest RSS feed URL from ``source``."""
+
+    if source:
+        trimmed = source.strip()
+        if trimmed:
+            parsed = urllib.parse.urlparse(trimmed)
+            if parsed.scheme and parsed.netloc:
+                return trimmed
+            path = trimmed.strip("/ ")
+            if path:
+                return f"https://www.pinterest.com/{path}.rss"
+    return _PINTEREST_DEFAULT_FEEDS[0]
+
+
+def _parse_pinterest_feed(feed_data: bytes | str) -> list[tuple[str, str]]:
+    """Extract ``(image_url, title)`` pairs from Pinterest RSS content."""
+
+    if isinstance(feed_data, bytes):
+        text = feed_data.decode("utf-8", errors="replace")
+    else:
+        text = feed_data
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise ValueError("Unable to parse Pinterest feed XML") from exc
+
+    channel = root.find("channel")
+    items = channel.findall("item") if channel is not None else root.findall(".//item")
+
+    candidates: list[tuple[str, str]] = []
+    for item in items:
+        title = (item.findtext("title") or "Pinterest inspiration").strip()
+        for child in item:
+            tag = child.tag.split("}")[-1]
+            if tag in {"content", "thumbnail"}:
+                url = child.attrib.get("url")
+                if url and url.startswith("http"):
+                    candidates.append((url, title))
+        description = item.findtext("description") or ""
+        for match in _PINTEREST_IMAGE_PATTERN.findall(description):
+            candidates.append((match, title))
+
+    deduped: OrderedDict[str, str] = OrderedDict()
+    for url, label in candidates:
+        if url not in deduped:
+            deduped[url] = label
+    return list(deduped.items())
+
+
+def _fetch_random_pinterest_image(
+    source: str | None,
+    *,
+    timeout: float = 10.0,
+    download: Callable[[str, float], bytes] | None = None,
+) -> tuple[np.ndarray, str]:
+    """Download and decode a random image from a Pinterest feed."""
+
+    downloader = download or (lambda url, to: _download_bytes(url, timeout=to))
+    feed_url = _normalize_pinterest_source(source)
+    try:
+        feed_bytes = downloader(feed_url, timeout)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Failed to retrieve Pinterest feed: {exc}") from exc
+
+    try:
+        candidates = _parse_pinterest_feed(feed_bytes)
+    except ValueError as exc:
+        raise RuntimeError(f"Pinterest feed at {feed_url} is invalid: {exc}") from exc
+
+    if not candidates:
+        raise RuntimeError("Pinterest feed did not contain any downloadable images")
+
+    image_url, title = random.choice(candidates)
+    try:
+        image_bytes = downloader(image_url, timeout)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Failed to download Pinterest image: {exc}") from exc
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as downloaded:
+            array = np.asarray(downloaded.convert("RGB"), dtype=np.float32) / 255.0
+    except Exception as exc:  # pragma: no cover - defensive
+        raise RuntimeError(f"Unable to decode Pinterest image from {image_url}") from exc
+
+    label = (title or "Pinterest inspiration").strip() or "Pinterest inspiration"
+    return np.clip(array, 0.0, 1.0), f"{label} (Pinterest)"
 
 
 def _rgb_to_grayscale(image: np.ndarray) -> np.ndarray:
@@ -549,7 +674,7 @@ def _render_quick_start_wizard(
         state["difficulty_mode"] = mode_names[default_idx]
 
     media_source = state.get("quick_start_media_source", "auto")
-    if media_source not in ("auto", "upload"):
+    if media_source not in {"auto", "upload", "pinterest"}:
         media_source = "auto"
     state["quick_start_media_source"] = media_source
 
@@ -572,9 +697,13 @@ def _render_quick_start_wizard(
     )
     source_choice = upload_col.radio(
         "Media source",
-        options=("auto", "upload"),
-        index=0 if media_source == "auto" else 1,
-        format_func=lambda val: "Use generated scene" if val == "auto" else "Upload image",
+        options=("auto", "upload", "pinterest"),
+        index={"auto": 0, "upload": 1, "pinterest": 2}[media_source],
+        format_func=lambda val: {
+            "auto": "Use generated scene",
+            "upload": "Upload image",
+            "pinterest": "Pinterest inspiration",
+        }[val],
         key="quick_start_media_selector",
     )
     state["quick_start_media_source"] = source_choice
@@ -593,13 +722,60 @@ def _render_quick_start_wizard(
             else:
                 state["quick_start_reference_image"] = image
                 state["quick_start_reference_label"] = uploaded.name or "Uploaded image"
+                state["quick_start_reference_source"] = "upload"
                 state["quick_start_step1_timestamp"] = time.time()
                 step_status["upload"] = True
         elif state.get("quick_start_reference_image") is not None:
             step_status["upload"] = True
+        else:
+            state.pop("quick_start_reference_source", None)
+    elif source_choice == "pinterest":
+        pinterest_hint = state.get("quick_start_pinterest_source", "")
+        board_input = upload_col.text_input(
+            "Pinterest board or RSS feed",
+            value=pinterest_hint,
+            help=(
+                "Enter a board path such as 'umbresearch/inspirations' or paste a Pinterest RSS "
+                "URL. Leave blank to use Umbra's curated feeds."
+            ),
+            key="quick_start_pinterest_board",
+        )
+        state["quick_start_pinterest_source"] = board_input
+
+        fetch_button = upload_col.button(
+            "Fetch Pinterest inspiration",
+            key="quick_start_pinterest_fetch",
+            help="Download a random Pinterest image using the selected feed.",
+        )
+
+        needs_fetch = (
+            fetch_button
+            or state.get("quick_start_reference_source") != "pinterest"
+            or state.get("quick_start_reference_image") is None
+        )
+        if needs_fetch:
+            try:
+                image, label = _fetch_random_pinterest_image(board_input or None)
+            except RuntimeError as exc:
+                logger.warning("Pinterest fetch failed: %s", exc)
+                upload_col.error(str(exc))
+                state.pop("quick_start_reference_image", None)
+                state.pop("quick_start_reference_label", None)
+                state.pop("quick_start_reference_source", None)
+                step_status["upload"] = False
+            else:
+                state["quick_start_reference_image"] = image
+                state["quick_start_reference_label"] = label
+                state["quick_start_reference_source"] = "pinterest"
+                state["quick_start_step1_timestamp"] = time.time()
+                step_status["upload"] = True
+        elif state.get("quick_start_reference_source") == "pinterest":
+            step_status["upload"] = True
+        upload_col.caption("Pinterest images refresh when you press the fetch button.")
     else:
         state.pop("quick_start_reference_image", None)
         state.pop("quick_start_reference_label", None)
+        state.pop("quick_start_reference_source", None)
         step_status["upload"] = True
 
     mode_col.markdown(
@@ -3005,8 +3181,9 @@ def run() -> None:
             )
     _sync_active_tree_state(state)
 
+    custom_media_sources = {"upload", "pinterest"}
     if (
-        state.get("quick_start_media_source") == "upload"
+        state.get("quick_start_media_source") in custom_media_sources
         and isinstance(state.get("quick_start_reference_image"), np.ndarray)
     ):
         uploaded_image = np.asarray(state.get("quick_start_reference_image"), dtype=np.float32)
@@ -3027,7 +3204,12 @@ def run() -> None:
             band_volumes=band_volumes,
         )
         shape_specs = []
-        source_label = state.get("quick_start_reference_label", "Uploaded image")
+        default_label = (
+            "Uploaded image"
+            if state.get("quick_start_media_source") == "upload"
+            else "Pinterest inspiration"
+        )
+        source_label = state.get("quick_start_reference_label", default_label)
     else:
         original_color, original, sound_clip, shape_specs = generate_sound_art(
             seed=sound_seed,
