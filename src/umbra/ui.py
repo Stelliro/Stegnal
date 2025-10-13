@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from streamlit.delta_generator import DeltaGenerator
 
 from umbra.chart_export import export_chart_png
-# Removed: from umbra.adversarial import...
+from umbra.adversarial import AdversarialManager, apply_generator
 from umbra.codec import (
     decode_waveform_to_image,
     encode_image_to_waveform,
@@ -43,7 +43,7 @@ from umbra.evolution import (
 )
 from umbra.logging_utils import collect_provenance, configure_logging
 from umbra.metrics import ReconstructionMetrics, compute_metrics
-# Removed: from umbra.neural import...
+from umbra.neural import NeuralRewardModel
 from umbra.predictor import predict_image_from_waveform
 from umbra.progress import prepare_metrics_chart, prepare_trend_chart, sanitize_progress_rows
 from umbra.reconstruction import (
@@ -104,6 +104,9 @@ _DARK_STYLE = """
 }
 </style>
 """
+
+
+download_cache: dict[str, dict[str, Any]] = {}
 
 
 class RunStore:
@@ -2155,6 +2158,52 @@ def _record_performance_history(
     return history
 
 
+def _append_global_progress_row(
+    state: st.session_state,
+    manager: EvolutionManager,
+    row: Mapping[str, Any],
+) -> None:
+    """Persist a generation summary in a cumulative timeline across runs."""
+
+    history: list[dict[str, Any]] = list(state.get("_global_progress_history", []))
+    index_map: dict[str, int] = dict(state.get("_global_progress_index", {}))
+
+    try:
+        run_generation = int(row.get("Generation", len(history)))
+    except (TypeError, ValueError):
+        run_generation = len(history)
+
+    progress_key = f"{manager.run_id}:{run_generation}"
+
+    base_entry: dict[str, Any] = dict(row)
+    base_entry["_run_id"] = manager.run_id
+    base_entry["_run_generation"] = run_generation
+    base_entry["_run_seed"] = int(getattr(manager, "base_seed", 0))
+
+    existing_index = index_map.get(progress_key)
+    if existing_index is not None and 0 <= existing_index < len(history):
+        preserved_step = history[existing_index].get("Generation", existing_index + 1)
+        merged = dict(history[existing_index])
+        merged.update(base_entry)
+        merged["Generation"] = preserved_step
+        history[existing_index] = merged
+        state["_global_progress_history"] = history
+        state["_global_progress_index"] = index_map
+        return
+    if existing_index is not None:
+        index_map.pop(progress_key, None)
+
+    global_step = int(state.get("_global_progress_step", 0)) + 1
+    state["_global_progress_step"] = global_step
+
+    base_entry["Generation"] = float(global_step)
+    history.append(base_entry)
+    index_map[progress_key] = len(history) - 1
+
+    state["_global_progress_history"] = history
+    state["_global_progress_index"] = index_map
+
+
 def _mark_sound_target_transition(state: st.session_state) -> None:
     """Record the observation index where the sound target changed."""
 
@@ -2768,9 +2817,12 @@ def run() -> None:
             force=True,
         )
 
-    if state.get("sound_generations_left", target_dwell) > target_dwell:
+    if "sound_generations_left" not in state:
+        state["sound_generations_left"] = target_dwell
+    elif state.get("sound_generations_left", target_dwell) > target_dwell:
         state["sound_generations_left"] = target_dwell
     remaining_before = int(state.get("sound_generations_left", target_dwell))
+    remaining_after = remaining_before
 
     forest = state.setdefault("evolution_trees", {})
     new_tree_requested = False
@@ -2836,6 +2888,9 @@ def run() -> None:
 
     state["sound_score_remaining"] = float(
         max(0.0, state.get("sound_score_remaining", float(target_score)))
+    )
+    score_remaining_before = float(
+        state.get("sound_score_remaining", float(target_score))
     )
 
     current_sample_rate = int(state.get("current_sound_sample_rate", sample_rate_range[0]))
@@ -3595,6 +3650,9 @@ def run() -> None:
                 ),
             )
         _sync_active_tree_state(state)
+        capped_before = min(remaining_before, target_dwell)
+        remaining_after = max(0, int(capped_before) - generations_ran)
+        state["sound_generations_left"] = int(remaining_after)
 
     trigger_rerun = False
     if generations_ran:
@@ -3619,6 +3677,8 @@ def run() -> None:
                 state.get("sound_target_score", float(target_score))
             )
             score_remaining = float(state["sound_score_remaining"])
+            state["sound_generations_left"] = int(target_dwell)
+            remaining_after = int(target_dwell)
             reseeded = True
             st.info(
                 "Auto-randomised sound scene after exhausting the score budget "
@@ -3628,6 +3688,7 @@ def run() -> None:
 
     else:
         state["sound_score_remaining"] = score_remaining_before
+        state["sound_generations_left"] = int(min(remaining_before, target_dwell))
         score_consumed = 0.0
 
     trigger_rerun = _should_schedule_rerun(
