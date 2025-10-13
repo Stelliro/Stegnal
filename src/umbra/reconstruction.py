@@ -238,8 +238,8 @@ def predict_missing_pixels(variations: np.ndarray) -> tuple[np.ndarray, np.ndarr
 
 
 def tiled_reconstruction(
-    decoder: "NoiseStreamDecoder",
-    packet: "NoisePacket",
+    decoder: NoiseStreamDecoder,
+    packet: NoisePacket,
     seed: int,
     *,
     tile_size: tuple[int, int] = (256, 256),

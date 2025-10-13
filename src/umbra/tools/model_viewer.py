@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import tkinter as tk
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from tkinter import filedialog, messagebox, ttk
+from typing import Any
 
 import numpy as np
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 from PIL import Image
 
 from umbra.reconstruction import (
@@ -422,7 +423,7 @@ class ModelViewerApp:
 
 def main() -> None:
     root = tk.Tk()
-    app = ModelViewerApp(root)
+    ModelViewerApp(root)
     try:
         root.mainloop()
     finally:

@@ -4,8 +4,8 @@ import pytest
 from umbra.codec import (
     _ensure_rgb_image,
     decode_wav_bytes_to_image,
-    encode_image_to_waveform,
     encode_image_to_wav_bytes,
+    encode_image_to_waveform,
 )
 from umbra.metrics import compute_metrics
 

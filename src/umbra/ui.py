@@ -10,29 +10,31 @@ import logging
 import math
 import time
 import zipfile
-from datetime import datetime
 from collections import OrderedDict
-from collections.abc import MutableMapping, Mapping
+from collections.abc import Mapping, MutableMapping
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
+
 if TYPE_CHECKING:
     from streamlit.delta_generator import DeltaGenerator
 
-from umbra.chart_export import export_chart_png
 from umbra.adversarial import AdversarialManager, apply_generator
+from umbra.chart_export import export_chart_png
 from umbra.codec import (
     decode_waveform_to_image,
-    encode_image_to_waveform,
     encode_image_to_wav_bytes,
+    encode_image_to_waveform,
 )
 from umbra.decoding import NoiseStreamDecoder
+from umbra.demo_packager import build_demo_package
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
 from umbra.evolution import (
     EvolutionManager,
@@ -59,7 +61,6 @@ from umbra.sound import (
     guess_shapes,
     load_waveform_from_wav,
 )
-from umbra.demo_packager import build_demo_package
 from umbra.visualization import (
     colorize_comparison,
     multiplicative_overlap,
@@ -2681,23 +2682,22 @@ def run() -> None:
         state.get("generations_to_queue", auto_settings["generations_to_queue"])
     )
     autosave_interval = int(state.get("autosave_interval", auto_settings["autosave_interval"]))
-    evolution_mode = (
-        "Infinite" if state.get("run_infinite", False) else state.get("evolution_mode", "Finite")
-    )
-
     max_overlap_so_far = float(np.clip(state.get("max_overlap_seen", 0.0), 0.0, 100.0))
 
     advanced_mode = not easy_mode
-    load_button = False
+    autosave_dir = Path(state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))).expanduser()
     if advanced_mode:
         with st.sidebar.expander("Session & autosave", expanded=False):
             st.text_input(
                 "Autosave directory",
-                value=state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR)),
+                value=str(autosave_dir),
                 help="Evolution checkpoints are saved here as evolution_state.pkl.",
                 key="autosave_dir",
             )
-            load_button = st.button("Load autosave")
+            if st.button("Load autosave"):
+                autosave_dir = Path(state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))).expanduser()
+                state["autosave_checked"] = True
+                _attempt_autoload(autosave_dir)
 
     autosave_dir = Path(state.get("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))).expanduser()
     normalized_autosave_dir = str(autosave_dir)
@@ -3444,7 +3444,6 @@ def run() -> None:
                 st.caption(
                     "Hyper performance mode tunes these parameters from runtime throughput and the current difficulty so you can focus on results."
                 )
-                evolution_mode = "Finite"
             else:
                 with st.sidebar.expander("Evolution cadence", expanded=False):
                     population_size = int(
@@ -3971,10 +3970,7 @@ def run() -> None:
             if run_id:
                 artifact_dir = run_store.artifacts_directory(run_id)
                 st.caption(
-                    "Active run {run_id} — artifacts stored in {path}".format(
-                        run_id=run_id,
-                        path=artifact_dir,
-                    )
+                    f"Active run {run_id} — artifacts stored in {artifact_dir}"
                 )
             else:
                 st.caption(
