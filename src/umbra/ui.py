@@ -538,6 +538,7 @@ def _render_quick_start_wizard(
         key="quick_start_easy_mode",
     )
     state["easy_mode"] = easy_mode
+    state["show_advanced_controls"] = not easy_mode
     mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
     if "difficulty_mode" not in state or state.get("difficulty_mode") not in mode_names:
         default_idx = 1 if len(mode_names) > 1 else 0
@@ -2568,6 +2569,7 @@ def run() -> None:
         hyper_profile=hyper_profile,
     )
     state["_latest_auto_settings"] = auto_settings
+    show_advanced = bool(state.get("show_advanced_controls", not easy_mode))
 
     _render_demo_lab(state, demo_tab)
 
