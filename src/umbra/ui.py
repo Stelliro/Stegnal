@@ -59,6 +59,7 @@ from umbra.sound import (
     guess_shapes,
     load_waveform_from_wav,
 )
+from umbra.packaging import build_demo_package
 from umbra.visualization import (
     colorize_comparison,
     multiplicative_overlap,
@@ -658,6 +659,137 @@ def _render_quick_start_wizard(
 
     return run_button, stop_button, reset_button, save_button, reload_button, auto_settings
 
+
+def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None = None) -> None:
+    """Render the portable demo controls with packaging helpers."""
+
+    target = container or st.container()
+
+    target.header("Codec demo package")
+    target.write(
+        "Bundle a minimal Umbra codec demo or try the encode/decode loop directly below."
+    )
+
+    package_col, demo_col = target.columns([1, 2])
+
+    package_container = package_col.container()
+    package_container.subheader("Share the model")
+    package_name = state.get("demo_package_name")
+    package_blob: bytes | None = state.get("demo_package_blob")
+
+    if package_container.button("Package demo executable", key="demo_package_button"):
+        with package_container.spinner("Building demo archive..."):
+            try:
+                name, blob = build_demo_package()
+            except Exception as exc:  # pragma: no cover - defensive
+                package_container.error(f"Packaging failed: {exc}")
+            else:
+                state["demo_package_name"] = name
+                state["demo_package_blob"] = blob
+                state["demo_package_timestamp"] = time.time()
+                package_name = name
+                package_blob = blob
+                package_container.success(
+                    "Demo packaged! Use the download button below to share it."
+                )
+
+    if package_blob:
+        package_container.download_button(
+            "Download demo archive",
+            data=package_blob,
+            file_name=package_name or "umbra_demo.pyz",
+            mime="application/octet-stream",
+            key="demo_package_download",
+        )
+    else:
+        package_container.caption(
+            "No package built yet. Press the button above to generate a shareable .pyz archive."
+        )
+
+    demo_container = demo_col.container()
+    demo_container.subheader("In-app translator")
+
+    uploaded = demo_container.file_uploader(
+        "Image input",
+        type=("png", "jpg", "jpeg", "bmp"),
+        key="demo_image_upload",
+    )
+
+    demo_image: np.ndarray | None = state.get("demo_image_array")
+    if uploaded is not None:
+        try:
+            uploaded.seek(0)
+            demo_image = _load_uploaded_image(uploaded)
+        except ValueError as exc:  # pragma: no cover - defensive
+            demo_container.error(str(exc))
+            demo_image = None
+        else:
+            state["demo_image_array"] = demo_image
+            state["demo_image_label"] = uploaded.name or "Uploaded image"
+            state["demo_resolution"] = demo_image.shape[:2]
+            state["demo_sample_rate"] = 48_000
+            try:
+                wav_bytes = encode_image_to_wav_bytes(
+                    demo_image,
+                    sample_rate=int(state["demo_sample_rate"]),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                demo_container.error(f"Failed to encode image: {exc}")
+            else:
+                state["demo_wav_bytes"] = wav_bytes
+                state["demo_wav_label"] = (
+                    Path(state.get("demo_image_label", "demo"))
+                    .with_suffix(".wav")
+                    .name
+                )
+
+    if demo_image is not None:
+        demo_container.image(
+            normalize_for_display(demo_image),
+            caption=state.get("demo_image_label", "Uploaded image"),
+            use_column_width=True,
+        )
+
+    wav_bytes = state.get("demo_wav_bytes")
+    sample_rate = int(state.get("demo_sample_rate", 48_000))
+    resolution = state.get("demo_resolution")
+
+    if wav_bytes is not None and isinstance(wav_bytes, (bytes, bytearray)):
+        demo_container.audio(wav_bytes, format="audio/wav")
+        demo_container.download_button(
+            "Download WAV",
+            data=wav_bytes,
+            file_name=state.get("demo_wav_label", "demo.wav"),
+            mime="audio/wav",
+            key="demo_wav_download",
+        )
+
+        if demo_container.button("Translate", key="demo_translate_button"):
+            try:
+                waveform, detected_rate = load_waveform_from_wav(bytes(wav_bytes))
+                active_rate = sample_rate or int(detected_rate)
+                if resolution is None:
+                    raise ValueError(
+                        "Unknown resolution. Upload an image first to establish dimensions."
+                    )
+                translated = decode_waveform_to_image(
+                    waveform,
+                    sample_rate=int(active_rate),
+                    resolution=tuple(int(v) for v in resolution),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                demo_container.error(f"Translation failed: {exc}")
+            else:
+                state["demo_translated_image"] = translated
+                state["demo_translation_timestamp"] = time.time()
+
+    translated = state.get("demo_translated_image")
+    if isinstance(translated, np.ndarray):
+        demo_container.image(
+            normalize_for_display(translated),
+            caption="Translated image",
+            use_column_width=True,
+        )
 
 def _render_control_panel(
     state: st.session_state,
@@ -2387,8 +2519,8 @@ def run() -> None:
         hyper_profile = None
 
     difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
-    quick_tab, tune_tab, progress_tab = st.tabs(
-        ["Quick Start", "Tune It", "Watch Progress"]
+    quick_tab, tune_tab, progress_tab, demo_tab = st.tabs(
+        ["Quick Start", "Tune It", "Watch Progress", "Demo"]
     )
     (
         run_button,
@@ -2404,6 +2536,8 @@ def run() -> None:
         hyper_profile=hyper_profile,
     )
     state["_latest_auto_settings"] = auto_settings
+
+    _render_demo_lab(state, demo_tab)
 
     population_size = int(state.get("population_size", auto_settings["population_size"]))
     generations_to_queue = int(
