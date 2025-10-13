@@ -1,6 +1,10 @@
 import math
 
-from umbra.progress import prepare_trend_chart, sanitize_progress_rows
+from umbra.progress import (
+    prepare_metrics_chart,
+    prepare_trend_chart,
+    sanitize_progress_rows,
+)
 
 
 def test_sanitize_progress_rows_handles_non_finite_values() -> None:
@@ -80,3 +84,20 @@ def test_sanitize_progress_rows_preserves_additional_columns() -> None:
     assert sanitized[0]["reward_total"] == 1.0
     assert sanitized[0]["difficulty_raw"] == 0.8
     assert "checkpoint_tag" not in sanitized[0]
+
+
+def test_prepare_metrics_chart_uses_root_dataset() -> None:
+    history = [
+        {"ai_overlap": 10.0, "ai_ssim": 0.1, "sound_overlap": 11.0},
+        {"ai_overlap": 12.0, "ai_ssim": 0.2, "sound_overlap": 13.0},
+    ]
+
+    spec = prepare_metrics_chart(history, markers=[1])
+
+    assert spec is not None
+    assert spec.get("data", {}).get("values")
+    assert "layer" in spec
+    base_layer = spec["layer"][0]
+    marker_layer = spec["layer"][1]
+    assert "data" not in base_layer
+    assert marker_layer.get("data", {}).get("values") == [{"Step": 1.0}]

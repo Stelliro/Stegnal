@@ -323,7 +323,6 @@ def prepare_metrics_chart(
 
     schema = "https://vega.github.io/schema/vega-lite/v6.json"
     base_layer: dict[str, object] = {
-        "data": {"values": values},
         "mark": {"type": "line", "point": True},
         "encoding": {
             "x": {
@@ -391,9 +390,10 @@ def prepare_metrics_chart(
                 ],
             },
         }
-        spec: dict[str, object] = {
+        spec = {
             "$schema": schema,
             "config": config,
+            "data": {"values": values},
             "layer": [base_layer, marker_layer],
             "resolve": {"scale": {"y": "shared"}},
         }
@@ -401,6 +401,7 @@ def prepare_metrics_chart(
         spec = {
             "$schema": schema,
             "config": config,
+            "data": {"values": values},
             **base_layer,
         }
 
