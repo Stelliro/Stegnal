@@ -486,8 +486,12 @@ def _render_quick_start_wizard(
 
     target_container = container or st.container()
     mode_names = list(_DIFFICULTY_MODE_PRESETS.keys())
+    easy_mode = bool(state.get("quick_start_easy_mode", False))
     if "difficulty_mode" not in state or state.get("difficulty_mode") not in mode_names:
-        default_idx = 1 if len(mode_names) > 1 else 0
+        if easy_mode and mode_names:
+            default_idx = 0
+        else:
+            default_idx = 1 if len(mode_names) > 1 else 0
         state["difficulty_mode"] = mode_names[default_idx]
 
     media_source = state.get("quick_start_media_source", "auto")
@@ -560,6 +564,8 @@ def _render_quick_start_wizard(
         key="quick_start_difficulty",
     )
     state["difficulty_mode"] = difficulty_choice
+    easy_mode = difficulty_choice == mode_names[0] if mode_names else False
+    state["quick_start_easy_mode"] = easy_mode
     step_status["mode"] = True
     mode_col.caption(
         "Difficulty drives every setting—no advanced mode required. Sound scenes refresh "
