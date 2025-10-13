@@ -27,6 +27,8 @@ def _ensure_rgb_image(image: np.ndarray | Image.Image) -> np.ndarray:
         return np.clip(array, 0.0, 1.0)
 
     array = np.asarray(image, dtype=np.float32)
+    if array.ndim == 3 and array.shape[2] == 1:
+        array = array[..., 0]
     if array.ndim == 2:
         array = np.repeat(array[..., None], 3, axis=2)
     if array.ndim != 3 or array.shape[2] < 3:

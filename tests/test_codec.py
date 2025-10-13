@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from umbra.codec import (
+    _ensure_rgb_image,
     decode_wav_bytes_to_image,
     encode_image_to_waveform,
     encode_image_to_wav_bytes,
@@ -39,6 +40,14 @@ def test_encode_image_accepts_grayscale() -> None:
     gray = np.linspace(0.0, 1.0, 16, dtype=np.float32).reshape(4, 4)
     waveform = encode_image_to_waveform(gray, sample_rate=1024)
     assert waveform.size == 1024
+
+
+def test_ensure_rgb_accepts_single_channel_dimension() -> None:
+    single_channel = np.linspace(0.0, 1.0, 9, dtype=np.float32).reshape(3, 3, 1)
+    rgb = _ensure_rgb_image(single_channel)
+    assert rgb.shape == (3, 3, 3)
+    assert rgb.dtype == np.float32
+    assert np.all((0.0 <= rgb) & (rgb <= 1.0))
 
 
 def test_decode_requires_bytes() -> None:
