@@ -12,7 +12,7 @@ import time
 import zipfile
 from datetime import datetime
 from collections import OrderedDict
-from collections.abc import MutableMapping
+from collections.abc import MutableMapping, Mapping
 from io import BytesIO
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -288,6 +288,129 @@ def _auto_run_parameters(
     }
 
 
+def _base_sound_score_target(
+    dwell: float,
+    *,
+    difficulty_progress: float,
+    difficulty_target: float | None = None,
+) -> float:
+    """Estimate the score budget required before refreshing the sound scene."""
+
+    progress = float(np.clip(difficulty_progress, 0.0, 1.0))
+    target = (
+        float(np.clip(difficulty_target, 0.0, 1.0))
+        if difficulty_target is not None
+        else progress
+    )
+
+    progress_factor = 0.9 + 0.8 * progress
+    difficulty_factor = 1.2 - 0.5 * target
+
+    return float(max(1.0, dwell * progress_factor * difficulty_factor))
+
+
+def _next_sound_budget_rng(state: st.session_state) -> np.random.Generator:
+    """Return a reproducible RNG for score budgeting with updated seed."""
+
+    seed = int(state.get("_sound_score_seed", 0))
+    if seed <= 0:
+        seed = int(np.random.default_rng().integers(1, np.iinfo(np.int32).max))
+    rng = np.random.default_rng(seed)
+    state["_sound_score_seed"] = int(rng.integers(1, np.iinfo(np.int32).max))
+    return rng
+
+
+def _compute_sound_score_target(
+    auto_settings: Mapping[str, Any],
+    *,
+    difficulty_progress: float,
+    rng: np.random.Generator,
+) -> float:
+    dwell = float(auto_settings.get("target_dwell", 10))
+    base_target = _base_sound_score_target(
+        dwell,
+        difficulty_progress=difficulty_progress,
+        difficulty_target=float(auto_settings.get("difficulty_target", difficulty_progress)),
+    )
+    jitter = float(rng.uniform(0.85, 1.25))
+    return float(max(1.0, base_target * jitter))
+
+
+def _ensure_sound_score_budget(
+    state: st.session_state,
+    auto_settings: Mapping[str, Any],
+    *,
+    difficulty_progress: float,
+    force: bool = False,
+) -> float:
+    """Synchronise the target score budget with the current difficulty profile."""
+
+    dwell = float(auto_settings.get("target_dwell", 10))
+    baseline = _base_sound_score_target(
+        dwell,
+        difficulty_progress=difficulty_progress,
+        difficulty_target=float(auto_settings.get("difficulty_target", difficulty_progress)),
+    )
+
+    previous_baseline = float(state.get("_sound_target_baseline", 0.0))
+    current_target = float(state.get("sound_target_score", 0.0))
+
+    if force or current_target <= 0.0:
+        rng = _next_sound_budget_rng(state)
+        new_target = _compute_sound_score_target(
+            auto_settings,
+            difficulty_progress=difficulty_progress,
+            rng=rng,
+        )
+        state["sound_target_score"] = new_target
+        state["sound_score_remaining"] = new_target
+        state["_sound_target_baseline"] = baseline
+        return new_target
+
+    if previous_baseline <= 0.0:
+        state["_sound_target_baseline"] = baseline
+        return current_target
+
+    change_ratio = abs(baseline - previous_baseline) / max(previous_baseline, 1.0)
+    if change_ratio >= 0.25:
+        scale = baseline / previous_baseline
+        updated_target = max(1.0, current_target * scale)
+        remaining = float(state.get("sound_score_remaining", current_target))
+        state["sound_target_score"] = updated_target
+        state["sound_score_remaining"] = max(0.0, remaining * scale)
+        state["_sound_target_baseline"] = baseline
+        return updated_target
+
+    state["_sound_target_baseline"] = baseline
+    return current_target
+
+
+def _generation_sound_score(generation: GenerationRecord) -> float:
+    """Quantify how much a generation should consume from the sound budget."""
+
+    try:
+        reward_peak = max(0.0, float(generation.reward_peak))
+    except (TypeError, ValueError):
+        reward_peak = 0.0
+
+    try:
+        reward_summary = max(0.0, float(generation.reward_summary))
+    except (TypeError, ValueError):
+        reward_summary = 0.0
+
+    overlap = 0.0
+    best_candidate = getattr(generation, "best_candidate", None)
+    overlap_score = getattr(best_candidate, "overlap_score", None)
+    if overlap_score is not None:
+        try:
+            overlap = float(np.clip(overlap_score, 0.0, 100.0)) / 100.0
+        except (TypeError, ValueError):
+            overlap = 0.0
+
+    weighted = 0.45 * reward_peak + 0.3 * reward_summary + 1.5 * overlap + 0.2
+    return float(np.clip(weighted, 0.1, 8.0))
+
+
 def _aggregate_reward_components(record: GenerationRecord) -> dict[str, float | None]:
     """Average reward component contributions for ``record``."""
 
@@ -436,7 +559,10 @@ def _render_quick_start_wizard(
     )
     state["difficulty_mode"] = difficulty_choice
     step_status["mode"] = True
-    mode_col.caption("Difficulty drives every setting—no advanced mode required.")
+    mode_col.caption(
+        "Difficulty drives every setting—no advanced mode required. Sound scenes refresh "
+        "automatically once their score target is reached."
+    )
 
     profile = _DIFFICULTY_MODE_PRESETS[state["difficulty_mode"]]
     auto_settings = _auto_run_parameters(
@@ -455,7 +581,12 @@ def _render_quick_start_wizard(
         auto_settings["generations_to_queue"],
     )
     stats_cols[2].metric("Scene shapes", auto_settings["shape_count"])
-    mode_col.metric("Sound dwell (gens)", auto_settings["target_dwell"])
+    estimated_score = _base_sound_score_target(
+        float(auto_settings["target_dwell"]),
+        difficulty_progress=difficulty_progress,
+        difficulty_target=float(auto_settings.get("difficulty_target", difficulty_progress)),
+    )
+    mode_col.metric("Sound score target", f"{estimated_score:.1f}")
     if hyper_profile is None:
         state["population_size"] = auto_settings["population_size"]
         state["generations_to_queue"] = auto_settings["generations_to_queue"]
@@ -1080,7 +1211,6 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     state["current_sound_sample_rate"] = int(scene["sample_rate"])
     state["current_sound_resolution"] = int(scene["resolution"])
     state["shared_seed"] = int(scene["base_seed"])
-    state["sound_generations_left"] = int(scene["target_dwell"])
     state["population_size"] = manager.population_size
     state["autosave_interval"] = manager.autosave_interval
     if EvolutionManager.hyper_mode_enabled():
@@ -1093,7 +1223,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
         )
         state["sound_target_dwell"] = dwell
         state["last_sound_target_dwell"] = dwell
-        state["sound_generations_left"] = min(int(state.get("sound_generations_left", dwell)), dwell)
+        scene["target_dwell"] = dwell
     label = f"Autosave • {time.strftime('%H:%M:%S')}"
     metadata = {
         "shared_seed": int(scene["base_seed"]),
@@ -1114,6 +1244,16 @@ def _attempt_autoload(autosave_dir: Path) -> None:
     state["evolution_signature"] = (manager.image_signature, int(manager.base_seed))
     state["pending_generations"] = 0
     state["run_infinite"] = False
+    auto_settings = {
+        "target_dwell": int(scene["target_dwell"]),
+        "difficulty_target": float(state.get("difficulty", 0.0)),
+    }
+    _ensure_sound_score_budget(
+        state,
+        auto_settings,
+        difficulty_progress=float(state.get("difficulty", 0.0)),
+        force=True,
+    )
     _sync_active_tree_state(state)
     st.success("Loaded autosaved evolution session.")
     logger.info(
@@ -1832,7 +1972,6 @@ def _refresh_sound_scene(
         int(resolution_bounds[0]),
         int(resolution_bounds[1]),
     )
-    state["sound_generations_left"] = int(target_dwell)
     state["shared_seed"] = new_shared_seed
 
     if record_event:
@@ -1935,6 +2074,8 @@ def _session_export_payload(
             "max_overlap": float(state.get("max_overlap_seen", 0.0)),
             "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
             "dwell_generations": int(target_dwell),
+            "score_budget": float(state.get("sound_target_score", 0.0)),
+            "score_remaining": float(state.get("sound_score_remaining", 0.0)),
             "momentum": float(state.get("difficulty_improvement", 0.0)),
             "volatility": float(state.get("difficulty_volatility", 0.0)),
             "raw": difficulty_raw,
@@ -2059,6 +2200,8 @@ def _build_export_bundle(payload: dict[str, Any], progress_rows: list[dict[str, 
             "max_overlap": float(state.get("max_overlap_seen", 0.0)),
             "sound_reseed_count": int(state.get("sound_reseed_count", 0)),
             "dwell_generations": int(target_dwell),
+            "score_budget": float(state.get("sound_target_score", 0.0)),
+            "score_remaining": float(state.get("sound_score_remaining", 0.0)),
             "momentum": float(state.get("difficulty_improvement", 0.0)),
             "volatility": float(state.get("difficulty_volatility", 0.0)),
             "raw": difficulty_raw,
@@ -2188,7 +2331,8 @@ def run() -> None:
         )
     state.setdefault("sound_target_dwell", 10)
     state.setdefault("last_sound_target_dwell", int(state["sound_target_dwell"]))
-    state.setdefault("sound_generations_left", int(state["sound_target_dwell"]))
+    state.setdefault("sound_target_score", 0.0)
+    state.setdefault("sound_score_remaining", float(state.get("sound_target_score", 0.0)))
     state.setdefault("sound_reseed_count", 0)
     state.setdefault("difficulty_progress", 0.0)
     state.setdefault("max_overlap_seen", 0.0)
@@ -2238,10 +2382,6 @@ def run() -> None:
         state["generations_to_queue"] = queue_baseline
         state["sound_target_dwell"] = dwell_baseline
         state["last_sound_target_dwell"] = dwell_baseline
-        state["sound_generations_left"] = min(
-            int(state.get("sound_generations_left", dwell_baseline)),
-            dwell_baseline,
-        )
         state["evolution_mode"] = "Finite"
     else:
         hyper_profile = None
@@ -2319,7 +2459,16 @@ def run() -> None:
         state["sound_resolution_bounds"] = tuple(int(v) for v in preset["resolution"])
         state["sound_target_dwell"] = int(preset["target_dwell"])
         state["last_sound_target_dwell"] = int(preset["target_dwell"])
-        state["sound_generations_left"] = int(preset["target_dwell"])
+        sound_budget_settings = {
+            "target_dwell": int(preset["target_dwell"]),
+            "difficulty_target": float(auto_settings.get("difficulty_target", difficulty_progress)),
+        }
+        _ensure_sound_score_budget(
+            state,
+            sound_budget_settings,
+            difficulty_progress=difficulty_progress,
+            force=True,
+        )
 
     if state.get("_active_evolution_engine") != selected_engine:
         state["_active_evolution_engine"] = selected_engine
@@ -2338,7 +2487,14 @@ def run() -> None:
 
     if state.get("last_sound_target_dwell") != target_dwell:
         state["last_sound_target_dwell"] = target_dwell
-        state["sound_generations_left"] = target_dwell
+
+    sound_budget_settings = dict(auto_settings)
+    sound_budget_settings["target_dwell"] = target_dwell
+    target_score = _ensure_sound_score_budget(
+        state,
+        sound_budget_settings,
+        difficulty_progress=difficulty_progress,
+    )
 
     if "sound_sample_rate_bounds" not in state or "sound_resolution_bounds" not in state:
         _refresh_sound_scene(
@@ -2350,10 +2506,16 @@ def run() -> None:
             volatility=float(state.get("difficulty_volatility", 0.0)),
             max_overlap=max_overlap_so_far,
         )
+        target_score = _ensure_sound_score_budget(
+            state,
+            sound_budget_settings,
+            difficulty_progress=difficulty_progress,
+            force=True,
+        )
 
-    if state.get("sound_generations_left", target_dwell) > target_dwell:
-        state["sound_generations_left"] = target_dwell
-    remaining_before = int(state.get("sound_generations_left", target_dwell))
+    score_remaining_before = float(
+        state.get("sound_score_remaining", float(target_score))
+    )
 
     state.setdefault("evolution_trees", {})
 
@@ -2381,8 +2543,8 @@ def run() -> None:
     state["active_encoder_sigma"] = encoder_sigma
     state["active_decoder_sigma"] = denoise_sigma
 
-    state["sound_generations_left"] = int(
-        max(0, min(state.get("sound_generations_left", target_dwell), target_dwell))
+    state["sound_score_remaining"] = float(
+        max(0.0, state.get("sound_score_remaining", float(target_score)))
     )
 
     current_sample_rate = int(state.get("current_sound_sample_rate", sample_rate_range[0]))
@@ -2712,7 +2874,8 @@ def run() -> None:
         state["run_infinite"] = False
         state["active_run_id"] = None
         state.pop("adaptive_scene", None)
-        state["sound_generations_left"] = 0
+        state["sound_score_remaining"] = 0.0
+        state["sound_target_score"] = 0.0
         state["difficulty"] = 0.0
         state["evolution_trees"] = {}
         state.pop("active_tree_id", None)
@@ -2787,6 +2950,7 @@ def run() -> None:
 
     generations_ran = 0
     reseeded = False
+    score_consumed = 0.0
     if runs_to_execute:
         for _ in range(runs_to_execute):
             selection = state.get("active_parent_seeds", [])
@@ -2805,6 +2969,7 @@ def run() -> None:
                 float(state.get("difficulty_reward", 0.0)),
                 reward_signal,
             )
+            score_consumed += _generation_sound_score(generation)
             generations_ran += 1
             if finite_batch:
                 state["pending_generations"] = max(
@@ -2833,24 +2998,39 @@ def run() -> None:
                 max(1, profile.dwell_generations or state.get("sound_target_dwell", target_dwell))
             )
             state["last_sound_target_dwell"] = int(state["sound_target_dwell"])
-            state["sound_generations_left"] = min(
-                int(state.get("sound_generations_left", state["sound_target_dwell"])),
-                int(state["sound_target_dwell"]),
-            )
             state["evolution_mode"] = "Finite"
             population_size = int(state["population_size"])
             autosave_interval = int(state["autosave_interval"])
             generations_to_queue = int(state["generations_to_queue"])
             target_dwell = int(state["sound_target_dwell"])
+            sound_budget_settings["target_dwell"] = target_dwell
+            hyper_budget_settings = {
+                "target_dwell": target_dwell,
+                "difficulty_target": float(auto_settings.get("difficulty_target", difficulty_progress)),
+            }
+            target_score = _ensure_sound_score_budget(
+                state,
+                hyper_budget_settings,
+                difficulty_progress=float(
+                    np.clip(state.get("difficulty_progress", difficulty_progress), 0.0, 1.0)
+                ),
+            )
         _sync_active_tree_state(state)
 
     trigger_rerun = False
     if generations_ran:
-        remaining_before = int(state.get("sound_generations_left", target_dwell))
-        remaining_after = max(remaining_before - 1, 0)
-        state["sound_generations_left"] = remaining_after
+        score_remaining = max(0.0, score_remaining_before - score_consumed)
+        state["sound_score_remaining"] = score_remaining
 
-        if remaining_after == 0:
+        if score_remaining <= 0.0:
+            target_score = _ensure_sound_score_budget(
+                state,
+                sound_budget_settings,
+                difficulty_progress=float(
+                    np.clip(state.get("difficulty_progress", difficulty_progress), 0.0, 1.0)
+                ),
+                force=True,
+            )
             new_seed, next_rate, next_resolution = _refresh_sound_scene(
                 state,
                 float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0)),
@@ -2863,15 +3043,20 @@ def run() -> None:
             sound_seed = int(state.get("active_sound_seed", new_seed))
             current_sample_rate = next_rate
             current_resolution = next_resolution
-            state["sound_generations_left"] = int(target_dwell)
+            state["sound_score_remaining"] = float(
+                state.get("sound_target_score", float(target_score))
+            )
+            score_remaining = float(state["sound_score_remaining"])
             reseeded = True
             st.info(
-                "Auto-randomised sound scene after completing the dwell window "
-                f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px)."
+                "Auto-randomised sound scene after exhausting the score budget "
+                f"(seed {sound_seed}, {next_rate:,} Hz, {next_resolution}×{next_resolution} px; "
+                f"new target ≈ {state.get('sound_target_score', target_score):.1f})."
             )
 
     else:
-        state["sound_generations_left"] = remaining_before
+        state["sound_score_remaining"] = score_remaining_before
+        score_consumed = 0.0
 
     trigger_rerun = _should_schedule_rerun(
         generations_ran=generations_ran,
@@ -2885,9 +3070,15 @@ def run() -> None:
         st.success(f"Autosaved evolution session to {save_path}")
         logger.info("Autosaved evolution session to %s", save_path)
 
+    current_target_score = float(state.get("sound_target_score", float(target_score)))
+    remaining_score = float(state.get("sound_score_remaining", current_target_score))
+    delta_display: str | None = None
+    if generations_ran and score_consumed > 0.0:
+        delta_display = f"-{score_consumed:.2f}"
     st.sidebar.metric(
-        "Generations remaining on sound target",
-        int(state.get("sound_generations_left", target_dwell)),
+        "Sound score remaining",
+        f"{remaining_score:.2f} / {current_target_score:.2f}",
+        delta_display,
     )
 
     generation_progress_rows: list[dict[str, Any]] = []
