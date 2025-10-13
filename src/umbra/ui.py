@@ -3385,10 +3385,10 @@ def run() -> None:
                 "How clear the AI picture looks",
                 float(metrics.psnr),
                 value_display=f"{metrics.psnr:.2f} dB",
-                scale_min=10.0,
-                scale_max=50.0,
-                good_range=(28.0, 35.0),
-                caption="Aim for 30 dB or more for a crisp-looking render.",
+                scale_min=20.0,
+                scale_max=60.0,
+                good_range=(45.0, 52.0),
+                caption="Push toward 50 dB or more for a crystal-clear render.",
                 tooltip="PSNR compares brightness differences; higher numbers mean less noise.",
             )
         with ai_metrics_cols[1]:
@@ -3437,10 +3437,10 @@ def run() -> None:
                 "How closely the sound picture tracks the AI",
                 float(sound_metrics.psnr),
                 value_display=f"{sound_metrics.psnr:.2f} dB",
-                scale_min=10.0,
-                scale_max=50.0,
-                good_range=(26.0, 32.0),
-                caption="Higher PSNR means the sound-driven reconstruction preserves the AI's brightness cues.",
+                scale_min=20.0,
+                scale_max=60.0,
+                good_range=(40.0, 48.0),
+                caption="Higher PSNR means the sound-driven reconstruction preserves the AI's brightness cues; aim for 45 dB or more.",
                 tooltip="PSNR between the sound-only reconstruction and the AI reconstruction.",
             )
         with sound_metrics_cols[1]:
