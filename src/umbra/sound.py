@@ -150,34 +150,61 @@ def _synthesise_sound_image(
     rng: np.random.Generator,
     volumes: dict[str, float],
     image_size: tuple[int, int],
+    *,
+    shape_count: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[ShapeSpec]]:
     """Create the colour/grayscale pair representing ``volumes``."""
 
     color_canvas = np.zeros((*image_size, 3), dtype=np.float32)
     rows, cols = image_size
-    min_extent = max(min(rows, cols) // 5, 18)
-    max_extent = max(min(rows, cols) // 4, min_extent + 6)
-    padding = int(np.ceil(max_extent * 1.25))
+    min_extent = max(int(min(rows, cols) * 0.05), 8)
+    max_extent = max(int(min(rows, cols) * 0.4), min_extent + 6)
 
     shapes: list[ShapeSpec] = []
     shape_types = ("circle", "square", "triangle")
     channels = {"red": 0, "green": 1, "blue": 2}
+    colour_order = ["red", "green", "blue"]
 
-    for color_name in ("red", "green", "blue"):
+    total_shapes = int(shape_count) if shape_count is not None else len(colour_order)
+    total_shapes = max(3, total_shapes)
+    weight_array = np.array([
+        max(float(volumes.get(name, 0.0)), 1e-3) for name in colour_order
+    ])
+    weight_sum = float(weight_array.sum())
+    if weight_sum <= 0.0:
+        weight_array = np.ones_like(weight_array, dtype=np.float32)
+        weight_sum = float(weight_array.sum())
+    probabilities = (weight_array / weight_sum).astype(np.float32)
+
+    sequence: list[str] = []
+    for base_colour in colour_order:
+        sequence.append(base_colour)
+        if len(sequence) >= total_shapes:
+            break
+    while len(sequence) < total_shapes:
+        chosen = str(rng.choice(colour_order, p=probabilities))
+        sequence.append(chosen)
+
+    for color_name in sequence:
         channel = channels[color_name]
-        extent = int(rng.integers(min_extent, max_extent + 1))
-        cy = int(rng.integers(padding, rows - padding)) if rows > 2 * padding else rows // 2
-        cx = int(rng.integers(padding, cols - padding)) if cols > 2 * padding else cols // 2
+        base_extent = float(rng.uniform(min_extent, max_extent))
+        cy = int(rng.integers(0, rows))
+        cx = int(rng.integers(0, cols))
         center = (cy, cx)
         shape = rng.choice(shape_types)
         rotation = float(rng.uniform(0, 2 * np.pi)) if shape != "circle" else 0.0
-        intensity = float(np.clip(volumes.get(color_name, 0.0), 0.05, 1.0))
+        base_volume = float(np.clip(volumes.get(color_name, 0.0), 0.05, 1.0))
+        variation = float(rng.uniform(0.85, 1.15))
+        scaled = float(np.clip(base_volume * variation, 0.05, 1.0))
+        intensity = scaled
 
         if shape == "circle":
-            _draw_circle(color_canvas, center, extent, channel, intensity)
+            radius = int(max(2, round(base_extent * rng.uniform(0.4, 0.9))))
+            _draw_circle(color_canvas, center, radius, channel, intensity)
+            size_value = max(2, radius * 2)
         else:
             if shape == "square":
-                half = float(extent)
+                half = float(base_extent * rng.uniform(0.4, 0.9))
                 base = np.array(
                     [
                         [-half, -half],
@@ -187,9 +214,10 @@ def _synthesise_sound_image(
                     ],
                     dtype=np.float32,
                 )
+                size_value = int(max(2, round(half * 2)))
             else:
-                height = float(extent)
-                width = float(extent)
+                height = float(base_extent * rng.uniform(0.5, 1.1))
+                width = float(base_extent * rng.uniform(0.4, 1.0))
                 base = np.array(
                     [
                         [0.0, -height],
@@ -198,6 +226,7 @@ def _synthesise_sound_image(
                     ],
                     dtype=np.float32,
                 )
+                size_value = int(max(2, round(max(height, width))))
 
             rotated = _rotate_offsets(base, rotation)
             vertices = [(center[0] + pt[1], center[1] + pt[0]) for pt in rotated]
@@ -210,7 +239,7 @@ def _synthesise_sound_image(
                 volume=intensity,
                 center=center,
                 rotation=np.degrees(rotation),
-                size=extent,
+                size=int(size_value),
             )
         )
 
@@ -231,6 +260,7 @@ def generate_sound_art(
     *,
     image_size: tuple[int, int] = (192, 192),
     sample_rate: int = 48_000,
+    shape_count: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, SyntheticSound, list[ShapeSpec]]:
     """Create a colour image and grayscale reference from a synthetic sound clip."""
 
@@ -245,7 +275,9 @@ def generate_sound_art(
         {key: round(val, 3) for key, val in volumes.items()},
     )
 
-    color_canvas, grayscale, shapes = _synthesise_sound_image(rng, volumes, image_size)
+    color_canvas, grayscale, shapes = _synthesise_sound_image(
+        rng, volumes, image_size, shape_count=shape_count
+    )
 
     sound = SyntheticSound(
         seed=seed,
@@ -265,6 +297,7 @@ def generate_sound_art_from_waveform(
     *,
     image_size: tuple[int, int] = (192, 192),
     seed: int | None = None,
+    shape_count: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, SyntheticSound, list[ShapeSpec]]:
     """Create a colour/grayscale pair from an uploaded waveform."""
 
@@ -288,7 +321,9 @@ def generate_sound_art_from_waveform(
         seed = _seed_from_samples(wave)
 
     rng = np.random.default_rng(int(seed))
-    color_canvas, grayscale, shapes = _synthesise_sound_image(rng, volumes, image_size)
+    color_canvas, grayscale, shapes = _synthesise_sound_image(
+        rng, volumes, image_size, shape_count=shape_count
+    )
 
     sound = SyntheticSound(
         seed=int(seed),
