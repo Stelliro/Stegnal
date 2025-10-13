@@ -117,7 +117,7 @@ def test_auto_pause_does_not_cancel_infinite_mode(monkeypatch) -> None:
         )
 
         assert message == (
-            "Difficulty spike detected – infinite mode will continue running; "
+            "Difficulty spike detected – Keep Improving will continue running; "
             "refresh the scene manually if desired."
         )
         assert stub_state["run_infinite"] is True

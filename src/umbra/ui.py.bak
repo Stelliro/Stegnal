@@ -602,15 +602,9 @@ def _render_quick_start_wizard(
     run_col.markdown(
         ("✅" if step_status["run"] else "③") + " **Step 3** · Launch evolution"
     )
-    infinite_default = bool(state.get("quick_start_infinite_preference", False))
-    infinite_toggle = run_col.checkbox(
-        "Run infinitely",
-        value=infinite_default,
-        key="quick_start_infinite_toggle",
-        help="When enabled, Umbra keeps evolving new generations without stopping.",
-    )
-    state["quick_start_infinite_preference"] = infinite_toggle
-    state["evolution_mode"] = "Infinite" if infinite_toggle else "Finite"
+    state["quick_start_infinite_preference"] = False
+    state["run_infinite"] = False
+    state["evolution_mode"] = "Finite"
     controls_row = run_col.columns(2)
     run_button = controls_row[0].button(
         "Start", use_container_width=True, key="quick_start_run"

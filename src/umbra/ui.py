@@ -529,7 +529,6 @@ def _render_quick_start_wizard(
     """Render the staged quick-start controls inside ``container``."""
 
     target_container = container or st.container()
-    defaults_applied = bool(state.get("_easy_mode_defaults_applied", False))
     easy_mode = bool(state.get("easy_mode", True))
 
     easy_mode = target_container.toggle(
@@ -709,9 +708,8 @@ def _render_quick_start_wizard(
         state["difficulty_mode"] = balanced_name
         state["population_size"] = auto_settings["population_size"]
         state["difficulty_target_override"] = auto_settings["difficulty_target"]
-        if not defaults_applied:
-            state["run_infinite"] = True
-        state["evolution_mode"] = "Infinite"
+        state["run_infinite"] = False
+        state["evolution_mode"] = "Finite"
         state["_easy_mode_defaults_applied"] = True
         if hyper_profile is None:
             state["generations_to_queue"] = auto_settings["generations_to_queue"]
@@ -719,8 +717,7 @@ def _render_quick_start_wizard(
             state["sound_target_dwell"] = auto_settings["target_dwell"]
             state["last_sound_target_dwell"] = auto_settings["target_dwell"]
         guidance_text = (
-            "Easy Mode keeps evolution running with a balanced difficulty target and "
-            "10 candidates per generation."
+            "Easy Mode prepares balanced defaults with 10 candidates per generation."
         )
     else:
         state["_easy_mode_defaults_applied"] = False
