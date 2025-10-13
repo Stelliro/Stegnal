@@ -2541,8 +2541,8 @@ def run() -> None:
         hyper_profile = None
 
     difficulty_progress = float(np.clip(state.get("difficulty_progress", 0.0), 0.0, 1.0))
-    quick_tab, tune_tab, progress_tab = st.tabs(
-        ["Quick Start", "Tune It", "Watch Progress"]
+    quick_tab, demo_tab, tune_tab, progress_tab = st.tabs(
+        ["Quick Start", "Demo Lab", "Tune It", "Watch Progress"]
     )
     (
         easy_mode,
