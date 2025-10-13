@@ -157,9 +157,8 @@ def _synthesise_sound_image(
 
     color_canvas = np.zeros((*image_size, 3), dtype=np.float32)
     rows, cols = image_size
-    min_extent = max(min(rows, cols) // 5, 18)
-    max_extent = max(min(rows, cols) // 4, min_extent + 6)
-    padding = int(np.ceil(max_extent * 1.25))
+    min_extent = max(int(min(rows, cols) * 0.05), 8)
+    max_extent = max(int(min(rows, cols) * 0.4), min_extent + 6)
 
     shapes: list[ShapeSpec] = []
     shape_types = ("circle", "square", "triangle")
@@ -188,9 +187,9 @@ def _synthesise_sound_image(
 
     for color_name in sequence:
         channel = channels[color_name]
-        extent = int(rng.integers(min_extent, max_extent + 1))
-        cy = int(rng.integers(padding, rows - padding)) if rows > 2 * padding else rows // 2
-        cx = int(rng.integers(padding, cols - padding)) if cols > 2 * padding else cols // 2
+        base_extent = float(rng.uniform(min_extent, max_extent))
+        cy = int(rng.integers(0, rows))
+        cx = int(rng.integers(0, cols))
         center = (cy, cx)
         shape = rng.choice(shape_types)
         rotation = float(rng.uniform(0, 2 * np.pi)) if shape != "circle" else 0.0
@@ -200,10 +199,12 @@ def _synthesise_sound_image(
         intensity = scaled
 
         if shape == "circle":
-            _draw_circle(color_canvas, center, extent, channel, intensity)
+            radius = int(max(2, round(base_extent * rng.uniform(0.4, 0.9))))
+            _draw_circle(color_canvas, center, radius, channel, intensity)
+            size_value = max(2, radius * 2)
         else:
             if shape == "square":
-                half = float(extent)
+                half = float(base_extent * rng.uniform(0.4, 0.9))
                 base = np.array(
                     [
                         [-half, -half],
@@ -213,9 +214,10 @@ def _synthesise_sound_image(
                     ],
                     dtype=np.float32,
                 )
+                size_value = int(max(2, round(half * 2)))
             else:
-                height = float(extent)
-                width = float(extent)
+                height = float(base_extent * rng.uniform(0.5, 1.1))
+                width = float(base_extent * rng.uniform(0.4, 1.0))
                 base = np.array(
                     [
                         [0.0, -height],
@@ -224,6 +226,7 @@ def _synthesise_sound_image(
                     ],
                     dtype=np.float32,
                 )
+                size_value = int(max(2, round(max(height, width))))
 
             rotated = _rotate_offsets(base, rotation)
             vertices = [(center[0] + pt[1], center[1] + pt[0]) for pt in rotated]
@@ -236,7 +239,7 @@ def _synthesise_sound_image(
                 volume=intensity,
                 center=center,
                 rotation=np.degrees(rotation),
-                size=extent,
+                size=int(size_value),
             )
         )
 
