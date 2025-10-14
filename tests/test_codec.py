@@ -4,8 +4,8 @@ import pytest
 from umbra.codec import (
     _ensure_rgb_image,
     decode_wav_bytes_to_image,
-    encode_image_to_waveform,
     encode_image_to_wav_bytes,
+    encode_image_to_waveform,
 )
 from umbra.metrics import compute_metrics
 
@@ -40,6 +40,59 @@ def test_encode_image_accepts_grayscale() -> None:
     gray = np.linspace(0.0, 1.0, 16, dtype=np.float32).reshape(4, 4)
     waveform = encode_image_to_waveform(gray, sample_rate=1024)
     assert waveform.size == 1024
+
+
+def test_segmented_waveform_round_trip() -> None:
+    image = _random_image(size=12)
+    sample_rate = 2048
+    segments = 3
+    marker = 0.02
+
+    waveform = encode_image_to_waveform(
+        image,
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker,
+    )
+    assert waveform.ndim == 1
+    marker_samples = int(round(marker * sample_rate))
+    expected_segment = sample_rate + marker_samples
+    assert waveform.size == expected_segment * segments
+
+    decoded = decode_wav_bytes_to_image(
+        encode_image_to_wav_bytes(
+            image,
+            sample_rate=sample_rate,
+            segments=segments,
+            marker_duration=marker,
+        ),
+        resolution=image.shape[:2],
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker,
+    )[0]
+
+    metrics = compute_metrics(image, decoded)
+    assert metrics.psnr > 0.0
+    assert -1.0 <= metrics.ssim <= 1.0
+
+
+def test_waveform_duration_is_capped() -> None:
+    image = _random_image(size=6)
+    sample_rate = 8_000
+    absurd_segments = 500_000
+
+    waveform = encode_image_to_waveform(
+        image,
+        sample_rate=sample_rate,
+        segments=absurd_segments,
+        marker_duration=0.5,
+    )
+
+    assert waveform.ndim == 1
+    # Ten minute cap from reconstruction module
+    max_samples = int(600.0 * sample_rate)
+    assert 0 < waveform.size <= max_samples
 
 
 def test_ensure_rgb_accepts_single_channel_dimension() -> None:
