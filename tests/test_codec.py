@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from umbra.codec import (
+    DecodedWavMetadata,
     _ensure_rgb_image,
     decode_wav_bytes_to_image,
     encode_image_to_wav_bytes,
@@ -106,4 +107,34 @@ def test_ensure_rgb_accepts_single_channel_dimension() -> None:
 def test_decode_requires_bytes() -> None:
     with pytest.raises(TypeError):
         decode_wav_bytes_to_image("not-bytes", resolution=(4, 4))  # type: ignore[arg-type]
+
+
+def test_decode_waveform_metadata_inference() -> None:
+    image = _random_image(size=10)
+    sample_rate = 8192
+    segments = 4
+    marker = 0.03
+
+    wav_bytes = encode_image_to_wav_bytes(
+        image,
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker,
+    )
+
+    decoded, metadata = decode_wav_bytes_to_image(
+        wav_bytes,
+        resolution=image.shape[:2],
+        return_metadata=True,
+        marker_duration=marker,
+        segments=None,
+    )
+
+    assert isinstance(metadata, DecodedWavMetadata)
+    assert metadata.sample_rate == sample_rate
+    assert metadata.segments == segments
+    assert pytest.approx(metadata.marker_duration, rel=1e-6) == marker
+
+    metrics = compute_metrics(image, decoded)
+    assert metrics.psnr > 0.0
 

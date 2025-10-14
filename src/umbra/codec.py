@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from dataclasses import dataclass
+
 from .reconstruction import (
     image_to_waveform,
     reconstruct_from_waveform,
@@ -39,6 +41,15 @@ def _ensure_rgb_image(image: np.ndarray | Image.Image) -> np.ndarray:
             max_val = 1.0
         array = np.clip(array / max_val, 0.0, 1.0)
     return array[..., :3].astype(np.float32)
+
+
+@dataclass(frozen=True)
+class DecodedWavMetadata:
+    """Metadata describing a reconstructed image extracted from WAV bytes."""
+
+    sample_rate: int
+    segments: int
+    marker_duration: float
 
 
 def encode_image_to_waveform(
@@ -88,7 +99,7 @@ def decode_waveform_to_image(
     *,
     sample_rate: int,
     resolution: tuple[int, int],
-    segments: int = 1,
+    segments: int | None = 1,
     marker_duration: float = 0.05,
 ) -> np.ndarray:
     """Decode ``waveform`` back into an RGB image."""
@@ -100,7 +111,7 @@ def decode_waveform_to_image(
         waveform,
         resolution=(int(rows), int(cols)),
         sample_rate=int(sample_rate),
-        segments=int(segments),
+        segments=segments,
         marker_duration=float(marker_duration),
     )
     return image.astype(np.float32)
@@ -111,29 +122,60 @@ def decode_wav_bytes_to_image(
     *,
     resolution: tuple[int, int],
     sample_rate: int | None = None,
-    segments: int = 1,
+    segments: int | None = 1,
     marker_duration: float = 0.05,
-) -> tuple[np.ndarray, int]:
-    """Decode WAV ``data`` into an image and return it with the detected sample rate."""
+    return_metadata: bool = False,
+) -> tuple[np.ndarray, int] | tuple[np.ndarray, DecodedWavMetadata]:
+    """Decode WAV ``data`` into an image.
+
+    Parameters
+    ----------
+    data:
+        The PCM WAV byte stream to decode.
+    resolution:
+        Target resolution for the reconstructed image.
+    sample_rate:
+        Optional override for the waveform sample rate. When omitted the rate is
+        extracted from the WAV header.
+    segments:
+        Number of fax-style segments embedded in the waveform. When ``None``
+        the decoder will attempt to infer this value using the waveform length.
+    marker_duration:
+        Duration, in seconds, of each marker tone that separates a segment.
+    return_metadata:
+        When ``True`` the second element of the return tuple is a
+        :class:`DecodedWavMetadata` instance containing the detected sample rate
+        together with the segments and marker configuration used during
+        reconstruction. The default behaviour preserves the legacy tuple of
+        ``(image, sample_rate)``.
+    """
 
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("Expected WAV bytes for decoding")
 
     waveform, detected_rate = load_waveform_from_wav(bytes(data))
     target_rate = int(sample_rate or detected_rate)
-    image = decode_waveform_to_image(
+    reconstructed, used_segments = reconstruct_from_waveform(
         waveform,
+        resolution=(int(resolution[0]), int(resolution[1])),
         sample_rate=target_rate,
-        resolution=resolution,
         segments=segments,
-        marker_duration=marker_duration,
+        marker_duration=float(marker_duration),
+        return_segments=True,
     )
     logger.debug(
         "Decoded WAV bytes to image at %d Hz with resolution %s",
         target_rate,
         resolution,
     )
-    return image, target_rate
+    if return_metadata:
+        metadata = DecodedWavMetadata(
+            sample_rate=target_rate,
+            segments=int(used_segments),
+            marker_duration=float(marker_duration),
+        )
+        return reconstructed.astype(np.float32), metadata
+    return reconstructed.astype(np.float32), target_rate
 
 
 def save_image_as_png(data: np.ndarray, path: str | Path) -> Path:
@@ -163,6 +205,7 @@ def save_waveform_as_wav(
 
 
 __all__ = [
+    "DecodedWavMetadata",
     "decode_wav_bytes_to_image",
     "decode_waveform_to_image",
     "encode_image_to_waveform",

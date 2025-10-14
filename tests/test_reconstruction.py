@@ -7,6 +7,8 @@ import numpy as np
 from umbra.reconstruction import (
     create_variations,
     generate_shape_collage,
+    image_to_waveform,
+    reconstruct_from_waveform,
     run_reconstruction_cycle,
     waveform_to_wav_bytes,
 )
@@ -51,4 +53,26 @@ def test_run_reconstruction_cycle_returns_audio_and_hybrid() -> None:
 
     wav_bytes = waveform_to_wav_bytes(result.waveform, result.sample_rate)
     assert wav_bytes[:4] == b"RIFF"
+
+
+def test_waveform_segment_detection() -> None:
+    collage, _ = generate_shape_collage(99, resolution=(40, 36))
+    waveform = image_to_waveform(
+        collage,
+        sample_rate=16_000,
+        segments=6,
+        marker_duration=0.02,
+    )
+
+    recovered, detected = reconstruct_from_waveform(
+        waveform,
+        resolution=collage.shape[:2],
+        sample_rate=16_000,
+        segments=None,
+        marker_duration=0.02,
+        return_segments=True,
+    )
+
+    assert detected == 6
+    assert recovered.shape == collage.shape
 

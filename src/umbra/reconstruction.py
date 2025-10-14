@@ -470,15 +470,55 @@ def image_to_waveform(
     return waveform.astype(np.float32)
 
 
+def _infer_segment_count(
+    total_samples: int, sample_rate: int, marker_duration: float
+) -> int:
+    """Heuristically estimate the number of fax segments in ``waveform``."""
+
+    if total_samples <= 0:
+        raise ValueError("Waveform must contain samples")
+    payload_samples = max(int(sample_rate), 1)
+    marker_samples = max(int(round(marker_duration * sample_rate)), 0)
+    segment_length = payload_samples + marker_samples
+    if segment_length <= 0:
+        return 1
+
+    # A lower bound assuming the final segment may be truncated when the
+    # transmission is stopped early. ``max`` defends against extremely short
+    # clips that still need to be treated as a single segment.
+    minimum_segments = max(int(np.ceil(total_samples / (segment_length + 1))), 1)
+    approx_segments = int(total_samples // segment_length)
+    remainder = total_samples - approx_segments * segment_length
+    if remainder > marker_samples // 2:
+        approx_segments += 1
+
+    estimated = max(approx_segments, minimum_segments)
+    # Constrain the estimate so that the implied payload does not exceed the
+    # configured ten minute cap. This mirrors the guard in ``image_to_waveform``
+    # and prevents pathological sample counts from returning runaway values.
+    max_segments = max(
+        1,
+        int(np.ceil(total_samples / max(payload_samples, 1))),
+    )
+    return max(1, min(estimated, max_segments))
+
+
 def reconstruct_from_waveform(
     waveform: np.ndarray,
     *,
     resolution: tuple[int, int],
     sample_rate: int,
-    segments: int = 1,
+    segments: int | None = 1,
     marker_duration: float = 0.05,
-) -> np.ndarray:
-    """Approximate an RGB image from a mono waveform."""
+    return_segments: bool = False,
+) -> np.ndarray | tuple[np.ndarray, int]:
+    """Approximate an RGB image from a mono waveform.
+
+    When ``segments`` is ``None`` the decoder attempts to estimate how many
+    fax-style stripes were transmitted by examining the waveform length. The
+    ``return_segments`` flag can be used to retrieve the detected segment count
+    alongside the reconstructed image for bookkeeping purposes.
+    """
 
     rows, cols = resolution
     wave = np.asarray(waveform, dtype=np.float32)
@@ -487,7 +527,10 @@ def reconstruct_from_waveform(
     if wave.size == 0:
         raise ValueError("Waveform must contain samples")
 
-    safe_segments = max(1, int(segments))
+    if segments is None:
+        safe_segments = _infer_segment_count(wave.size, sample_rate, marker_duration)
+    else:
+        safe_segments = max(1, int(segments))
     marker_seconds = float(max(0.0, marker_duration))
     marker_samples = max(int(round(marker_seconds * sample_rate)), 0)
     payload_samples = max(sample_rate, 1)
@@ -550,6 +593,7 @@ def reconstruct_from_waveform(
         if cursor < needed and cursor > 0:
             combined[cursor:] = combined[cursor - 1]
         spectrum = combined
+        safe_segments = available_segments
 
     spectrum = spectrum.astype(np.float32)
     max_val = float(spectrum.max())
@@ -565,7 +609,10 @@ def reconstruct_from_waveform(
         spectrum = spectrum[:needed]
 
     image = spectrum.reshape(3, rows, cols).transpose(1, 2, 0)
-    return np.clip(image, 0.0, 1.0).astype(np.float32)
+    reconstructed = np.clip(np.nan_to_num(image, nan=0.0), 0.0, 1.0).astype(np.float32)
+    if return_segments:
+        return reconstructed, int(safe_segments)
+    return reconstructed
 
 
 def blend_predictions(
