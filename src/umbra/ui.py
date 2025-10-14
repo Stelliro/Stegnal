@@ -35,10 +35,12 @@ except Exception as exc:  # pragma: no cover - import is deferred until runtime
 else:
     _IMPORT_ERROR = None
 
+from .codec import decode_waveform_to_image, encode_image_to_waveform
 from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .evolution import EvolutionManager
-from .metrics import ReconstructionMetrics
+from .metrics import ReconstructionMetrics, compute_metrics
+from .visualization import multiplicative_overlap
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +78,18 @@ class UmbraAppState:
 
     history: deque[dict[str, float]] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
     ai_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
+    sound_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
 
     def record_generation(
         self,
         generation_index: int,
         metrics: ReconstructionMetrics,
         overlap: float,
+        *,
+        sound_metrics: ReconstructionMetrics | None = None,
+        sound_overlap: float | None = None,
+        sound_reference_metrics: ReconstructionMetrics | None = None,
+        sound_reference_overlap: float | None = None,
     ) -> dict[str, float]:
         """Store metrics for a completed generation and return the entry."""
 
@@ -93,6 +101,29 @@ class UmbraAppState:
             "ssim": float(metrics.ssim),
             "ai_score": float(ai_score),
         }
+        if sound_metrics is not None and sound_overlap is not None:
+            sound_score = _compute_ai_composite_score(
+                sound_overlap,
+                sound_metrics.psnr,
+                sound_metrics.ssim,
+            )
+            entry.update(
+                {
+                    "sound_psnr": float(sound_metrics.psnr),
+                    "sound_ssim": float(sound_metrics.ssim),
+                    "sound_overlap": float(sound_overlap),
+                    "sound_score": float(sound_score),
+                }
+            )
+            self.sound_scores.append(float(sound_score))
+        if sound_reference_metrics is not None and sound_reference_overlap is not None:
+            entry.update(
+                {
+                    "sound_reference_psnr": float(sound_reference_metrics.psnr),
+                    "sound_reference_ssim": float(sound_reference_metrics.ssim),
+                    "sound_reference_overlap": float(sound_reference_overlap),
+                }
+            )
         self.history.append(entry)
         self.ai_scores.append(float(ai_score))
         return entry
@@ -121,6 +152,24 @@ def _compute_ai_composite_score(overlap_pct: float, psnr: float, ssim: float) ->
 
     composite = float(np.clip(0.4 * overlap_norm + 0.3 * psnr_norm + 0.3 * ssim_norm, 0.0, 1.0))
     return composite * 100.0
+
+
+def _suggest_sample_rate(image: np.ndarray) -> int:
+    """Select a stable sample rate based on the image footprint."""
+
+    height, width = image.shape[:2]
+    area = max(height * width, 1)
+    rate = int(16_000 + 28.0 * np.sqrt(area))
+    return int(np.clip(rate, 16_000, 44_100))
+
+
+def _suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
+    """Derive fax-style transmission segments and marker duration heuristically."""
+
+    height = image.shape[0]
+    segments = int(np.clip(np.ceil(height / 96.0), 1, 48))
+    marker_duration = float(np.clip(0.035 + 0.002 * segments, 0.04, 0.18))
+    return segments, marker_duration
 
 
 def _clamp_image(array: np.ndarray) -> np.ndarray:
@@ -332,11 +381,13 @@ class UmbraDesktopApp:
         self.reference_image: np.ndarray | None = None
         self.reference_label = ""
         self.reconstruction: np.ndarray | None = None
+        self.sound_reconstruction: np.ndarray | None = None
         self.state = UmbraAppState()
         self._status_var = tk.StringVar(value="Select a reference image to begin.")
         self._run_mode_var = tk.StringVar(value="finite")
         self._score_threshold = tk.DoubleVar(value=88.0)
         self._ai_score_var = tk.StringVar(value="AI score: –")
+        self._sound_score_var = tk.StringVar(value="Sound score: –")
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._running = False
@@ -349,6 +400,9 @@ class UmbraDesktopApp:
         self._recon_label_widget: tk.Label | None = None
         self._recon_image_widget: tk.Label | None = None
         self._recon_photo: ImageTk.PhotoImage | None = None
+        self._sound_label_widget: tk.Label | None = None
+        self._sound_image_widget: tk.Label | None = None
+        self._sound_photo: ImageTk.PhotoImage | None = None
         self._graph_canvas: tk.Canvas | None = None
 
         self._build_layout()
@@ -411,6 +465,9 @@ class UmbraDesktopApp:
         tk.Label(control_frame, textvariable=self._ai_score_var, fg="#8fdc6d", bg="#101010").pack(
             side=tk.RIGHT, padx=12
         )
+        tk.Label(control_frame, textvariable=self._sound_score_var, fg="#f4d35e", bg="#101010").pack(
+            side=tk.RIGHT, padx=12
+        )
         tk.Label(control_frame, textvariable=self._status_var, fg="white", bg="#101010").pack(
             side=tk.RIGHT, padx=12
         )
@@ -431,6 +488,18 @@ class UmbraDesktopApp:
         self._recon_label_widget.pack()
         self._recon_image_widget = tk.Label(right_frame, bg="#101010")
         self._recon_image_widget.pack(padx=6, pady=6)
+
+        sound_frame = tk.Frame(preview_frame, bg="#181818")
+        sound_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._sound_label_widget = tk.Label(
+            sound_frame,
+            text="Sound-only reconstruction",
+            fg="white",
+            bg="#181818",
+        )
+        self._sound_label_widget.pack()
+        self._sound_image_widget = tk.Label(sound_frame, bg="#101010")
+        self._sound_image_widget.pack(padx=6, pady=6)
 
         graph_frame = tk.Frame(self.root, bg="#101010")
         graph_frame.pack(fill=tk.BOTH, side=tk.BOTTOM)
@@ -557,12 +626,66 @@ class UmbraDesktopApp:
 
             best = generation.best_candidate
             reconstruction = np.asarray(best.reconstruction, dtype=np.float32)
+            sound_payload: dict[str, Any] = {}
+            sound_image: np.ndarray | None = None
+            try:
+                sample_rate = _suggest_sample_rate(reconstruction)
+                segments, marker_duration = _suggest_transmission_profile(reconstruction)
+                waveform = encode_image_to_waveform(
+                    reconstruction,
+                    sample_rate=sample_rate,
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                sound_image = decode_waveform_to_image(
+                    waveform,
+                    sample_rate=sample_rate,
+                    resolution=reconstruction.shape[:2],
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                base_reference = (
+                    self.reference_image if self.reference_image is not None else reconstruction
+                )
+                ref_image = np.asarray(base_reference, dtype=np.float32)
+                ref_image = np.clip(ref_image, 0.0, 1.0)
+                recon_clipped = np.clip(reconstruction, 0.0, 1.0)
+                sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
+                sound_vs_ai = compute_metrics(recon_clipped, sound_clipped)
+                _, sound_overlap = multiplicative_overlap(recon_clipped, sound_clipped)
+                sound_vs_reference = compute_metrics(ref_image, sound_clipped)
+                _, sound_reference_overlap = multiplicative_overlap(ref_image, sound_clipped)
+                sound_payload = {
+                    "sound_metrics": sound_vs_ai,
+                    "sound_overlap": float(sound_overlap),
+                    "sound_reference_metrics": sound_vs_reference,
+                    "sound_reference_overlap": float(sound_reference_overlap),
+                    "sample_rate": int(sample_rate),
+                    "segments": int(segments),
+                    "marker_duration": float(marker_duration),
+                }
+            except Exception as exc:  # pragma: no cover - audio pipeline fallback
+                logger.debug("Failed to derive sound reconstruction: %s", exc)
+
             entry = self.state.record_generation(
                 generation.index,
                 best.metrics,
                 best.overlap_score,
+                sound_metrics=sound_payload.get("sound_metrics"),
+                sound_overlap=sound_payload.get("sound_overlap"),
+                sound_reference_metrics=sound_payload.get("sound_reference_metrics"),
+                sound_reference_overlap=sound_payload.get("sound_reference_overlap"),
             )
-            self._queue.put(("generation", reconstruction, best.metrics, entry))
+            self._queue.put(
+                (
+                    "generation",
+                    reconstruction,
+                    best.metrics,
+                    entry,
+                    sound_image,
+                    sound_payload,
+                )
+            )
 
             if self.reference_image is not None and self._run_mode_var.get() == "infinite":
                 threshold = float(self._score_threshold.get())
@@ -585,17 +708,42 @@ class UmbraDesktopApp:
             processed = True
             kind = message[0]
             if kind == "generation":
-                _, reconstruction, metrics, entry = message
+                (
+                    _,
+                    reconstruction,
+                    _metrics,
+                    entry,
+                    sound_image,
+                    sound_payload,
+                ) = message
                 self._update_reconstruction(np.asarray(reconstruction, dtype=np.float32))
-                self._status_var.set(
-                    "Generation {gen:.0f}: overlap {ov:.2f} · PSNR {ps:.2f} dB · SSIM {ss:.3f}".format(
-                        gen=entry["generation"],
-                        ov=entry["overlap"],
-                        ps=entry["psnr"],
-                        ss=entry["ssim"],
-                    )
+                self._update_sound_reconstruction(
+                    None if sound_image is None else np.asarray(sound_image, dtype=np.float32)
                 )
+                status_parts = [
+                    "Generation {gen:.0f}".format(gen=entry["generation"]),
+                    "AI overlap {ov:.2f}%".format(ov=entry["overlap"]),
+                    "AI PSNR {ps:.2f} dB".format(ps=entry["psnr"]),
+                    "AI SSIM {ss:.3f}".format(ss=entry["ssim"]),
+                ]
+                sound_score = entry.get("sound_score")
+                if sound_score is not None:
+                    status_parts.append(
+                        "Sound overlap {ov:.2f}%".format(
+                            ov=entry.get("sound_overlap", 0.0)
+                        )
+                    )
+                    status_parts.append(
+                        "Sound SSIM {ss:.3f}".format(
+                            ss=entry.get("sound_ssim", 0.0)
+                        )
+                    )
+                self._status_var.set(" · ".join(status_parts))
                 self._ai_score_var.set(f"AI score: {entry['ai_score']:.2f}")
+                if sound_score is not None:
+                    self._sound_score_var.set(f"Sound score: {sound_score:.2f}")
+                elif sound_payload.get("sound_metrics") is None:
+                    self._sound_score_var.set("Sound score: –")
                 self._draw_graph()
             elif kind == "status":
                 _, text = message
@@ -635,6 +783,20 @@ class UmbraDesktopApp:
         self._recon_photo = photo
         self._recon_image_widget.config(image=self._recon_photo)
 
+    def _update_sound_reconstruction(self, sound_image: np.ndarray | None) -> None:
+        if sound_image is None:
+            return
+        self.sound_reconstruction = np.clip(sound_image, 0.0, 1.0)
+        if self._sound_image_widget is None:
+            return
+        try:
+            photo = _to_photo_image(self.sound_reconstruction)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to render sound reconstruction preview: %s", exc)
+            return
+        self._sound_photo = photo
+        self._sound_image_widget.config(image=self._sound_photo)
+
     def _draw_graph(self) -> None:
         if self._graph_canvas is None:
             return
@@ -655,8 +817,14 @@ class UmbraDesktopApp:
 
         values = [row["ai_score"] for row in rows]
         x_values = [row["generation"] for row in rows]
+        sound_rows = [(row["generation"], row["sound_score"]) for row in rows if "sound_score" in row]
         x_min, x_max = min(x_values), max(x_values)
-        y_min, y_max = min(values), max(values)
+        y_min = min(values)
+        y_max = max(values)
+        if sound_rows:
+            sound_vals = [val for _, val in sound_rows]
+            y_min = min(y_min, min(sound_vals))
+            y_max = max(y_max, max(sound_vals))
         if x_max == x_min:
             x_max = x_min + 1
         if y_max == y_min:
@@ -673,6 +841,11 @@ class UmbraDesktopApp:
             points.extend([_scale_x(generation), _scale_y(score)])
 
         self._graph_canvas.create_line(points, fill="#58a6ff", width=3, smooth=True)
+        if len(sound_rows) >= 2:
+            sound_points: list[float] = []
+            for generation, score in sound_rows:
+                sound_points.extend([_scale_x(generation), _scale_y(score)])
+            self._graph_canvas.create_line(sound_points, fill="#f4d35e", width=2, dash=(4, 3))
         self._graph_canvas.create_line(margin, height - margin, width - margin, height - margin, fill="#333")
         self._graph_canvas.create_line(margin, margin, margin, height - margin, fill="#333")
         self._graph_canvas.create_text(
@@ -682,6 +855,14 @@ class UmbraDesktopApp:
             fill="#58a6ff",
             anchor=tk.W,
         )
+        if sound_rows:
+            self._graph_canvas.create_text(
+                margin,
+                margin + 14,
+                text="Sound alignment score",
+                fill="#f4d35e",
+                anchor=tk.W,
+            )
         self._graph_canvas.create_text(
             width - margin,
             height - margin + 20,
@@ -695,6 +876,15 @@ class UmbraDesktopApp:
             fill="#8fdc6d",
             anchor=tk.E,
         )
+        if sound_rows:
+            latest_sound = sound_rows[-1][1]
+            self._graph_canvas.create_text(
+                width - margin,
+                margin + 16,
+                text=f"Sound {latest_sound:.2f}",
+                fill="#f4d35e",
+                anchor=tk.E,
+            )
 
     # ------------------------------------------------------------------ Shutdown
     def _on_close(self) -> None:

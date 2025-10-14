@@ -21,12 +21,26 @@ def test_app_state_records_generations() -> None:
     state = UmbraAppState()
     metrics = ReconstructionMetrics(psnr=42.0, ssim=0.92)
 
-    entry = state.record_generation(5, metrics, 76.0)
+    sound_metrics = ReconstructionMetrics(psnr=28.0, ssim=0.66)
+    entry = state.record_generation(
+        5,
+        metrics,
+        76.0,
+        sound_metrics=sound_metrics,
+        sound_overlap=64.0,
+        sound_reference_metrics=metrics,
+        sound_reference_overlap=70.0,
+    )
     assert entry["generation"] == 5
     assert entry["overlap"] == 76.0
     assert entry["psnr"] == 42.0
     assert entry["ssim"] == 0.92
     assert entry["ai_score"] > 0
+    assert entry["sound_psnr"] == sound_metrics.psnr
+    assert entry["sound_ssim"] == sound_metrics.ssim
+    assert entry["sound_overlap"] == 64.0
+    assert entry["sound_score"] > 0
+    assert state.sound_scores[-1] == entry["sound_score"]
 
     # Fill more than the history limit to ensure trimming works.
     for index in range(1000):
@@ -34,6 +48,7 @@ def test_app_state_records_generations() -> None:
 
     assert len(state.history) <= state.history.maxlen  # type: ignore[operator]
     assert len(state.ai_scores) <= state.ai_scores.maxlen  # type: ignore[operator]
+    assert len(state.sound_scores) <= state.sound_scores.maxlen  # type: ignore[operator]
 
 
 def test_normalize_pinterest_url_strips_tracking() -> None:
