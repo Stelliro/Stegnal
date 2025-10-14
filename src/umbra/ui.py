@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 import queue
 import random
 import re
@@ -94,40 +95,53 @@ class UmbraAppState:
     ) -> dict[str, float]:
         """Store metrics for a completed generation and return the entry."""
 
-        ai_score = _compute_composite_score(overlap, metrics.psnr, metrics.ssim)
+        overlap_value = _nan_guard(overlap, 0.0)
+        psnr_value = _nan_guard(metrics.psnr, _AI_PSNR_BASELINE)
+        ssim_value = _nan_guard(metrics.ssim, 0.0)
+
+        ai_score = _compute_composite_score(overlap_value, psnr_value, ssim_value)
         # Default to a zero composite score so generations without a successful
         # sound reconstruction never receive credit from the sound-first
         # scoreboard.
         composite_score = 0.0
-        entry = {
+        entry: dict[str, float] = {
             "generation": float(generation_index),
-            "overlap": float(overlap),
-            "psnr": float(metrics.psnr),
-            "ssim": float(metrics.ssim),
-            "ai_score": float(ai_score),
+            "overlap": overlap_value,
+            "psnr": psnr_value,
+            "ssim": ssim_value,
+            "ai_overlap": overlap_value,
+            "ai_psnr": psnr_value,
+            "ai_ssim": ssim_value,
+            "ai_score": ai_score,
         }
         if sound_metrics is not None and sound_overlap is not None:
+            sound_overlap_value = _nan_guard(sound_overlap, 0.0)
+            sound_psnr_value = _nan_guard(sound_metrics.psnr, _AI_PSNR_BASELINE)
+            sound_ssim_value = _nan_guard(sound_metrics.ssim, 0.0)
             sound_score = _compute_composite_score(
-                sound_overlap,
-                sound_metrics.psnr,
-                sound_metrics.ssim,
+                sound_overlap_value,
+                sound_psnr_value,
+                sound_ssim_value,
             )
             entry.update(
                 {
-                    "sound_psnr": float(sound_metrics.psnr),
-                    "sound_ssim": float(sound_metrics.ssim),
-                    "sound_overlap": float(sound_overlap),
-                    "sound_score": float(sound_score),
+                    "sound_psnr": sound_psnr_value,
+                    "sound_ssim": sound_ssim_value,
+                    "sound_overlap": sound_overlap_value,
+                    "sound_score": sound_score,
                 }
             )
-            self.sound_scores.append(float(sound_score))
+            if math.isfinite(sound_score):
+                self.sound_scores.append(sound_score)
             composite_score = float(sound_score)
         if sound_reference_metrics is not None and sound_reference_overlap is not None:
             entry.update(
                 {
-                    "sound_reference_psnr": float(sound_reference_metrics.psnr),
-                    "sound_reference_ssim": float(sound_reference_metrics.ssim),
-                    "sound_reference_overlap": float(sound_reference_overlap),
+                    "sound_reference_psnr": _nan_guard(
+                        sound_reference_metrics.psnr, _AI_PSNR_BASELINE
+                    ),
+                    "sound_reference_ssim": _nan_guard(sound_reference_metrics.ssim, 0.0),
+                    "sound_reference_overlap": _nan_guard(sound_reference_overlap, 0.0),
                 }
             )
         entry["composite_score"] = composite_score
