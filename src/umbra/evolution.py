@@ -81,6 +81,9 @@ def _chaotic_seed_mix(values: Sequence[int], noise: int, logistic: float) -> int
     return int.from_bytes(digest[:8], "little") & 0x7FFFFFFF
 
 
+_LINEAGE_RETENTION_FACTOR = 3
+
+
 PLATEAU_CFG_DEFAULTS = {
     "window": 6,
     "delta_threshold": 0.002,
@@ -604,6 +607,32 @@ class EvolutionManager:
         elite_count = max(3, self.population_size // 2)
         self._elite_pool = [candidate.seed for candidate in ranked[:elite_count]]
 
+    def _prune_parent_lineage(self) -> None:
+        """Retain only the fittest lineage entries to favour elite parents."""
+
+        max_entries = max(self.population_size * _LINEAGE_RETENTION_FACTOR, self.population_size)
+        if len(self._parent_lineage) <= max_entries:
+            return
+
+        ranked = sorted(
+            self._parent_lineage.values(),
+            key=lambda record: (
+                float(record.cumulative_reward),
+                float(record.metrics.ssim),
+                float(record.overlap_score),
+                -float(record.last_generation),
+            ),
+            reverse=True,
+        )
+        survivors = {entry.seed for entry in ranked[:max_entries]}
+        removed = 0
+        for seed in list(self._parent_lineage.keys()):
+            if seed not in survivors:
+                del self._parent_lineage[seed]
+                removed += 1
+        if removed:
+            logger.debug("Pruned %d low-fitness parents from lineage", removed)
+
     def _difficulty_from_generation(
         self,
         generation: GenerationRecord,
@@ -833,6 +862,7 @@ class EvolutionManager:
             record.cumulative_reward = float(record.cumulative_reward + candidate.reward)
             record.peak_reward = float(max(record.peak_reward, candidate.reward))
             record.last_generation = generation.index
+        self._prune_parent_lineage()
         self.append_generation_record(generation, persist=False, use_next_index=True)
         if generation.candidates:
             best = generation.best_candidate

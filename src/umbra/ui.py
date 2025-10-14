@@ -352,6 +352,34 @@ def _to_photo_image(array: np.ndarray, *, max_edge: int = _DISPLAY_MAX_EDGE) -> 
     return ImageTk.PhotoImage(image)
 
 
+def _prepare_sound_preview(array: np.ndarray) -> np.ndarray:
+    """Return ``array`` rescaled for display while preserving structure."""
+
+    sound = np.nan_to_num(np.asarray(array, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    if sound.size == 0:
+        raise ValueError("Sound reconstruction is empty")
+    if sound.ndim == 3 and sound.shape[-1] > 3:
+        sound = sound[..., :3]
+    if sound.ndim == 2:
+        reduced = sound
+    elif sound.ndim == 3 and sound.shape[-1] == 3:
+        reduced = np.mean(sound, axis=-1)
+    else:
+        reduced = sound[..., 0]
+    reduced_min = float(np.min(reduced))
+    reduced_max = float(np.max(reduced))
+    span = reduced_max - reduced_min
+    if span <= 1e-4:
+        # Boost contrast for nearly-flat reconstructions so structure remains visible.
+        if span == 0.0:
+            normalized = np.zeros_like(sound)
+        else:
+            normalized = (sound - reduced_min) / max(span, 1e-6)
+    else:
+        normalized = (sound - reduced_min) / span
+    return np.clip(normalized, 0.0, 1.0)
+
+
 def _download_bytes(
     url: str,
     *,
@@ -688,7 +716,14 @@ class UmbraDesktopApp:
             bg="#181818",
         )
         self._sound_label_widget.pack()
-        self._sound_image_widget = tk.Label(sound_frame, bg="#101010")
+        self._sound_image_widget = tk.Label(
+            sound_frame,
+            bg="#101010",
+            fg="#cccccc",
+            text="Waiting for sound reconstruction…",
+            wraplength=320,
+            justify=tk.CENTER,
+        )
         self._sound_image_widget.pack(padx=6, pady=6)
 
         graph_frame = tk.Frame(self.root, bg="#101010")
@@ -1155,18 +1190,30 @@ class UmbraDesktopApp:
         self._recon_image_widget.config(image=self._recon_photo)
 
     def _update_sound_reconstruction(self, sound_image: np.ndarray | None) -> None:
-        if sound_image is None:
-            return
-        self.sound_reconstruction = np.clip(sound_image, 0.0, 1.0)
         if self._sound_image_widget is None:
             return
+        if sound_image is None:
+            self.sound_reconstruction = None
+            self._sound_photo = None
+            self._sound_image_widget.config(image="", text="Sound reconstruction unavailable")
+            return
+        try:
+            prepared = _prepare_sound_preview(sound_image)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to prepare sound reconstruction preview: %s", exc)
+            self.sound_reconstruction = None
+            self._sound_photo = None
+            self._sound_image_widget.config(image="", text="Sound reconstruction unavailable")
+            return
+        self.sound_reconstruction = prepared
         try:
             photo = _to_photo_image(self.sound_reconstruction)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to render sound reconstruction preview: %s", exc)
+            self._sound_image_widget.config(image="", text="Sound reconstruction unavailable")
             return
         self._sound_photo = photo
-        self._sound_image_widget.config(image=self._sound_photo)
+        self._sound_image_widget.config(image=self._sound_photo, text="")
 
     def _draw_graph(self) -> None:
         if self._graph_canvas is None:
