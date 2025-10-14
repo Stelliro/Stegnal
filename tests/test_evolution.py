@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
+from umbra.codec import decode_waveform_to_image, encode_image_to_waveform
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, _chaotic_seed_mix
+from umbra.metrics import compute_metrics
+from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
+from umbra.visualization import multiplicative_overlap
 
 
 def test_evolution_generation_and_persistence(tmp_path) -> None:
@@ -105,3 +110,43 @@ def test_spawn_child_seed_uses_chaotic_mix(monkeypatch) -> None:
 
     child = manager._spawn_child_seed(anchors)
     assert child == expected
+
+
+def test_generation_metrics_track_sound_alignment() -> None:
+    image = np.full((8, 8, 3), 0.5, dtype=np.float32)
+    encoder = NoiseStreamEncoder(sigma=0.05)
+    decoder = NoiseStreamDecoder(denoise_sigma=None)
+    manager = EvolutionManager(
+        original=image,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=2,
+        base_seed=17,
+        autosave_interval=1,
+    )
+
+    record = manager.run_generation()
+    candidate = record.best_candidate
+    reconstruction = np.clip(np.asarray(candidate.reconstruction, dtype=np.float32), 0.0, 1.0)
+    sample_rate = suggest_sample_rate(reconstruction)
+    segments, marker_duration = suggest_transmission_profile(reconstruction)
+    waveform = encode_image_to_waveform(
+        reconstruction,
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
+    )
+    sound_image = decode_waveform_to_image(
+        waveform,
+        sample_rate=sample_rate,
+        resolution=reconstruction.shape[:2],
+        segments=segments,
+        marker_duration=marker_duration,
+    )
+    sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
+    expected_metrics = compute_metrics(reconstruction, sound_clipped)
+    _, expected_overlap = multiplicative_overlap(reconstruction, sound_clipped)
+
+    assert candidate.metrics.psnr == pytest.approx(expected_metrics.psnr, rel=1e-5, abs=1e-5)
+    assert candidate.metrics.ssim == pytest.approx(expected_metrics.ssim, rel=1e-5, abs=1e-5)
+    assert candidate.overlap_score == pytest.approx(float(expected_overlap), rel=1e-5, abs=1e-5)

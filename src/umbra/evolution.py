@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .codec import decode_waveform_to_image, encode_image_to_waveform
 from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .metrics import (
@@ -22,6 +23,7 @@ from .metrics import (
     compute_ms_ssim,
     dct_band_correlation,
 )
+from .reconstruction import suggest_sample_rate, suggest_transmission_profile
 from .runs import append_history, get_run_paths, load_history, new_run
 from .visualization import multiplicative_overlap
 
@@ -49,6 +51,21 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _ensure_three_channel(image: np.ndarray) -> np.ndarray:
+    """Return ``image`` as a clipped three-channel float array."""
+
+    array = np.asarray(image, dtype=np.float32)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] > 3:
+        array = array[..., :3]
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected image with shape (H, W, 3)")
+    return np.clip(array, 0.0, 1.0)
 
 
 def _chaotic_seed_mix(values: Sequence[int], noise: int, logistic: float) -> int:
@@ -678,15 +695,47 @@ class EvolutionManager:
 
         channel_axis = -1 if self.original.ndim == 3 else None
 
+        reference_clipped = _ensure_three_channel(self.original)
         start_time = time.perf_counter()
         for seed in seeds:
             packet = self.encoder.encode(self.original, int(seed))
             reconstruction = self.decoder.decode(packet, int(seed))
-            metrics = compute_metrics(self.original, reconstruction)
-            _, overlap_score = multiplicative_overlap(self.original, reconstruction)
+            try:
+                recon_image = _ensure_three_channel(reconstruction)
+            except ValueError:
+                logger.debug("Falling back to reference alignment for seed %d", seed, exc_info=True)
+                recon_image = reference_clipped
+            comparison_base: np.ndarray | None
+            try:
+                sample_rate = suggest_sample_rate(recon_image)
+                segments, marker_duration = suggest_transmission_profile(recon_image)
+                waveform = encode_image_to_waveform(
+                    recon_image,
+                    sample_rate=sample_rate,
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                sound_image = decode_waveform_to_image(
+                    waveform,
+                    sample_rate=sample_rate,
+                    resolution=recon_image.shape[:2],
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                comparison_base = _ensure_three_channel(sound_image)
+            except Exception:  # pragma: no cover - audio fallback path
+                logger.debug("Sound alignment failed for seed %d", seed, exc_info=True)
+                comparison_base = None
+
+            if comparison_base is None:
+                metrics = compute_metrics(reference_clipped, recon_image)
+                _, overlap_score = multiplicative_overlap(reference_clipped, recon_image)
+            else:
+                metrics = compute_metrics(recon_image, comparison_base)
+                _, overlap_score = multiplicative_overlap(recon_image, comparison_base)
             candidate = CandidateResult(
                 seed=int(seed),
-                reconstruction=np.asarray(reconstruction, dtype=np.float16),
+                reconstruction=recon_image.astype(np.float32, copy=True),
                 metrics=metrics,
                 overlap_score=float(overlap_score),
             )

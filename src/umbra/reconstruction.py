@@ -23,6 +23,31 @@ logger = logging.getLogger(__name__)
 _MAX_FAX_DURATION_SECONDS = 600.0
 
 
+def suggest_sample_rate(image: np.ndarray) -> int:
+    """Return a stable audio sample rate for ``image`` based on its size."""
+
+    array = np.asarray(image)
+    if array.ndim < 2:
+        raise ValueError("image must have at least two dimensions for sample rate suggestion")
+    height = int(max(array.shape[0], 1))
+    width = int(max(array.shape[1], 1))
+    area = max(height * width, 1)
+    rate = int(16_000 + 28.0 * np.sqrt(float(area)))
+    return int(np.clip(rate, 16_000, 44_100))
+
+
+def suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
+    """Return fax-style transmission parameters tailored to ``image``."""
+
+    array = np.asarray(image)
+    if array.ndim < 2:
+        raise ValueError("image must have at least two dimensions for transmission profile")
+    height = int(max(array.shape[0], 1))
+    segments = int(np.clip(np.ceil(height / 96.0), 1, 48))
+    marker_duration = float(np.clip(0.035 + 0.002 * segments, 0.04, 0.18))
+    return segments, marker_duration
+
+
 @dataclass(frozen=True)
 class GeneratedShape:
     """Description of a synthetic geometric primitive used in a collage."""
@@ -645,5 +670,7 @@ __all__ = [
     "reconstruct_from_waveform",
     "run_reconstruction_cycle",
     "waveform_to_wav_bytes",
+    "suggest_sample_rate",
+    "suggest_transmission_profile",
 ]
 

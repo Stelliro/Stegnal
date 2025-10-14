@@ -42,6 +42,7 @@ from .demo_packager import build_demo_executable
 from .encoding import NoiseStreamEncoder
 from .evolution import EvolutionManager
 from .metrics import ReconstructionMetrics, compute_metrics
+from .reconstruction import suggest_sample_rate, suggest_transmission_profile
 from .visualization import multiplicative_overlap
 
 logger = logging.getLogger(__name__)
@@ -173,24 +174,6 @@ def _compute_composite_score(overlap_pct: float, psnr: float, ssim: float) -> fl
 
     composite = float(np.clip(0.4 * overlap_norm + 0.3 * psnr_norm + 0.3 * ssim_norm, 0.0, 1.0))
     return composite * 100.0
-
-
-def _suggest_sample_rate(image: np.ndarray) -> int:
-    """Select a stable sample rate based on the image footprint."""
-
-    height, width = image.shape[:2]
-    area = max(height * width, 1)
-    rate = int(16_000 + 28.0 * np.sqrt(area))
-    return int(np.clip(rate, 16_000, 44_100))
-
-
-def _suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
-    """Derive fax-style transmission segments and marker duration heuristically."""
-
-    height = image.shape[0]
-    segments = int(np.clip(np.ceil(height / 96.0), 1, 48))
-    marker_duration = float(np.clip(0.035 + 0.002 * segments, 0.04, 0.18))
-    return segments, marker_duration
 
 
 def _clamp_image(array: np.ndarray) -> np.ndarray:
@@ -657,8 +640,8 @@ class UmbraDesktopApp:
             sound_payload: dict[str, Any] = {}
             sound_image: np.ndarray | None = None
             try:
-                sample_rate = _suggest_sample_rate(reconstruction)
-                segments, marker_duration = _suggest_transmission_profile(reconstruction)
+                sample_rate = suggest_sample_rate(reconstruction)
+                segments, marker_duration = suggest_transmission_profile(reconstruction)
                 waveform = encode_image_to_waveform(
                     reconstruction,
                     sample_rate=sample_rate,
