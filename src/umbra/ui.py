@@ -37,6 +37,7 @@ else:
 
 from .codec import decode_waveform_to_image, encode_image_to_waveform
 from .decoding import NoiseStreamDecoder
+from .demo_packager import build_demo_executable
 from .encoding import NoiseStreamEncoder
 from .evolution import EvolutionManager
 from .metrics import ReconstructionMetrics, compute_metrics
@@ -397,6 +398,8 @@ class UmbraDesktopApp:
         self._running = False
         self._last_refresh = 0.0
         self._generation_delay = 0.25
+        self._latest_sound_payload: dict[str, Any] | None = None
+        self._latest_generation_entry: dict[str, float] | None = None
 
         self._reference_label_widget: tk.Label | None = None
         self._reference_image_widget: tk.Label | None = None
@@ -436,6 +439,11 @@ class UmbraDesktopApp:
         tk.Button(control_frame, text="Demo gradient", command=self._use_demo_image).pack(
             side=tk.LEFT, padx=6, pady=6
         )
+        tk.Button(
+            control_frame,
+            text="Build demo exe model here",
+            command=self._build_demo_executable,
+        ).pack(side=tk.LEFT, padx=6, pady=6)
 
         tk.Checkbutton(
             control_frame,
@@ -680,6 +688,8 @@ class UmbraDesktopApp:
                 sound_reference_metrics=sound_payload.get("sound_reference_metrics"),
                 sound_reference_overlap=sound_payload.get("sound_reference_overlap"),
             )
+            self._latest_sound_payload = dict(sound_payload) if sound_payload else None
+            self._latest_generation_entry = dict(entry)
             self._queue.put(
                 (
                     "generation",
@@ -771,6 +781,59 @@ class UmbraDesktopApp:
         if processed:
             self._draw_graph()
         self.root.after(200, self._poll_queue)
+
+    def _build_demo_executable(self) -> None:
+        if self.reconstruction is None and self.reference_image is None:
+            self._status_var.set("Generate a candidate before building the demo executable.")
+            if messagebox is not None:
+                messagebox.showinfo(
+                    "Demo builder",
+                    "Run at least one generation or select an image before packaging the demo.",
+                )
+            return
+
+        image = self.reconstruction
+        if image is None and self.reference_image is not None:
+            image = self.reference_image
+        if image is None:
+            self._status_var.set("No image available for demo packaging.")
+            return
+
+        payload = self._latest_sound_payload or {}
+        sample_rate = int(payload.get("sample_rate", 48_000))
+        segments = int(payload.get("segments", 1))
+        marker_duration = float(payload.get("marker_duration", 0.05))
+        label = self.reference_label or "Best candidate"
+
+        metadata: dict[str, Any] = {}
+        if self._latest_generation_entry is not None:
+            entry = self._latest_generation_entry
+            for key in ("sound_score", "ai_score", "composite_score"):
+                if key in entry:
+                    metadata[key] = float(entry[key])
+
+        try:
+            destination = build_demo_executable(
+                np.asarray(image, dtype=np.float32),
+                sample_rate=sample_rate,
+                segments=max(1, segments),
+                marker_duration=max(0.001, marker_duration),
+                label=label,
+                metadata=metadata,
+            )
+        except Exception as exc:  # pragma: no cover - packaging is user initiated
+            logger.exception("Failed to build demo executable")
+            self._status_var.set(f"Demo build failed: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Demo builder", f"Failed to build demo executable: {exc}")
+            return
+
+        self._status_var.set(f"Demo executable saved to {destination}")
+        if messagebox is not None:
+            messagebox.showinfo(
+                "Demo builder",
+                f"A demo executable has been written to:\n{destination}",
+            )
 
     # ------------------------------------------------------------------ Rendering helpers
     def _update_reference_preview(self) -> None:
