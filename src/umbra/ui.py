@@ -2187,8 +2187,25 @@ def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.nda
     """Colourize ``grayscale`` using the ratios captured in ``template``."""
 
     gray = np.clip(np.asarray(grayscale, dtype=np.float32), 0.0, 1.0)
-    tinted = gray[..., None] * template
-    return np.clip(tinted, 0.0, 1.0).astype(np.float32)
+    template_array = np.clip(np.asarray(template, dtype=np.float32), 0.0, 1.0)
+
+    if gray.shape != template_array.shape[:-1]:  # pragma: no cover - defensive guard
+        raise ValueError(
+            "Template spatial dimensions must match grayscale input: "
+            f"{template_array.shape[:-1]} vs {gray.shape}"
+        )
+
+    try:
+        tinted = np.empty_like(template_array, dtype=np.float32)
+    except MemoryError:  # pragma: no cover - fallback for constrained devices
+        gray16 = gray.astype(np.float16, copy=False)
+        template16 = template_array.astype(np.float16, copy=False)
+        tinted16 = np.empty_like(template16)
+        np.multiply(gray16[..., None], template16, out=tinted16)
+        return np.clip(tinted16, 0.0, 1.0, out=tinted16).astype(np.float32)
+
+    np.multiply(gray[..., None], template_array, out=tinted)
+    return np.clip(tinted, 0.0, 1.0, out=tinted)
 
 
 def _image_to_png_bytes(image: np.ndarray) -> bytes:
