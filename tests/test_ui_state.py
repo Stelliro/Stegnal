@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 from io import BytesIO
 from types import SimpleNamespace
@@ -50,6 +51,27 @@ def _install_ui_stubs(monkeypatch, state: dict[str, object]) -> None:
     monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)
     monkeypatch.setitem(sys.modules, "pandas", fake_pandas)
     monkeypatch.setitem(sys.modules, "vl_convert", fake_vl_convert)
+
+
+def test_record_performance_history_adds_composite_score(monkeypatch) -> None:
+    state: dict[str, object] = {"performance_history": []}
+    _install_ui_stubs(monkeypatch, state)
+
+    ui = importlib.import_module("umbra.ui")
+    history = ui._record_performance_history(
+        state,
+        ai_overlap=72.0,
+        ai_ssim=0.82,
+        ai_psnr=38.0,
+        sound_overlap=55.0,
+        sound_reference_overlap=54.0,
+    )
+
+    assert history, "expected performance history entry"
+    latest = history[-1]
+    expected_score = ui._compute_ai_composite_score(72.0, 38.0, 0.82)
+    assert math.isclose(latest["ai_score"], expected_score, rel_tol=1e-6)
+    assert "ai_score" in state["performance_history"][-1]
 
 
 def test_ensure_manager_preserves_infinite_flag(monkeypatch) -> None:

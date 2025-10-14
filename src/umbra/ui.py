@@ -2297,6 +2297,8 @@ _PERFORMANCE_HISTORY = 60
 _PERFORMANCE_CHART_WINDOW = 48
 _RECENT_PERFORMANCE = 8
 _MAX_GENERATIONS_PER_TICK = 3
+_AI_PSNR_BASELINE = 20.0
+_AI_PSNR_TARGET = 60.0
 
 
 def _should_schedule_rerun(
@@ -2556,6 +2558,34 @@ def _update_noise_bases(
     state["decoder_sigma_base"] = float(0.6 * prev_decoder + 0.4 * decoder_sigma)
 
 
+def _compute_ai_composite_score(
+    overlap_pct: float,
+    psnr: float,
+    ssim: float,
+) -> float:
+    """Combine overlap, PSNR, and SSIM into a single AI performance score."""
+
+    overlap_value = float(
+        np.nan_to_num(overlap_pct, nan=0.0, posinf=100.0, neginf=0.0)
+    )
+    psnr_value = float(
+        np.nan_to_num(psnr, nan=_AI_PSNR_BASELINE, posinf=_AI_PSNR_TARGET, neginf=0.0)
+    )
+    ssim_value = float(np.nan_to_num(ssim, nan=0.0, posinf=1.0, neginf=0.0))
+
+    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
+    psnr_span = max(_AI_PSNR_TARGET - _AI_PSNR_BASELINE, 1e-6)
+    psnr_norm = float(
+        np.clip((psnr_value - _AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0)
+    )
+    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
+
+    composite = float(
+        np.clip(0.4 * overlap_norm + 0.3 * psnr_norm + 0.3 * ssim_norm, 0.0, 1.0)
+    )
+    return composite * 100.0
+
+
 def _record_performance_history(
     state: st.session_state,
     ai_overlap: float,
@@ -2574,6 +2604,9 @@ def _record_performance_history(
         "ai_overlap": float(ai_overlap),
         "ai_ssim": float(ai_ssim),
         "ai_psnr": float(ai_psnr),
+        "ai_score": float(
+            _compute_ai_composite_score(ai_overlap, ai_psnr, ai_ssim)
+        ),
         "sound_overlap": float(sound_overlap),
         "step": float(observation),
     }
@@ -2660,22 +2693,45 @@ def _derive_difficulty_metrics(
     if not history:
         return 0.0, 0.0, 0.0, 0.0
 
-    overlaps = np.asarray([entry["ai_overlap"] for entry in history], dtype=np.float32)
-    recent_window = int(min(len(history), _RECENT_PERFORMANCE))
-    recent = overlaps[-recent_window:]
-    recent_mean = float(np.mean(recent)) / 100.0
-    best = float(np.max(overlaps)) / 100.0
-    long_term = float(np.mean(overlaps[:-recent_window])) / 100.0 if len(history) > recent_window else recent_mean
-    improvement = float(np.clip(recent_mean - long_term, 0.0, 1.0))
-    volatility = float(np.std(recent) / 100.0)
+    samples: list[float] = []
+    for entry in history:
+        raw_value = entry.get("ai_score")
+        if raw_value is None:
+            raw_value = entry.get("ai_overlap")
+        if raw_value is None:
+            continue
+        try:
+            numeric = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        samples.append(float(np.nan_to_num(numeric, nan=0.0, posinf=100.0, neginf=0.0)))
 
-    normalized = np.clip(overlaps / 100.0, 0.0, 1.0)
+    if not samples:
+        return 0.0, 0.0, 0.0, 0.0
+
+    values = np.asarray(samples, dtype=np.float32)
+    normalized = np.clip(values / 100.0, 0.0, 1.0)
+    recent_window = int(min(len(normalized), _RECENT_PERFORMANCE))
+    if recent_window <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    recent = normalized[-recent_window:]
+    recent_mean = float(np.mean(recent)) if recent.size else 0.0
+    best = float(np.max(normalized)) if normalized.size else 0.0
+    if normalized.size > recent_window:
+        long_term_slice = normalized[:-recent_window]
+    else:
+        long_term_slice = np.empty(0, dtype=np.float32)
+    long_term = float(np.mean(long_term_slice)) if long_term_slice.size else recent_mean
+    improvement = float(np.clip(recent_mean - long_term, 0.0, 1.0))
+    volatility = float(np.std(recent))
+
     reward_curve = np.clip((normalized - 0.4) / 0.6, 0.0, 1.0)
     reward_recent = float(np.mean(reward_curve[-recent_window:])) if recent_window else 0.0
     reward_peak = float(np.max(reward_curve)) if reward_curve.size else 0.0
     reward_signal = float(np.clip(0.65 * reward_recent + 0.35 * reward_peak, 0.0, 1.0))
 
-    coverage = float(min(len(history) / _PERFORMANCE_HISTORY, 1.0))
+    coverage = float(min(len(normalized) / _PERFORMANCE_HISTORY, 1.0))
     difficulty_target = float(
         np.clip(
             0.35 * best
