@@ -116,14 +116,16 @@ def test_prepare_metrics_chart_scales_per_metric() -> None:
             "ai_overlap": 80.0,
             "ai_ssim": 0.50,
             "ai_psnr": 30.0,
-            "ai_score": 60.0,
+            "ai_score": 55.0,
+            "composite_score": 60.0,
             "sound_overlap": 82.0,
         },
         {
             "ai_overlap": 81.0,
             "ai_ssim": 0.51,
             "ai_psnr": 31.0,
-            "ai_score": 61.0,
+            "ai_score": 56.0,
+            "composite_score": 61.0,
             "sound_overlap": 82.1,
         },
     ]
@@ -135,10 +137,13 @@ def test_prepare_metrics_chart_scales_per_metric() -> None:
     assert values, "expected chart values"
     metrics = {value["Metric"] for value in values}
     assert "AI SSIM" in metrics
-    assert "AI composite score" in metrics
+    assert "Sound composite score" in metrics
+    assert "AI baseline score" in metrics
     ssim_values = [value for value in values if value["Metric"] == "AI SSIM"]
     overlap_values = [value for value in values if value["Metric"] == "AI overlap (%)"]
-    composite_values = [value for value in values if value["Metric"] == "AI composite score"]
+    composite_values = [value for value in values if value["Metric"] == "Sound composite score"]
+    baseline_values = [value for value in values if value["Metric"] == "AI baseline score"]
     assert {entry["ScaledValue"] for entry in ssim_values} == {0.0, 1.0}
     assert {entry["ScaledValue"] for entry in overlap_values} == {0.0, 1.0}
     assert {entry["ScaledValue"] for entry in composite_values} == {0.0, 1.0}
+    assert {entry["ScaledValue"] for entry in baseline_values} == {0.0, 1.0}

@@ -1,16 +1,12 @@
 from umbra.metrics import ReconstructionMetrics
-from umbra.ui import (
-    UmbraAppState,
-    _compute_ai_composite_score,
-    _normalize_pinterest_url,
-)
+from umbra.ui import UmbraAppState, _compute_composite_score, _normalize_pinterest_url
 
 
-def test_compute_ai_composite_score_increases_with_metrics() -> None:
-    baseline = _compute_ai_composite_score(50.0, 30.0, 0.5)
-    improved_overlap = _compute_ai_composite_score(80.0, 30.0, 0.5)
-    improved_psnr = _compute_ai_composite_score(50.0, 55.0, 0.5)
-    improved_ssim = _compute_ai_composite_score(50.0, 30.0, 0.9)
+def test_compute_composite_score_increases_with_metrics() -> None:
+    baseline = _compute_composite_score(50.0, 30.0, 0.5)
+    improved_overlap = _compute_composite_score(80.0, 30.0, 0.5)
+    improved_psnr = _compute_composite_score(50.0, 55.0, 0.5)
+    improved_ssim = _compute_composite_score(50.0, 30.0, 0.9)
 
     assert improved_overlap > baseline
     assert improved_psnr > baseline
@@ -36,6 +32,7 @@ def test_app_state_records_generations() -> None:
     assert entry["psnr"] == 42.0
     assert entry["ssim"] == 0.92
     assert entry["ai_score"] > 0
+    assert entry["composite_score"] == entry["sound_score"]
     assert entry["sound_psnr"] == sound_metrics.psnr
     assert entry["sound_ssim"] == sound_metrics.ssim
     assert entry["sound_overlap"] == 64.0
@@ -47,7 +44,7 @@ def test_app_state_records_generations() -> None:
         state.record_generation(index, metrics, 60.0 + 0.01 * index)
 
     assert len(state.history) <= state.history.maxlen  # type: ignore[operator]
-    assert len(state.ai_scores) <= state.ai_scores.maxlen  # type: ignore[operator]
+    assert len(state.composite_scores) <= state.composite_scores.maxlen  # type: ignore[operator]
     assert len(state.sound_scores) <= state.sound_scores.maxlen  # type: ignore[operator]
 
 

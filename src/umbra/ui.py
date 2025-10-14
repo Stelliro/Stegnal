@@ -77,7 +77,7 @@ class UmbraAppState:
     """In-memory state container used by the desktop UI."""
 
     history: deque[dict[str, float]] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
-    ai_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
+    composite_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
     sound_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
 
     def record_generation(
@@ -93,7 +93,7 @@ class UmbraAppState:
     ) -> dict[str, float]:
         """Store metrics for a completed generation and return the entry."""
 
-        ai_score = _compute_ai_composite_score(overlap, metrics.psnr, metrics.ssim)
+        ai_score = _compute_composite_score(overlap, metrics.psnr, metrics.ssim)
         entry = {
             "generation": float(generation_index),
             "overlap": float(overlap),
@@ -102,7 +102,7 @@ class UmbraAppState:
             "ai_score": float(ai_score),
         }
         if sound_metrics is not None and sound_overlap is not None:
-            sound_score = _compute_ai_composite_score(
+            sound_score = _compute_composite_score(
                 sound_overlap,
                 sound_metrics.psnr,
                 sound_metrics.ssim,
@@ -116,6 +116,9 @@ class UmbraAppState:
                 }
             )
             self.sound_scores.append(float(sound_score))
+            composite_score = float(sound_score)
+        else:
+            composite_score = float(ai_score)
         if sound_reference_metrics is not None and sound_reference_overlap is not None:
             entry.update(
                 {
@@ -124,8 +127,9 @@ class UmbraAppState:
                     "sound_reference_overlap": float(sound_reference_overlap),
                 }
             )
+        entry["composite_score"] = composite_score
         self.history.append(entry)
-        self.ai_scores.append(float(ai_score))
+        self.composite_scores.append(float(composite_score))
         return entry
 
     def as_rows(self) -> list[dict[str, float]]:
@@ -138,8 +142,8 @@ def _nan_guard(value: float, fallback: float) -> float:
     return float(np.nan_to_num(value, nan=fallback, posinf=fallback, neginf=fallback))
 
 
-def _compute_ai_composite_score(overlap_pct: float, psnr: float, ssim: float) -> float:
-    """Combine overlap, PSNR, and SSIM into a single AI performance score."""
+def _compute_composite_score(overlap_pct: float, psnr: float, ssim: float) -> float:
+    """Combine overlap, PSNR, and SSIM into a single performance score."""
 
     overlap_value = _nan_guard(overlap_pct, 0.0)
     psnr_value = _nan_guard(psnr, _AI_PSNR_BASELINE)
@@ -386,8 +390,8 @@ class UmbraDesktopApp:
         self._status_var = tk.StringVar(value="Select a reference image to begin.")
         self._run_mode_var = tk.StringVar(value="finite")
         self._score_threshold = tk.DoubleVar(value=88.0)
-        self._ai_score_var = tk.StringVar(value="AI score: –")
-        self._sound_score_var = tk.StringVar(value="Sound score: –")
+        self._primary_score_var = tk.StringVar(value="Sound composite score: –")
+        self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._running = False
@@ -442,7 +446,7 @@ class UmbraDesktopApp:
             command=self._toggle_run_mode,
         ).pack(side=tk.LEFT, padx=10)
 
-        tk.Label(control_frame, text="Auto-refresh at AI score ≥", fg="white", bg="#101010").pack(
+        tk.Label(control_frame, text="Auto-refresh at sound score ≥", fg="white", bg="#101010").pack(
             side=tk.LEFT, padx=(20, 4)
         )
         threshold_spin = tk.Spinbox(
@@ -462,10 +466,10 @@ class UmbraDesktopApp:
             side=tk.LEFT, padx=6, pady=6
         )
 
-        tk.Label(control_frame, textvariable=self._ai_score_var, fg="#8fdc6d", bg="#101010").pack(
+        tk.Label(control_frame, textvariable=self._primary_score_var, fg="#8fdc6d", bg="#101010").pack(
             side=tk.RIGHT, padx=12
         )
-        tk.Label(control_frame, textvariable=self._sound_score_var, fg="#f4d35e", bg="#101010").pack(
+        tk.Label(control_frame, textvariable=self._baseline_score_var, fg="#f4d35e", bg="#101010").pack(
             side=tk.RIGHT, padx=12
         )
         tk.Label(control_frame, textvariable=self._status_var, fg="white", bg="#101010").pack(
@@ -689,7 +693,7 @@ class UmbraDesktopApp:
 
             if self.reference_image is not None and self._run_mode_var.get() == "infinite":
                 threshold = float(self._score_threshold.get())
-                if entry["ai_score"] >= threshold and (time.time() - self._last_refresh) > 30.0:
+                if entry["composite_score"] >= threshold and (time.time() - self._last_refresh) > 30.0:
                     self._queue.put(("refresh_pinterest", None, None))
                     self._last_refresh = time.time()
 
@@ -738,12 +742,21 @@ class UmbraDesktopApp:
                             ss=entry.get("sound_ssim", 0.0)
                         )
                     )
+                    status_parts.append(f"Sound score {sound_score:.2f}")
                 self._status_var.set(" · ".join(status_parts))
-                self._ai_score_var.set(f"AI score: {entry['ai_score']:.2f}")
-                if sound_score is not None:
-                    self._sound_score_var.set(f"Sound score: {sound_score:.2f}")
-                elif sound_payload.get("sound_metrics") is None:
-                    self._sound_score_var.set("Sound score: –")
+                composite_score = entry.get("composite_score")
+                if "sound_score" in entry and composite_score is not None:
+                    self._primary_score_var.set(f"Sound composite score: {composite_score:.2f}")
+                elif composite_score is not None:
+                    self._primary_score_var.set(f"Composite score: {composite_score:.2f} (AI fallback)")
+                else:
+                    self._primary_score_var.set("Sound composite score: –")
+
+                ai_baseline = entry.get("ai_score")
+                if ai_baseline is not None:
+                    self._baseline_score_var.set(f"AI baseline score: {ai_baseline:.2f}")
+                else:
+                    self._baseline_score_var.set("AI baseline score: –")
                 self._draw_graph()
             elif kind == "status":
                 _, text = message
@@ -811,20 +824,32 @@ class UmbraDesktopApp:
                 width // 2,
                 height // 2,
                 fill="#666",
-                text="Run a few generations to view the AI score trend.",
+                text="Run a few generations to view the sound score trend.",
             )
             return
 
-        values = [row["ai_score"] for row in rows]
-        x_values = [row["generation"] for row in rows]
-        sound_rows = [(row["generation"], row["sound_score"]) for row in rows if "sound_score" in row]
+        composite_rows = [
+            (row["generation"], row["composite_score"]) for row in rows if "composite_score" in row
+        ]
+        if len(composite_rows) < 2:
+            self._graph_canvas.create_text(
+                width // 2,
+                height // 2,
+                fill="#666",
+                text="Waiting for sound reconstructions…",
+            )
+            return
+
+        x_values = [generation for generation, _ in composite_rows]
+        values = [score for _, score in composite_rows]
+        baseline_rows = [(row["generation"], row["ai_score"]) for row in rows if "ai_score" in row]
         x_min, x_max = min(x_values), max(x_values)
         y_min = min(values)
         y_max = max(values)
-        if sound_rows:
-            sound_vals = [val for _, val in sound_rows]
-            y_min = min(y_min, min(sound_vals))
-            y_max = max(y_max, max(sound_vals))
+        if baseline_rows:
+            baseline_vals = [val for _, val in baseline_rows]
+            y_min = min(y_min, min(baseline_vals))
+            y_max = max(y_max, max(baseline_vals))
         if x_max == x_min:
             x_max = x_min + 1
         if y_max == y_min:
@@ -837,30 +862,30 @@ class UmbraDesktopApp:
             return height - margin - (val - y_min) / (y_max - y_min) * (height - 2 * margin)
 
         points: list[float] = []
-        for generation, score in zip(x_values, values):
+        for generation, score in composite_rows:
             points.extend([_scale_x(generation), _scale_y(score)])
 
-        self._graph_canvas.create_line(points, fill="#58a6ff", width=3, smooth=True)
-        if len(sound_rows) >= 2:
-            sound_points: list[float] = []
-            for generation, score in sound_rows:
-                sound_points.extend([_scale_x(generation), _scale_y(score)])
-            self._graph_canvas.create_line(sound_points, fill="#f4d35e", width=2, dash=(4, 3))
+        self._graph_canvas.create_line(points, fill="#f4d35e", width=3, smooth=True)
+        if len(baseline_rows) >= 2:
+            baseline_points: list[float] = []
+            for generation, score in baseline_rows:
+                baseline_points.extend([_scale_x(generation), _scale_y(score)])
+            self._graph_canvas.create_line(baseline_points, fill="#58a6ff", width=2, dash=(4, 3))
         self._graph_canvas.create_line(margin, height - margin, width - margin, height - margin, fill="#333")
         self._graph_canvas.create_line(margin, margin, margin, height - margin, fill="#333")
         self._graph_canvas.create_text(
             margin,
             margin - 10,
-            text="AI composite score",
-            fill="#58a6ff",
+            text="Sound composite score",
+            fill="#f4d35e",
             anchor=tk.W,
         )
-        if sound_rows:
+        if baseline_rows:
             self._graph_canvas.create_text(
                 margin,
                 margin + 14,
-                text="Sound alignment score",
-                fill="#f4d35e",
+                text="AI baseline score",
+                fill="#58a6ff",
                 anchor=tk.W,
             )
         self._graph_canvas.create_text(
@@ -873,16 +898,16 @@ class UmbraDesktopApp:
             width - margin,
             margin,
             text=f"Latest {values[-1]:.2f}",
-            fill="#8fdc6d",
+            fill="#f4d35e",
             anchor=tk.E,
         )
-        if sound_rows:
-            latest_sound = sound_rows[-1][1]
+        if baseline_rows:
+            latest_baseline = baseline_rows[-1][1]
             self._graph_canvas.create_text(
                 width - margin,
                 margin + 16,
-                text=f"Sound {latest_sound:.2f}",
-                fill="#f4d35e",
+                text=f"AI {latest_baseline:.2f}",
+                fill="#58a6ff",
                 anchor=tk.E,
             )
 
@@ -910,7 +935,7 @@ __all__ = [
     "UmbraDesktopApp",
     "UmbraAppState",
     "fetch_pinterest_inspiration",
-    "_compute_ai_composite_score",
+    "_compute_composite_score",
     "_normalize_pinterest_url",
     "main",
 ]

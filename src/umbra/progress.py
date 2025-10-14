@@ -282,8 +282,10 @@ def prepare_metrics_chart(
         "ai_psnr": "AI PSNR (dB)",
         "sound_overlap": "AI↔Sound overlap (%)",
     }
+    if any("composite_score" in entry for entry in sliced_history):
+        metric_labels["composite_score"] = "Sound composite score"
     if any("ai_score" in entry for entry in sliced_history):
-        metric_labels["ai_score"] = "AI composite score"
+        metric_labels["ai_score"] = "AI baseline score"
     if any("sound_reference_overlap" in entry for entry in sliced_history):
         metric_labels["sound_reference_overlap"] = "Sound↔Reference overlap (%)"
 
