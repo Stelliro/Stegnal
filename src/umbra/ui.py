@@ -208,13 +208,29 @@ def _sanitize_filename(label: str, suffix: str) -> str:
     return f"{safe}{suffix}"
 
 
-def _image_to_png_bytes(image: np.ndarray) -> bytes:
-    array = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
-    with BytesIO() as buffer:
-        Image.fromarray((array * 255.0).astype(np.uint8), mode="RGB").save(
-            buffer, format="PNG"
-        )
-        return buffer.getvalue()
+def _image_to_png_bytes(image: np.ndarray, *, max_edge: int | None = None) -> bytes:
+    """Encode ``image`` as PNG bytes, optionally downscaling for display."""
+
+    array = np.asarray(image)
+    if array.dtype != np.uint8 or array.ndim not in (2, 3):
+        array = to_uint8_image(array)
+
+    if array.ndim == 3:
+        if array.shape[2] == 1:
+            array = array[:, :, 0]
+        elif array.shape[2] not in (3, 4):  # pragma: no cover - defensive
+            raise ValueError("Expected image with 1, 3, or 4 channels")
+
+    pil_image = Image.fromarray(array)
+
+    if max_edge is not None and max_edge > 0:
+        longest = max(pil_image.size)
+        if longest > max_edge:
+            pil_image.thumbnail((max_edge, max_edge), Image.LANCZOS)
+
+    buffer = BytesIO()
+    pil_image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _resize_image(image: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
@@ -366,6 +382,7 @@ def _normalize_pinterest_url(url: str) -> str:
     cleaned = cleaned.replace("\\u002F", "/").replace("\\/", "/")
     cleaned = cleaned.split(")}")[0]
     cleaned = cleaned.strip("'\"}) ;")
+    cleaned = re.sub(r"(?i)(\.(?:png|jpe?g|gif|webp)).*", r"\1", cleaned)
     if "/originals/" in cleaned:
         # Pinterest frequently forbids direct downloads from /originals/ paths when
         # no browser session is present. Fall back to the public 736px variant which
@@ -673,8 +690,52 @@ def _sound_transmission_profile(state: st.session_state) -> tuple[int, float]:
     return sections, marker
 
 
+def _ensure_generation_throttle(state: MutableMapping[str, Any]) -> None:
+    """Ensure the per-tick generation throttle has a sane default."""
+
+    try:
+        throttle = int(state.get("max_generations_per_tick", 0))
+    except (TypeError, ValueError):
+        throttle = 0
+    if throttle <= 0:
+        state["max_generations_per_tick"] = _DEFAULT_GENERATIONS_PER_TICK
+
+
+def _current_generation_throttle(state: MutableMapping[str, Any]) -> int:
+    """Return the active per-tick generation budget respecting throttles."""
+
+    _ensure_generation_throttle(state)
+    try:
+        throttle = int(state.get("max_generations_per_tick", _DEFAULT_GENERATIONS_PER_TICK))
+    except (TypeError, ValueError):
+        throttle = _DEFAULT_GENERATIONS_PER_TICK
+
+    throttle = max(_DEFAULT_GENERATIONS_PER_TICK, throttle)
+    throttle = min(throttle, _MAX_GENERATION_TICK_CAP)
+
+    if state.get("run_infinite", False):
+        return _DEFAULT_GENERATIONS_PER_TICK
+
+    return throttle
+
+
+def _prune_generation_memory(manager: EvolutionManager) -> None:
+    """Trim cached generation records to avoid unbounded memory growth."""
+
+    if _GENERATION_MEMORY_LIMIT <= 0:
+        return
+    generations = getattr(manager, "generations", None)
+    if not generations:
+        return
+    excess = len(generations) - _GENERATION_MEMORY_LIMIT
+    if excess > 0:
+        del generations[:excess]
+
+
 def _ensure_transmission_genes(state: MutableMapping[str, Any]) -> None:
     """Seed transmission gene defaults when they are missing or invalid."""
+
+    _ensure_generation_throttle(state)
 
     try:
         sections = int(state.get("sound_section_count", 0))
@@ -769,6 +830,15 @@ def _mutate_transmission_genes(
     if not math.isfinite(marker):
         marker = 0.0
 
+    throttle = int(state.get("max_generations_per_tick", _DEFAULT_GENERATIONS_PER_TICK))
+    if reward_peak < 0.3 or improvement <= 0.0 or rng.random() < 0.4:
+        throttle = _DEFAULT_GENERATIONS_PER_TICK
+    elif rng.random() < 0.05 * (1 + exploration):
+        throttle = min(_MAX_GENERATION_TICK_CAP, throttle + 1)
+    elif rng.random() < 0.2:
+        throttle = max(_DEFAULT_GENERATIONS_PER_TICK, throttle - 1)
+
+    state["max_generations_per_tick"] = throttle
     state["sound_section_count"] = sections
     state["sound_marker_duration"] = marker
 
@@ -2208,30 +2278,10 @@ def _apply_color_template(grayscale: np.ndarray, template: np.ndarray) -> np.nda
     return np.clip(tinted, 0.0, 1.0, out=tinted)
 
 
-def _image_to_png_bytes(image: np.ndarray) -> bytes:
-    """Encode an image array as PNG bytes for inline display."""
-
-    array = np.asarray(image)
-    if array.dtype != np.uint8 or array.ndim not in (2, 3):
-        array = to_uint8_image(array)
-
-    if array.ndim == 3:
-        if array.shape[2] == 1:
-            array = array[:, :, 0]
-        elif array.shape[2] not in (3, 4):  # pragma: no cover - defensive
-            raise ValueError("Expected 1, 3, or 4 channel image for PNG conversion")
-
-    pil_image = Image.fromarray(array)
-
-    buffer = BytesIO()
-    pil_image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def _image_to_data_url(image: np.ndarray) -> str:
+def _image_to_data_url(image: np.ndarray, *, max_edge: int | None = None) -> str:
     """Convert an image into a ``data:`` URL for stable inline rendering."""
 
-    png_bytes = _image_to_png_bytes(image)
+    png_bytes = _image_to_png_bytes(image, max_edge=max_edge)
     encoded = base64.b64encode(png_bytes).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 
@@ -2246,7 +2296,7 @@ def _audio_to_data_url(data: bytes, *, mime: str = "audio/wav") -> str:
 def _render_image(column: st.delta_generator.DeltaGenerator, image: np.ndarray, caption: str) -> None:
     """Render ``image`` inside ``column`` with a semantic caption."""
 
-    data_url = _image_to_data_url(image)
+    data_url = _image_to_data_url(image, max_edge=_DISPLAY_MAX_EDGE)
     alt_text = html.escape(caption)
     caption_html = html.escape(caption).replace("\n", "<br />")
     column.markdown(
@@ -2414,7 +2464,11 @@ _SOUND_RESOLUTION_OPTIONS: tuple[int, ...] = (64, 96, 128, 160, 192, 224, 256)
 _PERFORMANCE_HISTORY = 60
 _PERFORMANCE_CHART_WINDOW = 48
 _RECENT_PERFORMANCE = 8
-_MAX_GENERATIONS_PER_TICK = 3
+_DEFAULT_GENERATIONS_PER_TICK = 1
+_MAX_GENERATION_TICK_CAP = 2
+_GENERATION_MEMORY_LIMIT = 120
+_GLOBAL_PROGRESS_HISTORY_LIMIT = 360
+_DISPLAY_MAX_EDGE = 768
 _AI_PSNR_BASELINE = 20.0
 _AI_PSNR_TARGET = 60.0
 
@@ -2784,6 +2838,15 @@ def _append_global_progress_row(
     base_entry["Generation"] = float(global_step)
     history.append(base_entry)
     index_map[progress_key] = len(history) - 1
+
+    if len(history) > _GLOBAL_PROGRESS_HISTORY_LIMIT > 0:
+        trim = len(history) - _GLOBAL_PROGRESS_HISTORY_LIMIT
+        history = history[trim:]
+        index_map = {
+            key: idx - trim
+            for key, idx in index_map.items()
+            if idx >= trim
+        }
 
     state["_global_progress_history"] = history
     state["_global_progress_index"] = index_map
@@ -4203,13 +4266,14 @@ def run() -> None:
     pending_generations = int(state.get("pending_generations", 0))
     runs_to_execute = 0
     finite_batch = False
+    tick_limit = _current_generation_throttle(state)
     if pending_generations > 0:
         finite_batch = True
-        runs_to_execute = min(pending_generations, _MAX_GENERATIONS_PER_TICK)
+        runs_to_execute = min(pending_generations, tick_limit)
     elif state.get("run_infinite", False):
-        runs_to_execute = 1
-    if state.get("run_infinite", False) and runs_to_execute == 0:
-        runs_to_execute = 1
+        runs_to_execute = tick_limit
+    if state.get("run_infinite", False) and runs_to_execute <= 0:
+        runs_to_execute = _DEFAULT_GENERATIONS_PER_TICK
 
     generations_ran = 0
     reseeded = False
@@ -4244,6 +4308,7 @@ def run() -> None:
                     int(state.get("pending_generations", 0)) - 1,
                     0,
                 )
+        _prune_generation_memory(manager)
         logger.debug(
             "Executed %d generation(s); pending=%d infinite=%s",
             generations_ran,

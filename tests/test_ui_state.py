@@ -291,6 +291,62 @@ def test_auto_refresh_pinterest_reference_respects_source(monkeypatch) -> None:
         sys.modules.pop("umbra.ui", None)
 
 
+def test_current_generation_throttle_defaults(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        state: dict[str, object] = {}
+        assert ui._current_generation_throttle(state) == ui._DEFAULT_GENERATIONS_PER_TICK
+
+        state["max_generations_per_tick"] = ui._MAX_GENERATION_TICK_CAP + 5
+        assert ui._current_generation_throttle(state) == ui._MAX_GENERATION_TICK_CAP
+
+        state["run_infinite"] = True
+        assert ui._current_generation_throttle(state) == ui._DEFAULT_GENERATIONS_PER_TICK
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_prune_generation_memory_limits(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        manager = SimpleNamespace(generations=[object()] * (ui._GENERATION_MEMORY_LIMIT + 5))
+        ui._prune_generation_memory(manager)
+        assert len(manager.generations) == ui._GENERATION_MEMORY_LIMIT
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_image_to_png_bytes_downscales(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        large = np.full((1500, 1000, 3), 0.5, dtype=np.float32)
+        png_bytes = ui._image_to_png_bytes(large, max_edge=512)
+        with Image.open(BytesIO(png_bytes)) as decoded:
+            assert max(decoded.size) <= 512
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_append_global_progress_row_prunes_history(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        limit = ui._GLOBAL_PROGRESS_HISTORY_LIMIT
+        state: dict[str, object] = {}
+        manager = SimpleNamespace(run_id="run", base_seed=7)
+        for idx in range(limit + 5):
+            row = {"Generation": float(idx + 1)}
+            ui._append_global_progress_row(state, manager, row)
+
+        history = state.get("_global_progress_history", [])
+        assert len(history) == limit
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
 def test_mutate_transmission_genes_allows_large_values(monkeypatch) -> None:
     state: dict[str, object] = {
         "sound_section_count": 8,
