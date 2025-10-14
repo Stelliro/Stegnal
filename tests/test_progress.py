@@ -137,11 +137,13 @@ def test_prepare_metrics_chart_scales_per_metric() -> None:
     assert values, "expected chart values"
     metrics = {value["Metric"] for value in values}
     assert "AI SSIM" in metrics
-    assert "Sound composite score" in metrics
+    assert "Sound↔AI composite score" in metrics
     assert "AI baseline score" in metrics
     ssim_values = [value for value in values if value["Metric"] == "AI SSIM"]
     overlap_values = [value for value in values if value["Metric"] == "AI overlap (%)"]
-    composite_values = [value for value in values if value["Metric"] == "Sound composite score"]
+    composite_values = [
+        value for value in values if value["Metric"] == "Sound↔AI composite score"
+    ]
     baseline_values = [value for value in values if value["Metric"] == "AI baseline score"]
     assert {entry["ScaledValue"] for entry in ssim_values} == {0.0, 1.0}
     assert {entry["ScaledValue"] for entry in overlap_values} == {0.0, 1.0}

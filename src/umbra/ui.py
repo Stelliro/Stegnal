@@ -391,7 +391,7 @@ class UmbraDesktopApp:
         self._status_var = tk.StringVar(value="Select a reference image to begin.")
         self._run_mode_var = tk.StringVar(value="finite")
         self._score_threshold = tk.DoubleVar(value=88.0)
-        self._primary_score_var = tk.StringVar(value="Sound composite score: –")
+        self._primary_score_var = tk.StringVar(value="Sound↔AI composite score: –")
         self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -735,32 +735,52 @@ class UmbraDesktopApp:
                     None if sound_image is None else np.asarray(sound_image, dtype=np.float32)
                 )
                 status_parts = [
-                    "Generation {gen:.0f}".format(gen=entry["generation"]),
-                    "AI overlap {ov:.2f}%".format(ov=entry["overlap"]),
-                    "AI PSNR {ps:.2f} dB".format(ps=entry["psnr"]),
-                    "AI SSIM {ss:.3f}".format(ss=entry["ssim"]),
+                    f"Generation {entry.get('generation', 0):.0f}",
                 ]
                 sound_score = entry.get("sound_score")
                 if sound_score is not None:
                     status_parts.append(
-                        "Sound overlap {ov:.2f}%".format(
+                        "Sound↔AI overlap {ov:.2f}%".format(
                             ov=entry.get("sound_overlap", 0.0)
                         )
                     )
+                    if "sound_psnr" in entry:
+                        status_parts.append(
+                            "Sound↔AI PSNR {ps:.2f} dB".format(
+                                ps=entry.get("sound_psnr", 0.0)
+                            )
+                        )
                     status_parts.append(
-                        "Sound SSIM {ss:.3f}".format(
+                        "Sound↔AI SSIM {ss:.3f}".format(
                             ss=entry.get("sound_ssim", 0.0)
                         )
                     )
-                    status_parts.append(f"Sound score {sound_score:.2f}")
+                    status_parts.append(f"Sound↔AI score {sound_score:.2f}")
+                else:
+                    status_parts.append("Sound↔AI score unavailable")
+                status_parts.append(
+                    "AI↔Reference overlap {ov:.2f}%".format(
+                        ov=entry.get("overlap", 0.0)
+                    )
+                )
+                status_parts.append(
+                    "AI↔Reference PSNR {ps:.2f} dB".format(ps=entry.get("psnr", 0.0))
+                )
+                status_parts.append(
+                    "AI↔Reference SSIM {ss:.3f}".format(ss=entry.get("ssim", 0.0))
+                )
                 self._status_var.set(" · ".join(status_parts))
                 composite_score = entry.get("composite_score")
                 if "sound_score" in entry and composite_score is not None:
-                    self._primary_score_var.set(f"Sound composite score: {composite_score:.2f}")
+                    self._primary_score_var.set(
+                        f"Sound↔AI composite score: {composite_score:.2f}"
+                    )
                 elif composite_score is not None:
-                    self._primary_score_var.set(f"Composite score: {composite_score:.2f} (AI fallback)")
+                    self._primary_score_var.set(
+                        f"Composite score: {composite_score:.2f} (AI fallback)"
+                    )
                 else:
-                    self._primary_score_var.set("Sound composite score: –")
+                    self._primary_score_var.set("Sound↔AI composite score: –")
 
                 ai_baseline = entry.get("ai_score")
                 if ai_baseline is not None:
@@ -939,7 +959,7 @@ class UmbraDesktopApp:
         self._graph_canvas.create_text(
             margin,
             margin - 10,
-            text="Sound composite score",
+            text="Sound↔AI composite score",
             fill="#f4d35e",
             anchor=tk.W,
         )
