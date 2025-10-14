@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import html
 import json
@@ -44,7 +45,11 @@ try:  # pragma: no cover - optional dependency for memory accounting
 except Exception:  # pragma: no cover - optional dependency
     psutil = None
 
-from .codec import decode_waveform_to_image, encode_image_to_waveform
+from .codec import (
+    decode_waveform_to_image,
+    encode_image_to_wav_bytes,
+    encode_image_to_waveform,
+)
 from .decoding import NoiseStreamDecoder
 from .demo_packager import build_demo_executable
 from .encoding import NoiseStreamEncoder
@@ -206,6 +211,7 @@ class UmbraAppState:
     history: deque[dict[str, float]] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
     composite_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
     sound_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
+    readability_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
 
     def record_generation(
         self,
@@ -248,16 +254,24 @@ class UmbraAppState:
                 sound_psnr_value,
                 sound_ssim_value,
             )
+            readability_score = _compute_readability_score(
+                sound_overlap_value,
+                sound_psnr_value,
+                sound_ssim_value,
+            )
             entry.update(
                 {
                     "sound_psnr": sound_psnr_value,
                     "sound_ssim": sound_ssim_value,
                     "sound_overlap": sound_overlap_value,
                     "sound_score": sound_score,
+                    "sound_readability_score": readability_score,
                 }
             )
             if math.isfinite(sound_score):
                 self.sound_scores.append(sound_score)
+            if math.isfinite(readability_score):
+                self.readability_scores.append(readability_score)
             composite_score = float(sound_score)
         if sound_reference_metrics is not None and sound_reference_overlap is not None:
             entry.update(
@@ -298,6 +312,22 @@ def _compute_composite_score(overlap_pct: float, psnr: float, ssim: float) -> fl
 
     composite = float(np.clip(0.4 * overlap_norm + 0.3 * psnr_norm + 0.3 * ssim_norm, 0.0, 1.0))
     return composite * 100.0
+
+
+def _compute_readability_score(overlap_pct: float, psnr: float, ssim: float) -> float:
+    """Derive a readability score emphasising agreement between sound and AI images."""
+
+    overlap_value = _nan_guard(overlap_pct, 0.0)
+    psnr_value = _nan_guard(psnr, _AI_PSNR_BASELINE)
+    ssim_value = _nan_guard(ssim, 0.0)
+
+    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
+    psnr_span = max(_AI_PSNR_TARGET - _AI_PSNR_BASELINE, 1e-6)
+    psnr_norm = float(np.clip((psnr_value - _AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
+    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
+
+    readability = float(np.clip((overlap_norm + psnr_norm + ssim_norm) / 3.0, 0.0, 1.0))
+    return readability * 100.0
 
 
 def _clamp_image(array: np.ndarray) -> np.ndarray:
@@ -514,7 +544,8 @@ class UmbraDesktopApp:
         self._status_var = tk.StringVar(value="Select a reference image to begin.")
         self._run_mode_var = tk.StringVar(value="finite")
         self._score_threshold = tk.DoubleVar(value=88.0)
-        self._primary_score_var = tk.StringVar(value="Sound↔AI composite score: –")
+        self._primary_score_var = tk.StringVar(value="Sound score: –")
+        self._readability_score_var = tk.StringVar(value="WAV readability score: –")
         self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -580,6 +611,11 @@ class UmbraDesktopApp:
             text="Build demo exe model here",
             command=self._build_demo_executable,
         ).pack(side=tk.LEFT, padx=6, pady=6)
+        tk.Button(
+            control_frame,
+            text="⭳ Extract parameters",
+            command=self._export_model_parameters,
+        ).pack(side=tk.LEFT, padx=6, pady=6)
 
         tk.Checkbutton(
             control_frame,
@@ -613,6 +649,12 @@ class UmbraDesktopApp:
         tk.Label(control_frame, textvariable=self._primary_score_var, fg="#8fdc6d", bg="#101010").pack(
             side=tk.RIGHT, padx=12
         )
+        tk.Label(
+            control_frame,
+            textvariable=self._readability_score_var,
+            fg="#9be9a8",
+            bg="#101010",
+        ).pack(side=tk.RIGHT, padx=12)
         tk.Label(control_frame, textvariable=self._baseline_score_var, fg="#f4d35e", bg="#101010").pack(
             side=tk.RIGHT, padx=12
         )
@@ -870,53 +912,40 @@ class UmbraDesktopApp:
                 self._update_sound_reconstruction(
                     None if sound_image is None else np.asarray(sound_image, dtype=np.float32)
                 )
-                status_parts = [
-                    f"Generation {entry.get('generation', 0):.0f}",
-                ]
+                status_parts = [f"Generation {entry.get('generation', 0):.0f}"]
                 sound_score = entry.get("sound_score")
                 if sound_score is not None:
                     status_parts.append(
-                        "Sound↔AI overlap {ov:.2f}%".format(
-                            ov=entry.get("sound_overlap", 0.0)
-                        )
+                        "Sound overlap {ov:.2f}%".format(ov=entry.get("sound_overlap", 0.0))
                     )
                     if "sound_psnr" in entry:
                         status_parts.append(
-                            "Sound↔AI PSNR {ps:.2f} dB".format(
-                                ps=entry.get("sound_psnr", 0.0)
-                            )
+                            "Sound PSNR {ps:.2f} dB".format(ps=entry.get("sound_psnr", 0.0))
                         )
                     status_parts.append(
-                        "Sound↔AI SSIM {ss:.3f}".format(
-                            ss=entry.get("sound_ssim", 0.0)
-                        )
+                        "Sound SSIM {ss:.3f}".format(ss=entry.get("sound_ssim", 0.0))
                     )
-                    status_parts.append(f"Sound↔AI score {sound_score:.2f}")
+                    status_parts.append(f"Sound score {sound_score:.2f}")
                 else:
-                    status_parts.append("Sound↔AI score unavailable")
+                    status_parts.append("Sound score unavailable")
                 status_parts.append(
-                    "AI↔Reference overlap {ov:.2f}%".format(
-                        ov=entry.get("overlap", 0.0)
-                    )
+                    "AI overlap {ov:.2f}%".format(ov=entry.get("overlap", 0.0))
                 )
-                status_parts.append(
-                    "AI↔Reference PSNR {ps:.2f} dB".format(ps=entry.get("psnr", 0.0))
-                )
-                status_parts.append(
-                    "AI↔Reference SSIM {ss:.3f}".format(ss=entry.get("ssim", 0.0))
-                )
+                status_parts.append("AI PSNR {ps:.2f} dB".format(ps=entry.get("psnr", 0.0)))
+                status_parts.append("AI SSIM {ss:.3f}".format(ss=entry.get("ssim", 0.0)))
                 self._status_var.set(" · ".join(status_parts))
+
                 composite_score = entry.get("composite_score")
                 if "sound_score" in entry and composite_score is not None:
-                    self._primary_score_var.set(
-                        f"Sound↔AI composite score: {composite_score:.2f}"
-                    )
-                elif composite_score is not None:
-                    self._primary_score_var.set(
-                        f"Sound↔AI composite score: {composite_score:.2f} (sound reconstruction unavailable)"
-                    )
+                    self._primary_score_var.set(f"Sound score: {composite_score:.2f}")
                 else:
-                    self._primary_score_var.set("Sound↔AI composite score: –")
+                    self._primary_score_var.set("Sound score: – (waiting for sound)")
+
+                readability_score = entry.get("sound_readability_score")
+                if readability_score is not None and "sound_score" in entry:
+                    self._readability_score_var.set(f"WAV readability score: {readability_score:.2f}")
+                else:
+                    self._readability_score_var.set("WAV readability score: –")
 
                 ai_baseline = entry.get("ai_score")
                 if ai_baseline is not None:
@@ -937,6 +966,116 @@ class UmbraDesktopApp:
         if processed:
             self._draw_graph()
         self.root.after(200, self._poll_queue)
+
+    def _export_model_parameters(self) -> None:
+        """Persist the current model history, images, and sound payload to JSON."""
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        default_name = f"umbra_model_parameters_{timestamp}.json"
+
+        if filedialog is not None:
+            chosen = filedialog.asksaveasfilename(
+                title="Export model parameters",
+                defaultextension=".json",
+                initialfile=default_name,
+                filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+            )
+        else:
+            chosen = ""
+
+        if chosen:
+            destination = Path(chosen)
+        else:
+            destination = Path.cwd() / default_name
+
+        def _encode_image(image: np.ndarray | None) -> str | None:
+            if image is None:
+                return None
+            try:
+                clamped = _clamp_image(image)
+            except ValueError:
+                return None
+            buffer = BytesIO()
+            png_image = Image.fromarray((clamped * 255.0).astype(np.uint8))
+            png_image.save(buffer, format="PNG")
+            return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        def _serialize_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+            serialised: dict[str, Any] = {}
+            for key, value in payload.items():
+                if isinstance(value, ReconstructionMetrics):
+                    serialised[key] = value.as_dict()
+                elif isinstance(value, np.ndarray):
+                    serialised[key] = np.asarray(value).tolist()
+                elif isinstance(value, (np.floating, np.integer)):
+                    serialised[key] = float(value)
+                else:
+                    serialised[key] = value
+            return serialised
+
+        history_rows: list[dict[str, float]] = []
+        for row in self.state.as_rows():
+            converted: dict[str, float] = {}
+            for key, value in row.items():
+                if isinstance(value, (np.floating, np.integer)):
+                    converted[key] = float(value)
+                else:
+                    converted[key] = value
+            history_rows.append(converted)
+
+        payload_serialised: dict[str, Any] | None = None
+        if self._latest_sound_payload:
+            payload_serialised = _serialize_payload(self._latest_sound_payload)
+
+        wav_base64: str | None = None
+        if (
+            self.reconstruction is not None
+            and payload_serialised is not None
+            and all(key in payload_serialised for key in ("sample_rate", "segments", "marker_duration"))
+        ):
+            try:
+                wav_bytes = encode_image_to_wav_bytes(
+                    self.reconstruction,
+                    sample_rate=int(payload_serialised["sample_rate"]),
+                    segments=int(payload_serialised["segments"]),
+                    marker_duration=float(payload_serialised["marker_duration"]),
+                )
+                wav_base64 = base64.b64encode(wav_bytes).decode("ascii")
+            except Exception as exc:  # pragma: no cover - defensive conversion guard
+                logger.debug("Failed to regenerate WAV for export: %s", exc)
+
+        export_payload = {
+            "saved_at": timestamp,
+            "reference": {
+                "label": self.reference_label,
+                "image_png_base64": _encode_image(self.reference_image),
+            },
+            "latest_reconstruction_png": _encode_image(self.reconstruction),
+            "latest_sound_reconstruction_png": _encode_image(self.sound_reconstruction),
+            "latest_generation_entry": dict(self._latest_generation_entry or {}),
+            "history": history_rows,
+            "composite_scores": list(self.state.composite_scores),
+            "sound_scores": list(self.state.sound_scores),
+            "readability_scores": list(self.state.readability_scores),
+            "latest_sound_payload": payload_serialised,
+            "latest_sound_wav_base64": wav_base64,
+        }
+
+        try:
+            destination.write_text(json.dumps(export_payload, indent=2))
+        except Exception as exc:  # pragma: no cover - filesystem failure guard
+            logger.exception("Failed to export model parameters")
+            self._status_var.set(f"Parameter export failed: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Export failed", f"Could not write export file:\n{exc}")
+            return
+
+        self._status_var.set(f"Model parameters saved to {destination}")
+        if messagebox is not None:
+            messagebox.showinfo(
+                "Export complete",
+                f"Model parameters and artifacts saved to:\n{destination}",
+            )
 
     def _build_demo_executable(self) -> None:
         if self.reconstruction is None and self.reference_image is None:
@@ -1048,9 +1187,16 @@ class UmbraDesktopApp:
             return
 
         composite_rows = [
-            (row["generation"], row["composite_score"]) for row in rows if "composite_score" in row
+            (row["generation"], row["composite_score"])
+            for row in rows
+            if "composite_score" in row and "sound_score" in row
         ]
-        if len(composite_rows) < 2:
+        readability_rows = [
+            (row["generation"], row["sound_readability_score"])
+            for row in rows
+            if "sound_readability_score" in row and "sound_score" in row
+        ]
+        if len(composite_rows) < 2 and len(readability_rows) < 2:
             self._graph_canvas.create_text(
                 width // 2,
                 height // 2,
@@ -1059,12 +1205,22 @@ class UmbraDesktopApp:
             )
             return
 
-        x_values = [generation for generation, _ in composite_rows]
-        values = [score for _, score in composite_rows]
+        x_values: list[float] = []
+        y_values: list[float] = []
+        if composite_rows:
+            x_values.extend(generation for generation, _ in composite_rows)
+            y_values.extend(score for _, score in composite_rows)
+        if readability_rows:
+            x_values.extend(generation for generation, _ in readability_rows)
+            y_values.extend(score for _, score in readability_rows)
         baseline_rows = [(row["generation"], row["ai_score"]) for row in rows if "ai_score" in row]
+        if not x_values:
+            x_values.extend(generation for generation, _ in baseline_rows)
+        if not y_values:
+            y_values.extend(score for _, score in baseline_rows)
         x_min, x_max = min(x_values), max(x_values)
-        y_min = min(values)
-        y_max = max(values)
+        y_min = min(y_values)
+        y_max = max(y_values)
         if baseline_rows:
             baseline_vals = [val for _, val in baseline_rows]
             y_min = min(y_min, min(baseline_vals))
@@ -1080,11 +1236,16 @@ class UmbraDesktopApp:
         def _scale_y(val: float) -> float:
             return height - margin - (val - y_min) / (y_max - y_min) * (height - 2 * margin)
 
-        points: list[float] = []
-        for generation, score in composite_rows:
-            points.extend([_scale_x(generation), _scale_y(score)])
-
-        self._graph_canvas.create_line(points, fill="#f4d35e", width=3, smooth=True)
+        if len(composite_rows) >= 2:
+            composite_points: list[float] = []
+            for generation, score in composite_rows:
+                composite_points.extend([_scale_x(generation), _scale_y(score)])
+            self._graph_canvas.create_line(composite_points, fill="#f4d35e", width=3, smooth=True)
+        if len(readability_rows) >= 2:
+            readability_points: list[float] = []
+            for generation, score in readability_rows:
+                readability_points.extend([_scale_x(generation), _scale_y(score)])
+            self._graph_canvas.create_line(readability_points, fill="#9be9a8", width=2, smooth=True)
         if len(baseline_rows) >= 2:
             baseline_points: list[float] = []
             for generation, score in baseline_rows:
@@ -1092,18 +1253,30 @@ class UmbraDesktopApp:
             self._graph_canvas.create_line(baseline_points, fill="#58a6ff", width=2, dash=(4, 3))
         self._graph_canvas.create_line(margin, height - margin, width - margin, height - margin, fill="#333")
         self._graph_canvas.create_line(margin, margin, margin, height - margin, fill="#333")
-        self._graph_canvas.create_text(
-            margin,
-            margin - 10,
-            text="Sound↔AI composite score",
-            fill="#f4d35e",
-            anchor=tk.W,
-        )
+        legend_y = margin - 10
+        if len(composite_rows) >= 2:
+            self._graph_canvas.create_text(
+                margin,
+                legend_y,
+                text="Sound score",
+                fill="#f4d35e",
+                anchor=tk.W,
+            )
+            legend_y += 14
+        if len(readability_rows) >= 2:
+            self._graph_canvas.create_text(
+                margin,
+                legend_y,
+                text="WAV readability",
+                fill="#9be9a8",
+                anchor=tk.W,
+            )
+            legend_y += 14
         if baseline_rows:
             self._graph_canvas.create_text(
                 margin,
-                margin + 14,
-                text="AI baseline score",
+                legend_y,
+                text="AI baseline",
                 fill="#58a6ff",
                 anchor=tk.W,
             )
@@ -1113,18 +1286,30 @@ class UmbraDesktopApp:
             text="Generation",
             fill="#888",
         )
-        self._graph_canvas.create_text(
-            width - margin,
-            margin,
-            text=f"Latest {values[-1]:.2f}",
-            fill="#f4d35e",
-            anchor=tk.E,
-        )
+        label_y = margin
+        if composite_rows:
+            self._graph_canvas.create_text(
+                width - margin,
+                label_y,
+                text=f"Sound {composite_rows[-1][1]:.2f}",
+                fill="#f4d35e",
+                anchor=tk.E,
+            )
+            label_y += 16
+        if readability_rows:
+            self._graph_canvas.create_text(
+                width - margin,
+                label_y,
+                text=f"Readability {readability_rows[-1][1]:.2f}",
+                fill="#9be9a8",
+                anchor=tk.E,
+            )
+            label_y += 16
         if baseline_rows:
             latest_baseline = baseline_rows[-1][1]
             self._graph_canvas.create_text(
                 width - margin,
-                margin + 16,
+                label_y,
                 text=f"AI {latest_baseline:.2f}",
                 fill="#58a6ff",
                 anchor=tk.E,
@@ -1155,6 +1340,7 @@ __all__ = [
     "UmbraAppState",
     "fetch_pinterest_inspiration",
     "_compute_composite_score",
+    "_compute_readability_score",
     "_normalize_pinterest_url",
     "main",
 ]
