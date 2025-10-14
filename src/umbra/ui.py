@@ -380,81 +380,6 @@ def _prepare_sound_preview(array: np.ndarray) -> np.ndarray:
     return np.clip(normalized, 0.0, 1.0)
 
 
-def _compute_sound_payload(
-    reconstruction: np.ndarray,
-    reference: np.ndarray,
-    *,
-    max_attempts: int = 3,
-) -> tuple[np.ndarray | None, dict[str, Any]]:
-    """Return a clipped sound reconstruction and associated metrics."""
-
-    recon = np.clip(np.asarray(reconstruction, dtype=np.float32), 0.0, 1.0)
-    base_reference = np.clip(np.asarray(reference, dtype=np.float32), 0.0, 1.0)
-    if recon.ndim < 2 or base_reference.ndim < 2:
-        raise ValueError("Expected images with at least two dimensions")
-
-    sample_rate = max(int(suggest_sample_rate(recon)), 8_000)
-    segments, marker_duration = suggest_transmission_profile(recon)
-    segments = max(int(segments), 1)
-    marker_duration = max(float(marker_duration), 0.01)
-
-    attempt = 0
-    while attempt < max_attempts:
-        attempt += 1
-        try:
-            waveform = encode_image_to_waveform(
-                recon,
-                sample_rate=sample_rate,
-                segments=segments,
-                marker_duration=marker_duration,
-            )
-            if waveform.size == 0:
-                raise ValueError("Waveform generation returned no samples")
-            sound_image = decode_waveform_to_image(
-                waveform,
-                sample_rate=sample_rate,
-                resolution=recon.shape[:2],
-                segments=segments,
-                marker_duration=marker_duration,
-            )
-            sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
-
-            sound_vs_ai = compute_metrics(recon, sound_clipped)
-            _, sound_overlap = multiplicative_overlap(recon, sound_clipped)
-
-            sound_vs_reference = compute_metrics(base_reference, sound_clipped)
-            _, sound_reference_overlap = multiplicative_overlap(
-                base_reference, sound_clipped
-            )
-
-            payload = {
-                "sound_metrics": sound_vs_ai,
-                "sound_overlap": float(sound_overlap),
-                "sound_reference_metrics": sound_vs_reference,
-                "sound_reference_overlap": float(sound_reference_overlap),
-                "sample_rate": int(sample_rate),
-                "segments": int(segments),
-                "marker_duration": float(marker_duration),
-            }
-            return sound_clipped, payload
-        except (MemoryError, ValueError) as exc:
-            logger.warning(
-                "Sound reconstruction attempt %d failed with %s; reducing parameters",
-                attempt,
-                exc.__class__.__name__,
-                exc_info=True,
-            )
-            sample_rate = max(8_000, int(sample_rate * 0.75))
-            segments = max(1, int(math.ceil(segments * 0.75)))
-            marker_duration = max(0.01, marker_duration * 0.85)
-            continue
-        except Exception:  # pragma: no cover - defensive logging path
-            logger.debug("Failed to derive sound reconstruction", exc_info=True)
-            break
-
-    return None, {}
-
-
 def _download_bytes(
     url: str,
     *,
@@ -926,12 +851,46 @@ class UmbraDesktopApp:
 
             best = generation.best_candidate
             reconstruction = np.asarray(best.reconstruction, dtype=np.float32)
-            reference_image = (
-                self.reference_image if self.reference_image is not None else reconstruction
-            )
-            sound_image, sound_payload = _compute_sound_payload(
-                reconstruction, reference_image
-            )
+            sound_payload: dict[str, Any] = {}
+            sound_image: np.ndarray | None = None
+            try:
+                sample_rate = suggest_sample_rate(reconstruction)
+                segments, marker_duration = suggest_transmission_profile(reconstruction)
+                waveform = encode_image_to_waveform(
+                    reconstruction,
+                    sample_rate=sample_rate,
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                sound_image = decode_waveform_to_image(
+                    waveform,
+                    sample_rate=sample_rate,
+                    resolution=reconstruction.shape[:2],
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                base_reference = (
+                    self.reference_image if self.reference_image is not None else reconstruction
+                )
+                ref_image = np.asarray(base_reference, dtype=np.float32)
+                ref_image = np.clip(ref_image, 0.0, 1.0)
+                recon_clipped = np.clip(reconstruction, 0.0, 1.0)
+                sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
+                sound_vs_ai = compute_metrics(recon_clipped, sound_clipped)
+                _, sound_overlap = multiplicative_overlap(recon_clipped, sound_clipped)
+                sound_vs_reference = compute_metrics(ref_image, sound_clipped)
+                _, sound_reference_overlap = multiplicative_overlap(ref_image, sound_clipped)
+                sound_payload = {
+                    "sound_metrics": sound_vs_ai,
+                    "sound_overlap": float(sound_overlap),
+                    "sound_reference_metrics": sound_vs_reference,
+                    "sound_reference_overlap": float(sound_reference_overlap),
+                    "sample_rate": int(sample_rate),
+                    "segments": int(segments),
+                    "marker_duration": float(marker_duration),
+                }
+            except Exception as exc:  # pragma: no cover - audio pipeline fallback
+                logger.debug("Failed to derive sound reconstruction: %s", exc)
 
             entry = self.state.record_generation(
                 generation.index,
@@ -1205,6 +1164,7 @@ class UmbraDesktopApp:
                 "Demo builder",
                 f"A demo executable has been written to:\n{destination}",
             )
+            return
 
     # ------------------------------------------------------------------ Rendering helpers
     def _update_reference_preview(self) -> None:
@@ -1422,6 +1382,15 @@ def main() -> None:
     UmbraDesktopApp(root)
     root.mainloop()
 
+__all__ = [
+    "UmbraDesktopApp",
+    "UmbraAppState",
+    "fetch_pinterest_inspiration",
+    "_compute_composite_score",
+    "_compute_readability_score",
+    "_normalize_pinterest_url",
+    "main",
+]
 
 __all__ = [
     "UmbraDesktopApp",

@@ -1,11 +1,8 @@
-import numpy as np
-
 from umbra.metrics import ReconstructionMetrics
 from umbra.ui import (
     UmbraAppState,
     _compute_composite_score,
     _compute_readability_score,
-    _compute_sound_payload,
     _normalize_pinterest_url,
 )
 
@@ -74,37 +71,3 @@ def test_normalize_pinterest_url_strips_tracking() -> None:
     messy = "https://i.pinimg.com/originals/d5/3b/01/d53b014d86a6b6761bf649a0ed813c2b.png?foo=1#fragment"
     clean = _normalize_pinterest_url(messy)
     assert clean == "https://i.pinimg.com/originals/d5/3b/01/d53b014d86a6b6761bf649a0ed813c2b.png"
-
-
-def test_compute_sound_payload_retries_with_reduced_parameters(monkeypatch) -> None:
-    recon = np.ones((4, 4, 3), dtype=np.float32)
-    reference = recon.copy()
-
-    call_count = {"encode": 0}
-
-    monkeypatch.setattr("umbra.ui.suggest_sample_rate", lambda _img: 12_000)
-    monkeypatch.setattr("umbra.ui.suggest_transmission_profile", lambda _img: (4, 0.05))
-
-    def _failing_encode(*args, **kwargs):
-        call_count["encode"] += 1
-        if call_count["encode"] == 1:
-            raise MemoryError("boom")
-        return np.ones(1_000, dtype=np.float32)
-
-    monkeypatch.setattr("umbra.ui.encode_image_to_waveform", _failing_encode)
-    monkeypatch.setattr(
-        "umbra.ui.decode_waveform_to_image",
-        lambda *_args, **_kwargs: np.full((4, 4, 3), 0.5, dtype=np.float32),
-    )
-
-    fake_metrics = ReconstructionMetrics(psnr=30.0, ssim=0.5)
-    monkeypatch.setattr("umbra.ui.compute_metrics", lambda *_args, **_kwargs: fake_metrics)
-    monkeypatch.setattr(
-        "umbra.ui.multiplicative_overlap", lambda *_args, **_kwargs: (None, 55.0)
-    )
-
-    image, payload = _compute_sound_payload(recon, reference, max_attempts=3)
-
-    assert image is not None
-    assert payload["sound_overlap"] == 55.0
-    assert call_count["encode"] == 2
