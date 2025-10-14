@@ -5,9 +5,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+try:  # pragma: no cover - optional GPU acceleration
+    import cupy as cp  # type: ignore
+except Exception:  # pragma: no cover - GPU optional dependency
+    cp = None
 
 if TYPE_CHECKING:
     from .decoding import NoiseStreamDecoder
@@ -32,8 +37,8 @@ def suggest_sample_rate(image: np.ndarray) -> int:
     height = int(max(array.shape[0], 1))
     width = int(max(array.shape[1], 1))
     area = max(height * width, 1)
-    rate = int(16_000 + 28.0 * np.sqrt(float(area)))
-    return int(np.clip(rate, 16_000, 44_100))
+    rate = int(round(16_000 + 28.0 * np.sqrt(float(area))))
+    return max(rate, 16_000)
 
 
 def suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
@@ -43,8 +48,8 @@ def suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
     if array.ndim < 2:
         raise ValueError("image must have at least two dimensions for transmission profile")
     height = int(max(array.shape[0], 1))
-    segments = int(np.clip(np.ceil(height / 96.0), 1, 48))
-    marker_duration = float(np.clip(0.035 + 0.002 * segments, 0.04, 0.18))
+    segments = max(1, int(np.ceil(height / 96.0)))
+    marker_duration = float(max(0.01, 0.03 + 0.0015 * segments))
     return segments, marker_duration
 
 
@@ -296,6 +301,22 @@ def tiled_reconstruction(
     return assembled
 
 
+def _as_backend(array: Any, xp: Any) -> Any:
+    """Return ``array`` as an ``xp`` ndarray with float32 dtype."""
+
+    if xp is cp:
+        return cp.asarray(array, dtype=cp.float32)
+    return np.asarray(array, dtype=np.float32)
+
+
+def _to_numpy(array: Any) -> np.ndarray:
+    """Convert ``array`` to a NumPy float32 array."""
+
+    if cp is not None and isinstance(array, cp.ndarray):  # pragma: no cover - runtime guard
+        return cp.asnumpy(array.astype(cp.float32, copy=False))
+    return np.asarray(array, dtype=np.float32)
+
+
 def _encode_stripe_waveform(
     stripe: np.ndarray,
     *,
@@ -306,28 +327,30 @@ def _encode_stripe_waveform(
     if sample_count <= 0:
         return np.zeros(0, dtype=np.float32)
 
-    weights = np.array([0.5, 0.35, 0.15], dtype=np.float32)
-    intensities = np.asarray(stripe, dtype=np.float32)[..., :3] @ weights
+    xp = cp if cp is not None else np
+
+    weights = _as_backend([0.5, 0.35, 0.15], xp)
+    intensities = _as_backend(stripe, xp)[..., :3] @ weights
     intensities = intensities.reshape(-1)
     if intensities.size == 0:
         return np.zeros(sample_count, dtype=np.float32)
 
-    intensities -= float(intensities.min())
-    max_val = float(intensities.max())
+    intensities -= intensities.min()
+    max_val = float(xp.max(intensities))
     if max_val > 0:
         intensities /= max_val
 
     bins = sample_count // 2 + 1
-    xp = np.linspace(0, max(intensities.size - 1, 0), bins)
-    source_idx = np.arange(intensities.size, dtype=np.float32)
-    spectrum = np.interp(xp, source_idx if source_idx.size else np.array([0.0]), intensities)
-    waveform = np.fft.irfft(spectrum, n=sample_count)
+    xp_lin = xp.linspace(0.0, max(float(intensities.size - 1), 0.0), bins, dtype=xp.float32)
+    xp_idx = xp.arange(intensities.size, dtype=xp.float32)
+    spectrum = xp.interp(xp_lin, xp_idx, intensities)
+    waveform = xp.fft.irfft(spectrum, n=sample_count)
     if waveform.size < sample_count:
-        waveform = np.pad(waveform, (0, sample_count - waveform.size))
-    peak = float(np.max(np.abs(waveform)))
+        waveform = xp.pad(waveform, (0, sample_count - waveform.size))
+    peak = float(xp.max(xp.abs(waveform)))
     if peak > 0:
         waveform /= peak
-    return waveform.astype(np.float32)
+    return _to_numpy(waveform)
 
 
 def _marker_tone(
@@ -374,8 +397,7 @@ def image_to_waveform(
 
     safe_segments = max(1, int(segments))
     marker_seconds = float(max(0.0, marker_duration))
-    marker_samples = int(round(marker_seconds * sample_rate))
-    marker_samples = min(marker_samples, sample_rate * 4)
+    marker_samples = max(int(round(marker_seconds * sample_rate)), 0)
     payload_samples = max(sample_rate, 1)
     segment_length = marker_samples + payload_samples
 
@@ -392,28 +414,11 @@ def image_to_waveform(
             safe_segments = max_segments
 
     if safe_segments == 1:
-        weights = np.array([0.5, 0.35, 0.15], dtype=np.float32)
-        intensities = array[..., :3] @ weights
-        intensities = intensities.reshape(-1)
-        if intensities.size == 0:
+        waveform = _encode_stripe_waveform(array, sample_count=sample_rate)
+        if waveform.size == 0:
             raise ValueError("Image contains no pixels")
-
-        intensities -= float(intensities.min())
-        max_val = float(intensities.max())
-        if max_val > 0:
-            intensities /= max_val
-
-        num_bins = sample_rate // 2 + 1
-        xp = np.linspace(0, intensities.size - 1, num_bins)
-        spectrum = np.interp(xp, np.arange(intensities.size), intensities)
-        waveform = np.fft.irfft(spectrum, n=sample_rate)
-        peak = float(np.max(np.abs(waveform)))
-        if peak > 0:
-            waveform /= peak
-
-        waveform = waveform.astype(np.float32)
         logger.debug("Encoded image to waveform with %d samples", waveform.size)
-        return waveform
+        return waveform.astype(np.float32, copy=False)
 
     rows = array.shape[0]
     stripe_height = int(np.ceil(rows / safe_segments))
@@ -484,8 +489,7 @@ def reconstruct_from_waveform(
 
     safe_segments = max(1, int(segments))
     marker_seconds = float(max(0.0, marker_duration))
-    marker_samples = int(round(marker_seconds * sample_rate))
-    marker_samples = min(marker_samples, sample_rate * 4)
+    marker_samples = max(int(round(marker_seconds * sample_rate)), 0)
     payload_samples = max(sample_rate, 1)
     segment_length = marker_samples + payload_samples
 

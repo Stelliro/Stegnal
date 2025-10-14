@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import ctypes
 import html
 import json
 import logging
 import math
+import os
 import queue
 import random
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -35,6 +38,11 @@ except Exception as exc:  # pragma: no cover - import is deferred until runtime
     _IMPORT_ERROR = exc
 else:
     _IMPORT_ERROR = None
+
+try:  # pragma: no cover - optional dependency for memory accounting
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
 
 from .codec import decode_waveform_to_image, encode_image_to_waveform
 from .decoding import NoiseStreamDecoder
@@ -73,6 +81,122 @@ _PINTEREST_JSON_SCRIPT_PATTERN = re.compile(
 
 class PinterestDownloadError(RuntimeError):
     """Raised when a Pinterest download fails."""
+
+
+def _process_memory_usage() -> tuple[int, int] | None:
+    """Return the process RSS and total system memory in bytes when available."""
+
+    try:
+        if psutil is not None:
+            process = psutil.Process(os.getpid())
+            rss = int(process.memory_info().rss)
+            total = int(psutil.virtual_memory().total)
+            if total > 0:
+                return rss, total
+    except Exception:
+        logger.debug("psutil memory query failed", exc_info=True)
+
+    if sys.platform.startswith("win"):
+        try:
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):  # pragma: no cover - platform specific
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            class MEMORYSTATUSEX(ctypes.Structure):  # pragma: no cover - platform specific
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                handle,
+                ctypes.byref(counters),
+                counters.cb,
+            ):
+                rss = int(counters.WorkingSetSize)
+            else:
+                rss = 0
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                total = int(status.ullTotalPhys)
+            else:
+                total = 0
+            if rss > 0 and total > 0:
+                return rss, total
+        except Exception:
+            logger.debug("Windows memory query failed", exc_info=True)
+        return None
+
+    try:
+        with open("/proc/self/statm", encoding="utf8") as handle:
+            parts = handle.readline().split()
+            if len(parts) >= 2:
+                rss_pages = int(parts[1])
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                rss = int(rss_pages * page_size)
+                total = int(os.sysconf("SC_PHYS_PAGES") * page_size)
+                if rss >= 0 and total > 0:
+                    return rss, total
+    except Exception:
+        logger.debug("/proc memory query failed", exc_info=True)
+
+    try:
+        import resource  # type: ignore
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss = int(usage.ru_maxrss)
+        if rss > 0:
+            if sys.platform == "darwin":
+                rss_bytes = rss
+            else:
+                rss_bytes = rss * 1024
+            total = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+            if total > 0:
+                return int(rss_bytes), total
+    except Exception:
+        logger.debug("resource memory query failed", exc_info=True)
+
+    return None
+
+
+def _memory_relief_delay(threshold: float = 0.92) -> tuple[float, float]:
+    """Return a back-off delay (seconds) and utilisation ratio if memory is tight."""
+
+    stats = _process_memory_usage()
+    if not stats:
+        return 0.0, 0.0
+    rss, total = stats
+    if total <= 0:
+        return 0.0, 0.0
+    ratio = rss / float(total)
+    if ratio < threshold:
+        return 0.0, ratio
+    overshoot = ratio - threshold
+    delay = 0.05 + overshoot * 2.0
+    delay = max(0.02, min(delay, 0.75))
+    return delay, ratio
 
 
 @dataclass
@@ -396,7 +520,6 @@ class UmbraDesktopApp:
         self._worker: threading.Thread | None = None
         self._running = False
         self._last_refresh = 0.0
-        self._generation_delay = 0.25
         self._latest_sound_payload: dict[str, Any] | None = None
         self._latest_generation_entry: dict[str, float] | None = None
 
@@ -424,6 +547,20 @@ class UmbraDesktopApp:
                 self.root.attributes("-zoomed", True)
             except Exception:
                 self.root.attributes("-fullscreen", False)
+
+    def _maybe_pause_for_memory(self) -> None:
+        """Sleep briefly when system memory is under pressure."""
+
+        delay, ratio = _memory_relief_delay()
+        if delay > 0.0:
+            logger.debug(
+                "Memory pressure %.1f%% detected; pausing worker for %.3f s",
+                ratio * 100.0,
+                delay,
+            )
+            time.sleep(delay)
+        else:
+            time.sleep(0.0)
 
     def _build_layout(self) -> None:
         control_frame = tk.Frame(self.root, bg="#101010")
@@ -632,7 +769,7 @@ class UmbraDesktopApp:
 
             if not generation.candidates:
                 self._queue.put(("status", "No candidates evaluated this generation."))
-                time.sleep(self._generation_delay)
+                self._maybe_pause_for_memory()
                 continue
 
             best = generation.best_candidate
@@ -706,7 +843,7 @@ class UmbraDesktopApp:
                     self._queue.put(("refresh_pinterest", None, None))
                     self._last_refresh = time.time()
 
-            time.sleep(self._generation_delay)
+            self._maybe_pause_for_memory()
 
         self._worker = None
 
