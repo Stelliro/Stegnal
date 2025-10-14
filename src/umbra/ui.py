@@ -221,10 +221,26 @@ def _load_uploaded_image(file) -> np.ndarray:
         raise ValueError(f"Unable to read image: {exc}") from exc
 
 
-def _download_bytes(url: str, *, timeout: float = 10.0) -> bytes:
+def _download_bytes(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    referer: str | None = None,
+) -> bytes:
     """Download ``url`` returning the raw bytes."""
 
-    request = urllib.request.Request(url, headers={"User-Agent": _PINTEREST_USER_AGENT})
+    headers = {
+        "User-Agent": _PINTEREST_USER_AGENT,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read()
@@ -372,7 +388,14 @@ def _fetch_random_pinterest_image(
 
     image_url, title = random.choice(candidates)
     try:
-        image_bytes = downloader(image_url, timeout)
+        if download is None:
+            image_bytes = _download_bytes(
+                image_url,
+                timeout=timeout,
+                referer=feed_url if feed_url.startswith("http") else "https://www.pinterest.com/",
+            )
+        else:
+            image_bytes = downloader(image_url, timeout)
     except RuntimeError as exc:
         raise RuntimeError(f"Failed to download Pinterest image: {exc}") from exc
 
