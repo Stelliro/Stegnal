@@ -95,6 +95,10 @@ class UmbraAppState:
         """Store metrics for a completed generation and return the entry."""
 
         ai_score = _compute_composite_score(overlap, metrics.psnr, metrics.ssim)
+        # Default to a zero composite score so generations without a successful
+        # sound reconstruction never receive credit from the sound-first
+        # scoreboard.
+        composite_score = 0.0
         entry = {
             "generation": float(generation_index),
             "overlap": float(overlap),
@@ -118,8 +122,6 @@ class UmbraAppState:
             )
             self.sound_scores.append(float(sound_score))
             composite_score = float(sound_score)
-        else:
-            composite_score = float(ai_score)
         if sound_reference_metrics is not None and sound_reference_overlap is not None:
             entry.update(
                 {
@@ -777,7 +779,7 @@ class UmbraDesktopApp:
                     )
                 elif composite_score is not None:
                     self._primary_score_var.set(
-                        f"Composite score: {composite_score:.2f} (AI fallback)"
+                        f"Sound↔AI composite score: {composite_score:.2f} (sound reconstruction unavailable)"
                     )
                 else:
                     self._primary_score_var.set("Sound↔AI composite score: –")
