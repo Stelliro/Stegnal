@@ -341,12 +341,13 @@ def image_to_waveform(
         raise ValueError("Expected an RGB image for conversion to waveform")
 
     safe_segments = max(1, int(segments))
-    marker_fraction = float(np.clip(marker_duration, 0.0, 0.5))
-    marker_samples = int(round(marker_fraction * sample_rate))
-    marker_samples = min(marker_samples, sample_rate // 2)
-    payload_samples = sample_rate - marker_samples
+    marker_seconds = float(max(0.0, marker_duration))
+    marker_samples = int(round(marker_seconds * sample_rate))
+    marker_samples = min(marker_samples, sample_rate * 4)
+    payload_samples = max(sample_rate, 1)
+    segment_length = marker_samples + payload_samples
 
-    if safe_segments == 1 or payload_samples <= 0:
+    if safe_segments == 1:
         weights = np.array([0.5, 0.35, 0.15], dtype=np.float32)
         intensities = array[..., :3] @ weights
         intensities = intensities.reshape(-1)
@@ -389,10 +390,10 @@ def image_to_waveform(
         segment_wave = np.concatenate(
             [marker.astype(np.float32), stripe_wave.astype(np.float32)]
         )
-        if segment_wave.size < sample_rate:
-            segment_wave = np.pad(segment_wave, (0, sample_rate - segment_wave.size))
-        elif segment_wave.size > sample_rate:
-            segment_wave = segment_wave[:sample_rate]
+        if segment_wave.size < segment_length:
+            segment_wave = np.pad(segment_wave, (0, segment_length - segment_wave.size))
+        elif segment_wave.size > segment_length:
+            segment_wave = segment_wave[:segment_length]
         segments_wave.append(segment_wave.astype(np.float32))
 
     waveform = np.concatenate(segments_wave).astype(np.float32)
@@ -426,12 +427,13 @@ def reconstruct_from_waveform(
         raise ValueError("Waveform must contain samples")
 
     safe_segments = max(1, int(segments))
-    marker_fraction = float(np.clip(marker_duration, 0.0, 0.5))
-    marker_samples = int(round(marker_fraction * sample_rate))
-    marker_samples = min(marker_samples, sample_rate // 2)
-    payload_samples = sample_rate - marker_samples
+    marker_seconds = float(max(0.0, marker_duration))
+    marker_samples = int(round(marker_seconds * sample_rate))
+    marker_samples = min(marker_samples, sample_rate * 4)
+    payload_samples = max(sample_rate, 1)
+    segment_length = marker_samples + payload_samples
 
-    if safe_segments == 1 or payload_samples <= 0:
+    if safe_segments == 1:
         usable = wave
         if usable.size < sample_rate:
             usable = np.pad(usable, (0, sample_rate - usable.size))
@@ -441,7 +443,6 @@ def reconstruct_from_waveform(
         if spectrum.size == 0:
             raise ValueError("Unable to derive spectrum from waveform")
     else:
-        segment_length = sample_rate
         available_segments = max(1, wave.size // segment_length)
         available_segments = min(available_segments, safe_segments)
         if available_segments <= 0:
@@ -454,15 +455,12 @@ def reconstruct_from_waveform(
             segment_wave = wave[start:end]
             if segment_wave.size < segment_length:
                 segment_wave = np.pad(segment_wave, (0, segment_length - segment_wave.size))
-            payload = segment_wave[marker_samples:]
-            if payload_samples > 0:
-                if payload.size < payload_samples:
-                    payload = np.pad(payload, (0, payload_samples - payload.size))
-                else:
-                    payload = payload[:payload_samples]
-                spectrum = np.abs(np.fft.rfft(payload, n=payload_samples))
+            payload = segment_wave[marker_samples : marker_samples + payload_samples]
+            if payload.size < payload_samples:
+                payload = np.pad(payload, (0, payload_samples - payload.size))
             else:
-                spectrum = np.abs(np.fft.rfft(segment_wave, n=segment_length))
+                payload = payload[:payload_samples]
+            spectrum = np.abs(np.fft.rfft(payload, n=payload_samples))
             stripes.append(spectrum.astype(np.float32))
 
         total_pixels = rows * cols

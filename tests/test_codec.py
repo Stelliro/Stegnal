@@ -55,7 +55,9 @@ def test_segmented_waveform_round_trip() -> None:
         marker_duration=marker,
     )
     assert waveform.ndim == 1
-    assert waveform.size == sample_rate * segments
+    marker_samples = int(round(marker * sample_rate))
+    expected_segment = sample_rate + marker_samples
+    assert waveform.size == expected_segment * segments
 
     decoded = decode_wav_bytes_to_image(
         encode_image_to_wav_bytes(

@@ -8,8 +8,10 @@ import html
 import json
 import logging
 import math
+import os
 import random
 import re
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -116,7 +118,22 @@ _DARK_STYLE = """
 download_cache: dict[str, dict[str, Any]] = {}
 
 
+def _entropy_seed(salt: int | None = None) -> int:
+    """Return a high-entropy 31-bit seed mixed with process and time entropy."""
+
+    base = secrets.randbits(62) ^ int(time.time_ns())
+    try:
+        base ^= os.getpid()
+    except Exception:  # pragma: no cover - platform specific safeguard
+        pass
+    if salt is not None:
+        base ^= int(salt)
+    base &= 0x7FFFFFFF
+    return base or 1
+
+
 _PINTEREST_DEFAULT_FEEDS: tuple[str, ...] = (
+    "https://www.pinterest.com/ideas/pictures-of-the-universe/935563701058/",
     "https://au.pinterest.com/search/pins/?q=space&rs=typed",
     "https://www.pinterest.com/pinterest/official-news.rss",
     "https://www.pinterest.com/pinterest/engagement.rss",
@@ -249,17 +266,10 @@ def _download_bytes(
 
 
 def _normalize_pinterest_source(source: str | None) -> str:
-    """Return a usable Pinterest RSS feed URL from ``source``."""
+    """Return the default Pinterest inspiration feed, ignoring custom input."""
 
-    if source:
-        trimmed = source.strip()
-        if trimmed:
-            parsed = urllib.parse.urlparse(trimmed)
-            if parsed.scheme and parsed.netloc:
-                return trimmed
-            path = trimmed.strip("/ ")
-            if path:
-                return f"https://www.pinterest.com/{path}.rss"
+    if source and source.strip():
+        logger.debug("Ignoring custom Pinterest source '%s' in favour of default feed", source)
     return _PINTEREST_DEFAULT_FEEDS[0]
 
 
@@ -349,8 +359,14 @@ def _parse_pinterest_html(text: str) -> list[tuple[str, str]]:
 
 
 def _normalize_pinterest_url(url: str) -> str:
-    cleaned = html.unescape(url)
-    return cleaned.replace("\\u002F", "/").replace("\\/", "/")
+    cleaned = html.unescape(url or "")
+    match = re.search(r"https://i\.pinimg\.com/[^\s\"'>)]+", cleaned, flags=re.IGNORECASE)
+    if match:
+        cleaned = match.group(0)
+    cleaned = cleaned.replace("\\u002F", "/").replace("\\/", "/")
+    cleaned = cleaned.split(")}")[0]
+    cleaned = cleaned.strip("'\"}) ;")
+    return cleaned
 
 
 def _collect_pinterest_nodes(payload: object) -> list[Mapping[str, object]]:
@@ -421,9 +437,8 @@ def _auto_refresh_pinterest_reference(
     if active_source != "pinterest" and reference_source != "pinterest":
         return False
 
-    board_input = state.get("quick_start_pinterest_source") or None
     try:
-        image, label = _fetch_random_pinterest_image(board_input, timeout=timeout)
+        image, label = _fetch_random_pinterest_image(None, timeout=timeout)
     except RuntimeError as exc:
         logger.warning("Pinterest auto-refresh failed: %s", exc)
         return False
@@ -609,8 +624,8 @@ def _next_sound_budget_rng(state: st.session_state) -> np.random.Generator:
 
     seed = int(state.get("_sound_score_seed", 0))
     if seed <= 0:
-        seed = int(np.random.default_rng().integers(1, np.iinfo(np.int32).max))
-    rng = np.random.default_rng(seed)
+        seed = _entropy_seed()
+    rng = np.random.default_rng(seed ^ _entropy_seed())
     state["_sound_score_seed"] = int(rng.integers(1, np.iinfo(np.int32).max))
     return rng
 
@@ -622,9 +637,99 @@ def _sound_transmission_profile(state: st.session_state) -> tuple[int, float]:
     if sections < 1:
         sections = 1
     marker = float(state.get("sound_marker_duration", 0.05))
-    marker = float(np.clip(marker, 0.0, 0.25))
+    marker = float(max(0.0, marker))
     return sections, marker
 
+
+def _ensure_transmission_genes(state: MutableMapping[str, Any]) -> None:
+    """Seed transmission gene defaults when they are missing or invalid."""
+
+    try:
+        sections = int(state.get("sound_section_count", 0))
+    except (TypeError, ValueError):
+        sections = 0
+    if sections <= 0:
+        state["sound_section_count"] = 4
+
+    marker_value = state.get("sound_marker_duration", 0.05)
+    try:
+        marker = float(marker_value)
+    except (TypeError, ValueError):
+        marker = 0.05
+    if not math.isfinite(marker) or marker < 0.0:
+        marker = 0.05
+    state["sound_marker_duration"] = float(marker)
+    state.setdefault("_transmission_logistic", random.random())
+
+
+def _transmission_mutation_rng(
+    state: MutableMapping[str, Any], *, salt: int = 0
+) -> np.random.Generator:
+    """Return a reproducible RNG dedicated to transmission gene mutations."""
+
+    base_seed = int(state.get("_transmission_seed", 0))
+    entropy = _entropy_seed(salt ^ base_seed)
+    if base_seed <= 0:
+        base_seed = entropy
+    rng = np.random.default_rng(base_seed ^ entropy)
+    state["_transmission_seed"] = int(rng.integers(1, np.iinfo(np.int32).max))
+    return rng
+
+
+def _mutate_transmission_genes(
+    state: MutableMapping[str, Any],
+    *,
+    generation: GenerationRecord | None,
+    boost: int = 0,
+) -> None:
+    """Evolve fax-style transmission parameters using chaotic gene mutations."""
+
+    _ensure_transmission_genes(state)
+
+    generation_index = int(getattr(generation, "index", 0) if generation is not None else 0)
+    boost = max(0, int(boost))
+    rng = _transmission_mutation_rng(state, salt=generation_index + (boost << 12))
+
+    logistic = float(state.get("_transmission_logistic", rng.random()))
+    logistic = (3.99 * logistic * (1.0 - logistic)) % 1.0 or rng.random()
+    state["_transmission_logistic"] = logistic
+
+    sections = max(1, int(state.get("sound_section_count", 1)))
+    marker = max(0.0, float(state.get("sound_marker_duration", 0.05)))
+
+    improvement = float(getattr(generation, "improvement", 0.0) or 0.0)
+    reward_peak = float(getattr(generation, "reward_peak", 0.0) or 0.0)
+    exploration = 1 + boost
+
+    leap = max(1, int(np.ceil(logistic * (exploration * 4 + 2))))
+    if improvement <= 0.0 or rng.random() < 0.45:
+        sections += leap
+    else:
+        sections = max(1, sections - max(1, leap // 2))
+
+    if rng.random() < 0.12 + exploration * 0.01:
+        primes = np.array(
+            [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61],
+            dtype=np.int64,
+        )
+        sections = int(primes[rng.integers(0, primes.size)])
+
+    if rng.random() < 0.08 and reward_peak > 0.5:
+        sections = max(1, int(sections * (1.0 + logistic * exploration)))
+
+    sections = int(min(sections, 256))
+
+    drift = (logistic - 0.5) * (0.12 + 0.03 * exploration)
+    marker += drift
+    marker += rng.normal(0.0, 0.02 * exploration)
+    if rng.random() < 0.15:
+        marker *= 1.0 + (rng.random() - 0.5) * (1.5 + 0.3 * exploration)
+
+    marker = float(max(0.0, marker))
+    marker = float(min(marker, 3.0))
+
+    state["sound_section_count"] = sections
+    state["sound_marker_duration"] = marker
 
 def _compute_sound_score_target(
     auto_settings: Mapping[str, Any],
@@ -791,8 +896,7 @@ def _render_quick_start_wizard(
     target_container = container or st.container()
     easy_mode = bool(state.get("easy_mode", True))
     state.setdefault("quick_start_infinite_preference", False)
-    state.setdefault("sound_section_count", 1)
-    state.setdefault("sound_marker_duration", 0.05)
+    _ensure_transmission_genes(state)
 
     easy_mode = target_container.toggle(
         "Easy mode",
@@ -867,22 +971,13 @@ def _render_quick_start_wizard(
         else:
             state.pop("quick_start_reference_source", None)
     elif source_choice == "pinterest":
-        pinterest_hint = state.get("quick_start_pinterest_source", "")
-        board_input = upload_col.text_input(
-            "Pinterest board or RSS feed",
-            value=pinterest_hint,
-            help=(
-                "Enter a board path such as 'umbresearch/inspirations' or paste a Pinterest RSS "
-                "URL. Leave blank to use Umbra's curated feeds."
-            ),
-            key="quick_start_pinterest_board",
-        )
-        state["quick_start_pinterest_source"] = board_input
-
+        state.pop("quick_start_pinterest_source", None)
         fetch_button = upload_col.button(
-            "Fetch Pinterest inspiration",
+            "Refresh space inspiration",
             key="quick_start_pinterest_fetch",
-            help="Download a random Pinterest image using the selected feed.",
+            help=(
+                "Download a random cosmic reference from Pinterest's universe ideas board."
+            ),
         )
 
         needs_fetch = (
@@ -892,7 +987,7 @@ def _render_quick_start_wizard(
         )
         if needs_fetch:
             try:
-                image, label = _fetch_random_pinterest_image(board_input or None)
+                image, label = _fetch_random_pinterest_image(None)
             except RuntimeError as exc:
                 logger.warning("Pinterest fetch failed: %s", exc)
                 upload_col.error(str(exc))
@@ -908,59 +1003,24 @@ def _render_quick_start_wizard(
                 step_status["upload"] = True
         elif state.get("quick_start_reference_source") == "pinterest":
             step_status["upload"] = True
-        upload_col.caption(
-            "Pinterest images refresh automatically when targets are met or when you press "
-            "the fetch button."
-        )
     else:
         state.pop("quick_start_reference_image", None)
         state.pop("quick_start_reference_label", None)
         state.pop("quick_start_reference_source", None)
         step_status["upload"] = True
 
-    fax_enabled_default = bool(state.get("sound_section_count", 1) > 1)
-    fax_enabled = upload_col.toggle(
-        "Fax-style sound encoding",
-        value=fax_enabled_default,
-        help=(
-            "Add segment markers and transmit the reference image in multiple audio "
-            "blocks for higher-fidelity reconstructions."
-        ),
-        key="quick_start_fax_enabled",
-    )
-
-    if fax_enabled:
-        sections_default = int(state.get("sound_section_count", 4))
-        sections_default = max(2, min(12, sections_default))
-        sections = upload_col.slider(
-            "Transmission sections",
-            min_value=2,
-            max_value=12,
-            value=sections_default,
-            step=1,
-            key="quick_start_fax_sections",
+    # Transmission genes are mutated automatically; surface the current values only.
+    sections, marker = _sound_transmission_profile(state)
+    if sections <= 1:
+        upload_col.caption(
+            "Umbra is mutating its transmission genes. Audio faxing is currently disabled, "
+            "but the system may re-enable segmented blocks as evolution demands more detail."
         )
-        marker_default = float(
-            _quantize_slider_value(
-                float(state.get("sound_marker_duration", 0.05)),
-                min_value=0.0,
-                max_value=0.25,
-                step=0.01,
-            )
-        )
-        marker_duration = upload_col.slider(
-            "Marker duration (s)",
-            min_value=0.0,
-            max_value=0.25,
-            value=marker_default,
-            step=0.01,
-            key="quick_start_marker_duration",
-            help="Length of the audible tone separating each transmission block.",
-        )
-        state["sound_section_count"] = int(sections)
-        state["sound_marker_duration"] = float(marker_duration)
     else:
-        state["sound_section_count"] = 1
+        upload_col.caption(
+            "Umbra is steering its own fax-style parameters: "
+            f"{sections} section(s) with {marker:.3f} s markers."
+        )
 
     mode_col.markdown(
         ("✅" if step_status["mode"] else "②") + " **Step 2** · Pick your pace"
@@ -1862,7 +1922,7 @@ def _attempt_autoload(autosave_dir: Path) -> None:
 
     previous_scene = state.get("adaptive_scene")
     scene = dict(previous_scene) if isinstance(previous_scene, dict) else {}
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(_entropy_seed(int(state.get("sound_reseed_count", 0))))
     scene.setdefault("sound_seed", int(rng.integers(0, np.iinfo(np.int32).max)))
     scene.setdefault("sample_rate", 48_000)
     resolution = int(manager.original.shape[0]) if manager.original.ndim >= 2 else 192
@@ -2802,6 +2862,7 @@ def _refresh_sound_scene(
     else:
         state.setdefault("sound_reseed_count", 0)
 
+    _mutate_transmission_genes(state, generation=None, boost=0)
     _update_noise_bases(state, difficulty, improvement, volatility, max_overlap)
     return new_sound_seed, int(sample_rate), int(resolution)
 
@@ -3013,6 +3074,7 @@ def run() -> None:
     state.setdefault("pending_generations", 0)
     state.setdefault("run_infinite", False)
     state.setdefault("autosave_dir", str(DEFAULT_AUTOSAVE_DIR))
+    _ensure_transmission_genes(state)
     state.setdefault("last_autosave_dir", str(Path(state["autosave_dir"]).expanduser()))
     state.setdefault("autosave_checked", False)
     state.setdefault("population_size", 4)
@@ -4113,6 +4175,11 @@ def run() -> None:
                 reward_signal,
             )
             score_consumed += _generation_sound_score(generation)
+            _mutate_transmission_genes(
+                state,
+                generation=generation,
+                boost=int(getattr(manager, "mutation_boost", 0)),
+            )
             generations_ran += 1
             if finite_batch:
                 state["pending_generations"] = max(

@@ -204,15 +204,10 @@ def test_normalize_pinterest_source(monkeypatch) -> None:
     _install_ui_stubs(monkeypatch, {})
     ui = importlib.import_module("umbra.ui")
     try:
-        assert (
-            ui._normalize_pinterest_source("umbra/research")
-            == "https://www.pinterest.com/umbra/research.rss"
-        )
-        assert (
-            ui._normalize_pinterest_source("https://example.com/feed.rss")
-            == "https://example.com/feed.rss"
-        )
-        assert ui._normalize_pinterest_source("") in ui._PINTEREST_DEFAULT_FEEDS
+        default_feed = ui._PINTEREST_DEFAULT_FEEDS[0]
+        assert ui._normalize_pinterest_source("umbra/research") == default_feed
+        assert ui._normalize_pinterest_source("https://example.com/feed.rss") == default_feed
+        assert ui._normalize_pinterest_source("") == default_feed
     finally:
         sys.modules.pop("umbra.ui", None)
 
@@ -271,23 +266,20 @@ def test_fetch_random_pinterest_image_uses_downloader(monkeypatch) -> None:
             Image.new("RGB", (2, 2), color=(200, 10, 10)).save(buffer, format="PNG")
             png_bytes = buffer.getvalue()
 
-        feed_xml = """<?xml version='1.0' encoding='UTF-8'?>
-        <rss version='2.0' xmlns:media='http://search.yahoo.com/mrss/'>
-          <channel>
-            <item>
-              <title>Sample Pin</title>
-              <media:content url='https://i.pinimg.com/originals/sample.jpg' />
-            </item>
-          </channel>
-        </rss>
+        board_html = """
+        <html>
+          <body>
+            <img src="https://i.pinimg.com/originals/sample.jpg" alt="Sample Pin" />
+          </body>
+        </html>
         """
 
         requested: list[str] = []
 
         def fake_download(url: str, timeout: float) -> bytes:
             requested.append(url)
-            if url.endswith(".rss"):
-                return feed_xml.encode("utf-8")
+            if url == ui._PINTEREST_DEFAULT_FEEDS[0]:
+                return board_html.encode("utf-8")
             return png_bytes
 
         image, label = ui._fetch_random_pinterest_image(
@@ -298,7 +290,7 @@ def test_fetch_random_pinterest_image_uses_downloader(monkeypatch) -> None:
 
         assert image.shape == (2, 2, 3)
         assert label.endswith("(Pinterest)")
-        assert any(url.endswith(".rss") for url in requested)
+        assert ui._PINTEREST_DEFAULT_FEEDS[0] in requested
         assert any(url.endswith("sample.jpg") for url in requested)
     finally:
         sys.modules.pop("umbra.ui", None)
@@ -308,7 +300,6 @@ def test_auto_refresh_pinterest_reference_updates_state(monkeypatch) -> None:
     stub_state: dict[str, object] = {
         "quick_start_media_source": "pinterest",
         "quick_start_reference_source": "pinterest",
-        "quick_start_pinterest_source": "space/inspiration",
     }
 
     _install_ui_stubs(monkeypatch, stub_state)
@@ -326,6 +317,37 @@ def test_auto_refresh_pinterest_reference_updates_state(monkeypatch) -> None:
         assert stub_state["quick_start_reference_label"] == "Galaxy (Pinterest)"
         assert stub_state["quick_start_reference_source"] == "pinterest"
         assert isinstance(stub_state.get("_last_pinterest_refresh"), float)
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_mutate_transmission_genes_evolves_parameters(monkeypatch) -> None:
+    stub_state: dict[str, object] = {
+        "sound_section_count": 1,
+        "sound_marker_duration": 0.05,
+        "_transmission_logistic": 0.3,
+    }
+
+    _install_ui_stubs(monkeypatch, stub_state)
+    ui = importlib.import_module("umbra.ui")
+
+    try:
+        monkeypatch.setattr(ui, "_entropy_seed", lambda salt=None: 42)
+        monkeypatch.setattr(ui.random, "random", lambda: 0.25)
+
+        class DummyGen:
+            index = 3
+            improvement = -0.1
+            reward_peak = 1.2
+
+        ui._mutate_transmission_genes(
+            stub_state,
+            generation=DummyGen(),
+            boost=2,
+        )
+
+        assert stub_state["sound_section_count"] >= 1
+        assert stub_state["sound_marker_duration"] >= 0.0
     finally:
         sys.modules.pop("umbra.ui", None)
 
