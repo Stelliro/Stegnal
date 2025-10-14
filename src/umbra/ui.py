@@ -1164,6 +1164,7 @@ class UmbraDesktopApp:
                 "Demo builder",
                 f"A demo executable has been written to:\n{destination}",
             )
+            return
 
     # ------------------------------------------------------------------ Rendering helpers
     def _update_reference_preview(self) -> None:
@@ -1381,6 +1382,15 @@ def main() -> None:
     UmbraDesktopApp(root)
     root.mainloop()
 
+__all__ = [
+    "UmbraDesktopApp",
+    "UmbraAppState",
+    "fetch_pinterest_inspiration",
+    "_compute_composite_score",
+    "_compute_readability_score",
+    "_normalize_pinterest_url",
+    "main",
+]
 
 __all__ = [
     "UmbraDesktopApp",

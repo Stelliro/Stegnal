@@ -10,7 +10,7 @@ The implementation is intentionally lightweight and self-contained so that the t
 - **Correlation-based decoder** that reverses the permutation, applies a denoising filter, and clips the results into image space.
 - **Quality metrics** (PSNR and SSIM) that provide an approximate measure of reconstruction fidelity.
 - **Command-line interface** that provides `encode`, `decode`, `pipeline`, `evaluate`, and `ui` commands.
-- **Interactive visual explorer** that compares the original signal, encoded packet, reconstruction, and multiplicative overlap score side-by-side.
+- **Interactive desktop explorer** (Tkinter-based) that compares the original signal, encoded packet, reconstruction, and multiplicative overlap score side-by-side.
 - **Generational evolution playground** with configurable AI attempt counts, infinite/finite runs, and autosave/load support for overnight experiments.
 - **Automated test** verifying that the toy pipeline can recover a synthetic image with reasonable fidelity.
 
@@ -56,21 +56,13 @@ Evaluate two images:
 umbra evaluate --reference path/to/input.png --candidate recon.png
 ```
 
-Launch the visual explorer UI (uses [Streamlit](https://streamlit.io/)):
+Launch the desktop visual explorer (Tkinter):
 
 ```bash
-pip install -e .[ui]
-umbra ui --port 8501
+umbra ui
 ```
 
-The command spawns a local Streamlit server that renders the original image, the encoded noise packet, the decoder's reconstruction, and a multiplicative overlap map that highlights shared signal energy. Use the sidebar controls to adjust the encoder/decoder hyperparameters and experiment with either uploaded images or bundled grayscale samples.
-
-The visual explorer now includes an **evolution playground** that lets you:
-
-- Pick how many AI attempts run each generation and how many generations execute before stopping.
-- Toggle an infinite mode that keeps evolving until you hit **Stop evolution**.
-- Inspect every generation's reconstructions, pick individual candidates for overlap analysis, and review per-candidate metrics.
-- Automatically save checkpoints to `~/.umbra_autosave/evolution_state.pkl` (or a custom directory) and resume from the latest snapshot on launch.
+The command opens a native window that renders the original image, the encoded noise packet, the decoder's reconstruction, and a multiplicative overlap map that highlights shared signal energy. The sidebar controls expose the evolution playground with AI/sound composite scoring, Pinterest inspiration downloads, autosave, and long-running evolution support.
 
 On Windows you can launch the UI directly with the provided helper scripts:
 
@@ -84,7 +76,7 @@ or
 launch_umbra_ui.bat
 ```
 
-Both scripts forward additional arguments to `streamlit run`, so you can override ports or Streamlit options if needed.
+Both scripts call `python -m umbra ui`, so any extra arguments are forwarded to the CLI wrapper.
 
 ## Next Steps
 
