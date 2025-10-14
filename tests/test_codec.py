@@ -77,6 +77,24 @@ def test_segmented_waveform_round_trip() -> None:
     assert -1.0 <= metrics.ssim <= 1.0
 
 
+def test_waveform_duration_is_capped() -> None:
+    image = _random_image(size=6)
+    sample_rate = 8_000
+    absurd_segments = 500_000
+
+    waveform = encode_image_to_waveform(
+        image,
+        sample_rate=sample_rate,
+        segments=absurd_segments,
+        marker_duration=0.5,
+    )
+
+    assert waveform.ndim == 1
+    # Ten minute cap from reconstruction module
+    max_samples = int(600.0 * sample_rate)
+    assert 0 < waveform.size <= max_samples
+
+
 def test_ensure_rgb_accepts_single_channel_dimension() -> None:
     single_channel = np.linspace(0.0, 1.0, 9, dtype=np.float32).reshape(3, 3, 1)
     rgb = _ensure_rgb_image(single_channel)

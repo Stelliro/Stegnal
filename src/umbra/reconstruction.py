@@ -16,6 +16,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Hard cap for fax-style encodings to avoid exhausting host memory when gene
+# mutations attempt to explore extremely long transmissions. Ten minutes keeps
+# experiments flexible while bounding allocations to roughly 600 * sample_rate
+# samples (≈115 MB at 48 kHz float32).
+_MAX_FAX_DURATION_SECONDS = 600.0
+
+
 @dataclass(frozen=True)
 class GeneratedShape:
     """Description of a synthetic geometric primitive used in a collage."""
@@ -347,6 +354,18 @@ def image_to_waveform(
     payload_samples = max(sample_rate, 1)
     segment_length = marker_samples + payload_samples
 
+    max_total_samples = int(max(_MAX_FAX_DURATION_SECONDS * sample_rate, sample_rate))
+    if safe_segments > 1:
+        max_segments = max(1, max_total_samples // max(segment_length, 1))
+        if safe_segments > max_segments:
+            logger.warning(
+                "Truncating fax transmission from %d to %d segments to respect the %.1f s cap",
+                safe_segments,
+                max_segments,
+                _MAX_FAX_DURATION_SECONDS,
+            )
+            safe_segments = max_segments
+
     if safe_segments == 1:
         weights = np.array([0.5, 0.35, 0.15], dtype=np.float32)
         intensities = array[..., :3] @ weights
@@ -374,7 +393,11 @@ def image_to_waveform(
     rows = array.shape[0]
     stripe_height = int(np.ceil(rows / safe_segments))
     segments_wave: list[np.ndarray] = []
+    total_samples = 0
     for idx in range(safe_segments):
+        remaining = max_total_samples - total_samples
+        if remaining <= 0:
+            break
         start_row = idx * stripe_height
         end_row = min(rows, start_row + stripe_height)
         if start_row >= rows:
@@ -394,7 +417,15 @@ def image_to_waveform(
             segment_wave = np.pad(segment_wave, (0, segment_length - segment_wave.size))
         elif segment_wave.size > segment_length:
             segment_wave = segment_wave[:segment_length]
+        if segment_wave.size > remaining:
+            segment_wave = segment_wave[:remaining]
+        if segment_wave.size == 0:
+            break
         segments_wave.append(segment_wave.astype(np.float32))
+        total_samples += segment_wave.size
+
+    if not segments_wave:
+        return np.zeros(0, dtype=np.float32)
 
     waveform = np.concatenate(segments_wave).astype(np.float32)
     peak = float(np.max(np.abs(waveform)))
