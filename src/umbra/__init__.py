@@ -13,6 +13,7 @@ from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
 from .neural import NeuralRewardModel
 from .pipeline import PipelineResult, replay_packet, run_pipeline
+from .predictor import predict_image_from_waveform
 from .reconstruction import (
     GeneratedShape,
     ReconstructionResult,
@@ -25,7 +26,6 @@ from .reconstruction import (
     run_reconstruction_cycle,
     waveform_to_wav_bytes,
 )
-from .predictor import predict_image_from_waveform
 from .visualization import colorize_comparison, multiplicative_overlap, normalize_for_display
 
 __all__ = [

@@ -258,21 +258,39 @@ def prepare_trend_chart(
 
 def prepare_metrics_chart(
     history: Sequence[Mapping[str, float]],
+    *,
+    markers: Sequence[float | int] | None = None,
+    window: int | None = None,
+    auto_follow: bool = True,
 ) -> dict[str, object] | None:
     """Return a Vega-Lite spec visualising the performance history."""
 
     if len(history) < 2:
         return None
 
+    if window is not None and window <= 0:
+        window = None
+
+    start_index = 0
+    if window is not None and len(history) > window and auto_follow:
+        start_index = len(history) - window
+    sliced_history = history[start_index:]
+
     metric_labels = {
         "ai_overlap": "AI overlap (%)",
         "ai_ssim": "AI SSIM",
         "ai_psnr": "AI PSNR (dB)",
-        "sound_overlap": "Sound overlap (%)",
+        "sound_overlap": "AI↔Sound overlap (%)",
     }
+    if any("composite_score" in entry for entry in sliced_history):
+        metric_labels["composite_score"] = "Sound↔AI composite score"
+    if any("ai_score" in entry for entry in sliced_history):
+        metric_labels["ai_score"] = "AI baseline score"
+    if any("sound_reference_overlap" in entry for entry in sliced_history):
+        metric_labels["sound_reference_overlap"] = "Sound↔Reference overlap (%)"
 
     values: list[dict[str, float | str]] = []
-    for index, entry in enumerate(history, start=1):
+    for offset, entry in enumerate(sliced_history, start=start_index + 1):
         for key, label in metric_labels.items():
             if key not in entry:
                 continue
@@ -282,7 +300,7 @@ def prepare_metrics_chart(
                 continue
             if not math.isfinite(numeric):
                 continue
-            values.append({"Step": float(index), "Metric": label, "Value": numeric})
+            values.append({"Step": float(offset), "Metric": label, "Value": numeric})
 
     if not values:
         return None
@@ -299,17 +317,38 @@ def prepare_metrics_chart(
     if not varying_metrics:
         return None
 
-    step_values = [value["Step"] for value in values]
-    score_values = [value["Value"] for value in values]
-
-    x_domain = [min(step_values), max(step_values)]
-    y_domain = [min(score_values), max(score_values)]
-    if y_domain[0] == y_domain[1]:
+    values = [value for value in values if str(value["Metric"]) in varying_metrics]
+    if not values:
         return None
 
-    spec: dict[str, object] = {
-        "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
-        "data": {"values": values},
+    step_values = [value["Step"] for value in values]
+
+    metric_stats: dict[str, tuple[float, float]] = {}
+    for entry in values:
+        label = str(entry["Metric"])
+        value = float(entry["Value"])
+        if label in metric_stats:
+            current_min, current_max = metric_stats[label]
+            metric_stats[label] = (min(current_min, value), max(current_max, value))
+        else:
+            metric_stats[label] = (value, value)
+
+    for entry in values:
+        label = str(entry["Metric"])
+        value = float(entry["Value"])
+        metric_min, metric_max = metric_stats[label]
+        span = metric_max - metric_min
+        if span <= 0:
+            scaled = 0.5
+        else:
+            scaled = (value - metric_min) / span
+        entry["ScaledValue"] = scaled
+
+    x_domain = [min(step_values), max(step_values)]
+    y_domain = [0.0, 1.0]
+
+    schema = "https://vega.github.io/schema/vega-lite/v6.json"
+    base_layer: dict[str, object] = {
         "mark": {"type": "line", "point": True},
         "encoding": {
             "x": {
@@ -319,20 +358,87 @@ def prepare_metrics_chart(
                 "scale": {"domain": x_domain},
             },
             "y": {
-                "field": "Value",
+                "field": "ScaledValue",
                 "type": "quantitative",
-                "title": "Score",
-                "scale": {"domain": y_domain},
+                "title": "Normalised score",
+                "scale": {"domain": y_domain, "nice": False},
             },
             "color": {"field": "Metric", "type": "nominal", "title": "Metric"},
             "tooltip": [
                 {"field": "Step", "type": "quantitative"},
                 {"field": "Metric", "type": "nominal"},
-                {"field": "Value", "type": "quantitative"},
+                {
+                    "field": "Value",
+                    "type": "quantitative",
+                    "title": "Score",
+                },
+                {
+                    "field": "ScaledValue",
+                    "type": "quantitative",
+                    "title": "Normalised score",
+                },
             ],
         },
-        "config": {"legend": {"orient": "bottom", "title": ""}},
     }
+
+    config = {"legend": {"orient": "bottom", "title": ""}}
+
+    marker_values: list[dict[str, float]] = []
+    if markers:
+        seen_steps: set[float] = set()
+        x_min, x_max = x_domain
+        for raw_marker in markers:
+            try:
+                step = float(raw_marker)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(step):
+                continue
+            if step < x_min or step > x_max:
+                continue
+            if step in seen_steps:
+                continue
+            seen_steps.add(step)
+            marker_values.append({"Step": step})
+
+    if marker_values:
+        marker_layer = {
+            "data": {"values": marker_values},
+            "mark": {
+                "type": "rule",
+                "color": "#ff6f61",
+                "strokeWidth": 1.5,
+                "strokeDash": [6, 4],
+            },
+            "encoding": {
+                "x": {
+                    "field": "Step",
+                    "type": "quantitative",
+                    "title": "Observation",
+                },
+                "tooltip": [
+                    {
+                        "field": "Step",
+                        "type": "quantitative",
+                        "title": "Sound target",
+                    }
+                ],
+            },
+        }
+        spec = {
+            "$schema": schema,
+            "config": config,
+            "data": {"values": values},
+            "layer": [base_layer, marker_layer],
+            "resolve": {"scale": {"y": "shared"}},
+        }
+    else:
+        spec = {
+            "$schema": schema,
+            "config": config,
+            "data": {"values": values},
+            **base_layer,
+        }
 
     return spec
 

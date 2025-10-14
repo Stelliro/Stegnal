@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .codec import decode_waveform_to_image, encode_image_to_waveform
 from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .metrics import (
@@ -22,6 +23,7 @@ from .metrics import (
     compute_ms_ssim,
     dct_band_correlation,
 )
+from .reconstruction import suggest_sample_rate, suggest_transmission_profile
 from .runs import append_history, get_run_paths, load_history, new_run
 from .visualization import multiplicative_overlap
 
@@ -49,6 +51,37 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _ensure_three_channel(image: np.ndarray) -> np.ndarray:
+    """Return ``image`` as a clipped three-channel float array."""
+
+    array = np.asarray(image, dtype=np.float32)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] > 3:
+        array = array[..., :3]
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("expected image with shape (H, W, 3)")
+    return np.clip(array, 0.0, 1.0)
+
+
+def _chaotic_seed_mix(values: Sequence[int], noise: int, logistic: float) -> int:
+    """Blend ``values`` with ``noise`` via a keyed hash for seed diversity."""
+
+    buffer = bytearray()
+    buffer.extend(int(noise & 0xFFFFFFFF).to_bytes(4, "little", signed=False))
+    logistic_bits = int(abs(logistic) * (1 << 32)) & 0xFFFFFFFF
+    buffer.extend(logistic_bits.to_bytes(4, "little", signed=False))
+    for value in values:
+        buffer.extend(int(value & 0x7FFFFFFF).to_bytes(8, "little", signed=False))
+    digest = hashlib.blake2s(buffer, person=b"umbChaos").digest()
+    return int.from_bytes(digest[:8], "little") & 0x7FFFFFFF
+
+
+_LINEAGE_RETENTION_FACTOR = 3
 
 
 PLATEAU_CFG_DEFAULTS = {
@@ -491,12 +524,31 @@ class EvolutionManager:
             return int(self.rng.integers(0, np.iinfo(np.int32).max))
 
         choices = self.rng.choice(anchors, size=min(3, len(anchors)), replace=False)
+        selected = np.asarray(choices, dtype=np.int64)
         combined = 0
-        for idx, parent_seed in enumerate(np.asarray(choices, dtype=np.int64)):
+        for idx, parent_seed in enumerate(selected):
             shift = (idx * 17) % 31
             combined ^= (int(parent_seed) << shift) & 0x7FFFFFFF
+
+        logistic = float(self.rng.random())
+        logistic = (3.999 * logistic * (1.0 - logistic)) or float(self.rng.random())
+        logistic_component = int(abs(logistic) * 0x7FFFFFFF) & 0x7FFFFFFF
+
+        if selected.size:
+            xor_mix = selected ^ np.roll(selected, 1)
+            walsh = int(np.bitwise_xor.reduce(xor_mix)) & 0x7FFFFFFF
+        else:  # pragma: no cover - defensive
+            walsh = 0
+
+        noise = int(self.rng.integers(0, np.iinfo(np.int32).max))
+        chaotic = _chaotic_seed_mix(selected.tolist(), noise, logistic)
+
         mutation = int(self.rng.integers(0, np.iinfo(np.int32).max))
-        return (combined ^ mutation) & 0x7FFFFFFF
+        combined ^= walsh
+        combined ^= chaotic
+        combined ^= logistic_component
+        combined ^= mutation
+        return combined & 0x7FFFFFFF
 
     def _candidate_features(
         self,
@@ -554,6 +606,32 @@ class EvolutionManager:
         ranked = sorted(generation.candidates, key=lambda cand: cand.reward, reverse=True)
         elite_count = max(3, self.population_size // 2)
         self._elite_pool = [candidate.seed for candidate in ranked[:elite_count]]
+
+    def _prune_parent_lineage(self) -> None:
+        """Retain only the fittest lineage entries to favour elite parents."""
+
+        max_entries = max(self.population_size * _LINEAGE_RETENTION_FACTOR, self.population_size)
+        if len(self._parent_lineage) <= max_entries:
+            return
+
+        ranked = sorted(
+            self._parent_lineage.values(),
+            key=lambda record: (
+                float(record.cumulative_reward),
+                float(record.metrics.ssim),
+                float(record.overlap_score),
+                -float(record.last_generation),
+            ),
+            reverse=True,
+        )
+        survivors = {entry.seed for entry in ranked[:max_entries]}
+        removed = 0
+        for seed in list(self._parent_lineage.keys()):
+            if seed not in survivors:
+                del self._parent_lineage[seed]
+                removed += 1
+        if removed:
+            logger.debug("Pruned %d low-fitness parents from lineage", removed)
 
     def _difficulty_from_generation(
         self,
@@ -646,15 +724,47 @@ class EvolutionManager:
 
         channel_axis = -1 if self.original.ndim == 3 else None
 
+        reference_clipped = _ensure_three_channel(self.original)
         start_time = time.perf_counter()
         for seed in seeds:
             packet = self.encoder.encode(self.original, int(seed))
             reconstruction = self.decoder.decode(packet, int(seed))
-            metrics = compute_metrics(self.original, reconstruction)
-            _, overlap_score = multiplicative_overlap(self.original, reconstruction)
+            try:
+                recon_image = _ensure_three_channel(reconstruction)
+            except ValueError:
+                logger.debug("Falling back to reference alignment for seed %d", seed, exc_info=True)
+                recon_image = reference_clipped
+            comparison_base: np.ndarray | None
+            try:
+                sample_rate = suggest_sample_rate(recon_image)
+                segments, marker_duration = suggest_transmission_profile(recon_image)
+                waveform = encode_image_to_waveform(
+                    recon_image,
+                    sample_rate=sample_rate,
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                sound_image = decode_waveform_to_image(
+                    waveform,
+                    sample_rate=sample_rate,
+                    resolution=recon_image.shape[:2],
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                comparison_base = _ensure_three_channel(sound_image)
+            except Exception:  # pragma: no cover - audio fallback path
+                logger.debug("Sound alignment failed for seed %d", seed, exc_info=True)
+                comparison_base = None
+
+            if comparison_base is None:
+                metrics = compute_metrics(reference_clipped, recon_image)
+                _, overlap_score = multiplicative_overlap(reference_clipped, recon_image)
+            else:
+                metrics = compute_metrics(recon_image, comparison_base)
+                _, overlap_score = multiplicative_overlap(recon_image, comparison_base)
             candidate = CandidateResult(
                 seed=int(seed),
-                reconstruction=np.asarray(reconstruction, dtype=np.float16),
+                reconstruction=recon_image.astype(np.float32, copy=True),
                 metrics=metrics,
                 overlap_score=float(overlap_score),
             )
@@ -752,6 +862,7 @@ class EvolutionManager:
             record.cumulative_reward = float(record.cumulative_reward + candidate.reward)
             record.peak_reward = float(max(record.peak_reward, candidate.reward))
             record.last_generation = generation.index
+        self._prune_parent_lineage()
         self.append_generation_record(generation, persist=False, use_next_index=True)
         if generation.candidates:
             best = generation.best_candidate

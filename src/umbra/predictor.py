@@ -24,6 +24,8 @@ def predict_image_from_waveform(
     resolution: tuple[int, int],
     model: Any | None = None,
     device: str | None = None,
+    segments: int = 1,
+    marker_duration: float = 0.05,
 ) -> np.ndarray:
     """Return an RGB image predicted from ``waveform``.
 
@@ -36,6 +38,8 @@ def predict_image_from_waveform(
         waveform,
         resolution=resolution,
         sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
     )
 
     if model is None or torch is None:
