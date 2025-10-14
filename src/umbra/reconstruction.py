@@ -264,12 +264,74 @@ def tiled_reconstruction(
     return assembled
 
 
+def _encode_stripe_waveform(
+    stripe: np.ndarray,
+    *,
+    sample_count: int,
+) -> np.ndarray:
+    """Encode an image stripe into ``sample_count`` audio samples."""
+
+    if sample_count <= 0:
+        return np.zeros(0, dtype=np.float32)
+
+    weights = np.array([0.5, 0.35, 0.15], dtype=np.float32)
+    intensities = np.asarray(stripe, dtype=np.float32)[..., :3] @ weights
+    intensities = intensities.reshape(-1)
+    if intensities.size == 0:
+        return np.zeros(sample_count, dtype=np.float32)
+
+    intensities -= float(intensities.min())
+    max_val = float(intensities.max())
+    if max_val > 0:
+        intensities /= max_val
+
+    bins = sample_count // 2 + 1
+    xp = np.linspace(0, max(intensities.size - 1, 0), bins)
+    source_idx = np.arange(intensities.size, dtype=np.float32)
+    spectrum = np.interp(xp, source_idx if source_idx.size else np.array([0.0]), intensities)
+    waveform = np.fft.irfft(spectrum, n=sample_count)
+    if waveform.size < sample_count:
+        waveform = np.pad(waveform, (0, sample_count - waveform.size))
+    peak = float(np.max(np.abs(waveform)))
+    if peak > 0:
+        waveform /= peak
+    return waveform.astype(np.float32)
+
+
+def _marker_tone(
+    *,
+    sample_rate: int,
+    marker_samples: int,
+    index: int,
+    base_frequency: float = 1_600.0,
+    step: float = 220.0,
+) -> np.ndarray:
+    """Return a short sinusoidal marker identifying ``index``."""
+
+    if marker_samples <= 0:
+        return np.zeros(0, dtype=np.float32)
+    frequency = max(base_frequency + index * step, 80.0)
+    t = np.linspace(0.0, marker_samples / sample_rate, marker_samples, endpoint=False)
+    envelope = np.linspace(0.2, 1.0, marker_samples, dtype=np.float32)
+    tone = np.sin(2 * np.pi * frequency * t)
+    tone = tone.astype(np.float32) * envelope
+    return tone
+
+
 def image_to_waveform(
     image: np.ndarray,
     *,
     sample_rate: int = 48_000,
+    segments: int = 1,
+    marker_duration: float = 0.05,
 ) -> np.ndarray:
-    """Encode ``image`` into a mono waveform using spectral weighting."""
+    """Encode ``image`` into a mono waveform using spectral weighting.
+
+    When ``segments`` is greater than one a fax-style transmission is produced
+    where each stripe of the image is emitted as its own block separated by a
+    short audible marker tone. The markers help the decoder realign segments
+    when reconstructing the image from an extended audio clip.
+    """
 
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
@@ -278,28 +340,72 @@ def image_to_waveform(
     if array.ndim != 3 or array.shape[2] < 3:
         raise ValueError("Expected an RGB image for conversion to waveform")
 
-    weights = np.array([0.5, 0.35, 0.15], dtype=np.float32)
-    intensities = array[..., :3] @ weights
-    intensities = intensities.reshape(-1)
-    if intensities.size == 0:
-        raise ValueError("Image contains no pixels")
+    safe_segments = max(1, int(segments))
+    marker_fraction = float(np.clip(marker_duration, 0.0, 0.5))
+    marker_samples = int(round(marker_fraction * sample_rate))
+    marker_samples = min(marker_samples, sample_rate // 2)
+    payload_samples = sample_rate - marker_samples
 
-    intensities -= intensities.min()
-    max_val = float(intensities.max())
-    if max_val > 0:
-        intensities /= max_val
+    if safe_segments == 1 or payload_samples <= 0:
+        weights = np.array([0.5, 0.35, 0.15], dtype=np.float32)
+        intensities = array[..., :3] @ weights
+        intensities = intensities.reshape(-1)
+        if intensities.size == 0:
+            raise ValueError("Image contains no pixels")
 
-    num_bins = sample_rate // 2 + 1
-    xp = np.linspace(0, intensities.size - 1, num_bins)
-    spectrum = np.interp(xp, np.arange(intensities.size), intensities)
-    waveform = np.fft.irfft(spectrum, n=sample_rate)
+        intensities -= float(intensities.min())
+        max_val = float(intensities.max())
+        if max_val > 0:
+            intensities /= max_val
+
+        num_bins = sample_rate // 2 + 1
+        xp = np.linspace(0, intensities.size - 1, num_bins)
+        spectrum = np.interp(xp, np.arange(intensities.size), intensities)
+        waveform = np.fft.irfft(spectrum, n=sample_rate)
+        peak = float(np.max(np.abs(waveform)))
+        if peak > 0:
+            waveform /= peak
+
+        waveform = waveform.astype(np.float32)
+        logger.debug("Encoded image to waveform with %d samples", waveform.size)
+        return waveform
+
+    rows = array.shape[0]
+    stripe_height = int(np.ceil(rows / safe_segments))
+    segments_wave: list[np.ndarray] = []
+    for idx in range(safe_segments):
+        start_row = idx * stripe_height
+        end_row = min(rows, start_row + stripe_height)
+        if start_row >= rows:
+            stripe = array[-1:]
+        else:
+            stripe = array[start_row:end_row]
+        stripe_wave = _encode_stripe_waveform(stripe, sample_count=max(payload_samples, 1))
+        marker = _marker_tone(
+            sample_rate=sample_rate,
+            marker_samples=marker_samples,
+            index=idx,
+        )
+        segment_wave = np.concatenate(
+            [marker.astype(np.float32), stripe_wave.astype(np.float32)]
+        )
+        if segment_wave.size < sample_rate:
+            segment_wave = np.pad(segment_wave, (0, sample_rate - segment_wave.size))
+        elif segment_wave.size > sample_rate:
+            segment_wave = segment_wave[:sample_rate]
+        segments_wave.append(segment_wave.astype(np.float32))
+
+    waveform = np.concatenate(segments_wave).astype(np.float32)
     peak = float(np.max(np.abs(waveform)))
     if peak > 0:
         waveform /= peak
 
-    waveform = waveform.astype(np.float32)
-    logger.debug("Encoded image to waveform with %d samples", waveform.size)
-    return waveform
+    logger.debug(
+        "Encoded image to waveform with %d samples across %d segments",
+        waveform.size,
+        safe_segments,
+    )
+    return waveform.astype(np.float32)
 
 
 def reconstruct_from_waveform(
@@ -307,6 +413,8 @@ def reconstruct_from_waveform(
     *,
     resolution: tuple[int, int],
     sample_rate: int,
+    segments: int = 1,
+    marker_duration: float = 0.05,
 ) -> np.ndarray:
     """Approximate an RGB image from a mono waveform."""
 
@@ -317,9 +425,73 @@ def reconstruct_from_waveform(
     if wave.size == 0:
         raise ValueError("Waveform must contain samples")
 
-    spectrum = np.abs(np.fft.rfft(wave, n=sample_rate))
-    if spectrum.size == 0:
-        raise ValueError("Unable to derive spectrum from waveform")
+    safe_segments = max(1, int(segments))
+    marker_fraction = float(np.clip(marker_duration, 0.0, 0.5))
+    marker_samples = int(round(marker_fraction * sample_rate))
+    marker_samples = min(marker_samples, sample_rate // 2)
+    payload_samples = sample_rate - marker_samples
+
+    if safe_segments == 1 or payload_samples <= 0:
+        usable = wave
+        if usable.size < sample_rate:
+            usable = np.pad(usable, (0, sample_rate - usable.size))
+        else:
+            usable = usable[:sample_rate]
+        spectrum = np.abs(np.fft.rfft(usable, n=sample_rate))
+        if spectrum.size == 0:
+            raise ValueError("Unable to derive spectrum from waveform")
+    else:
+        segment_length = sample_rate
+        available_segments = max(1, wave.size // segment_length)
+        available_segments = min(available_segments, safe_segments)
+        if available_segments <= 0:
+            raise ValueError("Waveform is shorter than one segment")
+
+        stripes: list[np.ndarray] = []
+        for idx in range(available_segments):
+            start = idx * segment_length
+            end = start + segment_length
+            segment_wave = wave[start:end]
+            if segment_wave.size < segment_length:
+                segment_wave = np.pad(segment_wave, (0, segment_length - segment_wave.size))
+            payload = segment_wave[marker_samples:]
+            if payload_samples > 0:
+                if payload.size < payload_samples:
+                    payload = np.pad(payload, (0, payload_samples - payload.size))
+                else:
+                    payload = payload[:payload_samples]
+                spectrum = np.abs(np.fft.rfft(payload, n=payload_samples))
+            else:
+                spectrum = np.abs(np.fft.rfft(segment_wave, n=segment_length))
+            stripes.append(spectrum.astype(np.float32))
+
+        total_pixels = rows * cols
+        needed = total_pixels * 3
+        combined = np.zeros(needed, dtype=np.float32)
+        stripe_height = int(np.ceil(rows / available_segments))
+        cursor = 0
+        for idx, spectrum in enumerate(stripes):
+            start_row = idx * stripe_height
+            end_row = min(rows, start_row + stripe_height)
+            if start_row >= rows:
+                break
+            stripe_rows = max(end_row - start_row, 1)
+            stripe_pixels = stripe_rows * cols * 3
+            xp = np.linspace(0, max(spectrum.size - 1, 0), stripe_pixels)
+            source_idx = np.arange(spectrum.size, dtype=np.float32)
+            stripe_values = np.interp(
+                xp,
+                source_idx if source_idx.size else np.array([0.0], dtype=np.float32),
+                spectrum,
+            )
+            end_cursor = min(cursor + stripe_pixels, needed)
+            combined[cursor:end_cursor] = stripe_values[: end_cursor - cursor]
+            cursor = end_cursor
+            if cursor >= needed:
+                break
+        if cursor < needed and cursor > 0:
+            combined[cursor:] = combined[cursor - 1]
+        spectrum = combined
 
     spectrum = spectrum.astype(np.float32)
     max_val = float(spectrum.max())

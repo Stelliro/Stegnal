@@ -45,11 +45,18 @@ def encode_image_to_waveform(
     image: np.ndarray | Image.Image,
     *,
     sample_rate: int,
+    segments: int = 1,
+    marker_duration: float = 0.05,
 ) -> np.ndarray:
     """Return a mono waveform encoding of ``image`` at ``sample_rate`` samples."""
 
     rgb = _ensure_rgb_image(image)
-    waveform = image_to_waveform(rgb, sample_rate=sample_rate)
+    waveform = image_to_waveform(
+        rgb,
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
+    )
     logger.debug(
         "Encoded image to waveform with resolution %s at %d Hz",
         rgb.shape[:2],
@@ -62,10 +69,17 @@ def encode_image_to_wav_bytes(
     image: np.ndarray | Image.Image,
     *,
     sample_rate: int,
+    segments: int = 1,
+    marker_duration: float = 0.05,
 ) -> bytes:
     """Encode ``image`` into deterministic WAV bytes."""
 
-    waveform = encode_image_to_waveform(image, sample_rate=sample_rate)
+    waveform = encode_image_to_waveform(
+        image,
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
+    )
     return waveform_to_wav_bytes(waveform, sample_rate)
 
 
@@ -74,6 +88,8 @@ def decode_waveform_to_image(
     *,
     sample_rate: int,
     resolution: tuple[int, int],
+    segments: int = 1,
+    marker_duration: float = 0.05,
 ) -> np.ndarray:
     """Decode ``waveform`` back into an RGB image."""
 
@@ -84,6 +100,8 @@ def decode_waveform_to_image(
         waveform,
         resolution=(int(rows), int(cols)),
         sample_rate=int(sample_rate),
+        segments=int(segments),
+        marker_duration=float(marker_duration),
     )
     return image.astype(np.float32)
 
@@ -93,6 +111,8 @@ def decode_wav_bytes_to_image(
     *,
     resolution: tuple[int, int],
     sample_rate: int | None = None,
+    segments: int = 1,
+    marker_duration: float = 0.05,
 ) -> tuple[np.ndarray, int]:
     """Decode WAV ``data`` into an image and return it with the detected sample rate."""
 
@@ -105,6 +125,8 @@ def decode_wav_bytes_to_image(
         waveform,
         sample_rate=target_rate,
         resolution=resolution,
+        segments=segments,
+        marker_duration=marker_duration,
     )
     logger.debug(
         "Decoded WAV bytes to image at %d Hz with resolution %s",

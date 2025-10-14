@@ -615,6 +615,17 @@ def _next_sound_budget_rng(state: st.session_state) -> np.random.Generator:
     return rng
 
 
+def _sound_transmission_profile(state: st.session_state) -> tuple[int, float]:
+    """Return the configured fax-style sound segmentation profile."""
+
+    sections = int(state.get("sound_section_count", 1))
+    if sections < 1:
+        sections = 1
+    marker = float(state.get("sound_marker_duration", 0.05))
+    marker = float(np.clip(marker, 0.0, 0.25))
+    return sections, marker
+
+
 def _compute_sound_score_target(
     auto_settings: Mapping[str, Any],
     *,
@@ -780,6 +791,8 @@ def _render_quick_start_wizard(
     target_container = container or st.container()
     easy_mode = bool(state.get("easy_mode", True))
     state.setdefault("quick_start_infinite_preference", False)
+    state.setdefault("sound_section_count", 1)
+    state.setdefault("sound_marker_duration", 0.05)
 
     easy_mode = target_container.toggle(
         "Easy mode",
@@ -904,6 +917,50 @@ def _render_quick_start_wizard(
         state.pop("quick_start_reference_label", None)
         state.pop("quick_start_reference_source", None)
         step_status["upload"] = True
+
+    fax_enabled_default = bool(state.get("sound_section_count", 1) > 1)
+    fax_enabled = upload_col.toggle(
+        "Fax-style sound encoding",
+        value=fax_enabled_default,
+        help=(
+            "Add segment markers and transmit the reference image in multiple audio "
+            "blocks for higher-fidelity reconstructions."
+        ),
+        key="quick_start_fax_enabled",
+    )
+
+    if fax_enabled:
+        sections_default = int(state.get("sound_section_count", 4))
+        sections_default = max(2, min(12, sections_default))
+        sections = upload_col.slider(
+            "Transmission sections",
+            min_value=2,
+            max_value=12,
+            value=sections_default,
+            step=1,
+            key="quick_start_fax_sections",
+        )
+        marker_default = float(
+            _quantize_slider_value(
+                float(state.get("sound_marker_duration", 0.05)),
+                min_value=0.0,
+                max_value=0.25,
+                step=0.01,
+            )
+        )
+        marker_duration = upload_col.slider(
+            "Marker duration (s)",
+            min_value=0.0,
+            max_value=0.25,
+            value=marker_default,
+            step=0.01,
+            key="quick_start_marker_duration",
+            help="Length of the audible tone separating each transmission block.",
+        )
+        state["sound_section_count"] = int(sections)
+        state["sound_marker_duration"] = float(marker_duration)
+    else:
+        state["sound_section_count"] = 1
 
     mode_col.markdown(
         ("✅" if step_status["mode"] else "②") + " **Step 2** · Pick your pace"
@@ -1181,9 +1238,12 @@ def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None =
             state["demo_resolution"] = demo_image.shape[:2]
             state["demo_sample_rate"] = 48_000
             try:
+                sections, marker = _sound_transmission_profile(state)
                 wav_bytes = encode_image_to_wav_bytes(
                     demo_image,
                     sample_rate=int(state["demo_sample_rate"]),
+                    segments=sections,
+                    marker_duration=marker,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 demo_container.error(f"Failed to encode image: {exc}")
@@ -1225,10 +1285,13 @@ def _render_demo_lab(state: st.session_state, container: DeltaGenerator | None =
                     raise ValueError(
                         "Unknown resolution. Upload an image first to establish dimensions."
                     )
+                sections, marker = _sound_transmission_profile(state)
                 translated = decode_waveform_to_image(
                     waveform,
                     sample_rate=int(active_rate),
                     resolution=tuple(int(v) for v in resolution),
+                    segments=sections,
+                    marker_duration=marker,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 demo_container.error(f"Translation failed: {exc}")
@@ -4323,16 +4386,25 @@ def run() -> None:
 
             with image_lane:
                 st.markdown("#### Image → WAV")
+                sample_default = int(
+                    _quantize_slider_value(
+                        float(current_sample_rate),
+                        min_value=8_000,
+                        max_value=96_000,
+                        step=1_000,
+                    )
+                )
                 sample_rate_choice = int(
                     st.slider(
                         "Sample rate (Hz)",
                         min_value=8_000,
                         max_value=96_000,
-                        value=int(np.clip(current_sample_rate, 8_000, 96_000)),
+                        value=sample_default,
                         step=1_000,
                         key="codec_sample_rate",
                     )
                 )
+                sections, marker = _sound_transmission_profile(state)
                 source_options: list[str] = []
                 if best_candidate is not None:
                     source_options.append("Evolution best")
@@ -4372,15 +4444,21 @@ def run() -> None:
                     waveform = encode_image_to_waveform(
                         source_image,
                         sample_rate=sample_rate_choice,
+                        segments=sections,
+                        marker_duration=marker,
                     )
                     wav_bytes = encode_image_to_wav_bytes(
                         source_image,
                         sample_rate=sample_rate_choice,
+                        segments=sections,
+                        marker_duration=marker,
                     )
                     roundtrip = decode_waveform_to_image(
                         waveform,
                         sample_rate=sample_rate_choice,
                         resolution=source_image.shape[:2],
+                        segments=sections,
+                        marker_duration=marker,
                     )
                     _render_image(st, roundtrip, "Heuristic round-trip")
                     metrics_roundtrip = compute_metrics(source_image, roundtrip)
@@ -4421,12 +4499,20 @@ def run() -> None:
                     type=("wav", "wave"),
                     key="codec_wav_upload",
                 )
+                resolution_default = int(
+                    _quantize_slider_value(
+                        float(current_resolution),
+                        min_value=32,
+                        max_value=512,
+                        step=8,
+                    )
+                )
                 target_resolution = int(
                     st.number_input(
                         "Target resolution",
                         min_value=32,
                         max_value=512,
-                        value=int(current_resolution),
+                        value=resolution_default,
                         step=8,
                         key="codec_target_resolution",
                     )
@@ -4440,6 +4526,8 @@ def run() -> None:
                             waveform,
                             sample_rate=detected_rate,
                             resolution=(target_resolution, target_resolution),
+                            segments=sections,
+                            marker_duration=marker,
                         )
                         _render_audio(st, wav_bytes)
                         st.markdown(
