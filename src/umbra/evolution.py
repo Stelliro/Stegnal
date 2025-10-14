@@ -51,6 +51,19 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _chaotic_seed_mix(values: Sequence[int], noise: int, logistic: float) -> int:
+    """Blend ``values`` with ``noise`` via a keyed hash for seed diversity."""
+
+    buffer = bytearray()
+    buffer.extend(int(noise & 0xFFFFFFFF).to_bytes(4, "little", signed=False))
+    logistic_bits = int(abs(logistic) * (1 << 32)) & 0xFFFFFFFF
+    buffer.extend(logistic_bits.to_bytes(4, "little", signed=False))
+    for value in values:
+        buffer.extend(int(value & 0x7FFFFFFF).to_bytes(8, "little", signed=False))
+    digest = hashlib.blake2s(buffer, person=b"umbChaos").digest()
+    return int.from_bytes(digest[:8], "little") & 0x7FFFFFFF
+
+
 PLATEAU_CFG_DEFAULTS = {
     "window": 6,
     "delta_threshold": 0.002,
@@ -491,12 +504,31 @@ class EvolutionManager:
             return int(self.rng.integers(0, np.iinfo(np.int32).max))
 
         choices = self.rng.choice(anchors, size=min(3, len(anchors)), replace=False)
+        selected = np.asarray(choices, dtype=np.int64)
         combined = 0
-        for idx, parent_seed in enumerate(np.asarray(choices, dtype=np.int64)):
+        for idx, parent_seed in enumerate(selected):
             shift = (idx * 17) % 31
             combined ^= (int(parent_seed) << shift) & 0x7FFFFFFF
+
+        logistic = float(self.rng.random())
+        logistic = (3.999 * logistic * (1.0 - logistic)) or float(self.rng.random())
+        logistic_component = int(abs(logistic) * 0x7FFFFFFF) & 0x7FFFFFFF
+
+        if selected.size:
+            xor_mix = selected ^ np.roll(selected, 1)
+            walsh = int(np.bitwise_xor.reduce(xor_mix)) & 0x7FFFFFFF
+        else:  # pragma: no cover - defensive
+            walsh = 0
+
+        noise = int(self.rng.integers(0, np.iinfo(np.int32).max))
+        chaotic = _chaotic_seed_mix(selected.tolist(), noise, logistic)
+
         mutation = int(self.rng.integers(0, np.iinfo(np.int32).max))
-        return (combined ^ mutation) & 0x7FFFFFFF
+        combined ^= walsh
+        combined ^= chaotic
+        combined ^= logistic_component
+        combined ^= mutation
+        return combined & 0x7FFFFFFF
 
     def _candidate_features(
         self,

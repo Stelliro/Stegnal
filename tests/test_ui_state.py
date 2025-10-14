@@ -229,8 +229,8 @@ def test_parse_pinterest_feed_extracts_images(monkeypatch) -> None:
         """
         pairs = ui._parse_pinterest_feed(feed_xml)
         urls = {url for url, _ in pairs}
-        assert "https://i.pinimg.com/originals/example.jpg" in urls
-        assert "https://i.pinimg.com/originals/example-desc.jpg" in urls
+        assert any("/736x/example.jpg" in url for url in urls)
+        assert any("/736x/example-desc.jpg" in url for url in urls)
         assert all(label for _, label in pairs)
     finally:
         sys.modules.pop("umbra.ui", None)
@@ -250,13 +250,84 @@ def test_parse_pinterest_feed_accepts_html(monkeypatch) -> None:
         """
         pairs = ui._parse_pinterest_feed(html_doc)
         urls = {url for url, _ in pairs}
-        assert "https://i.pinimg.com/originals/galaxy.jpg" in urls
-        assert "https://i.pinimg.com/736x/starfield.jpg" in urls
+        assert any("/736x/galaxy.jpg" in url for url in urls)
+        assert any("/736x/starfield.jpg" in url for url in urls)
         assert any("Galaxy" in label for _, label in pairs)
         assert len(pairs) >= 2
     finally:
         sys.modules.pop("umbra.ui", None)
 
+
+def test_normalize_pinterest_url_strips_css(monkeypatch) -> None:
+    _install_ui_stubs(monkeypatch, {})
+    ui = importlib.import_module("umbra.ui")
+    try:
+        messy = "https://i.pinimg.com/originals/d5/3b/01/d53b014d86a6b6761bf649a0ed813c2b.png)}.cIt{border:0;}"
+        cleaned = ui._normalize_pinterest_url(messy)
+        assert cleaned.endswith(".png")
+        assert "/736x/" in cleaned
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_auto_refresh_pinterest_reference_respects_source(monkeypatch) -> None:
+    state: dict[str, object] = {
+        "quick_start_media_source": "auto",
+        "quick_start_reference_source": "pinterest",
+        "quick_start_reference_image": np.ones((2, 2, 3), dtype=np.float32),
+        "quick_start_reference_label": "Old",
+    }
+
+    _install_ui_stubs(monkeypatch, state)
+    ui = importlib.import_module("umbra.ui")
+
+    try:
+        refreshed = ui._auto_refresh_pinterest_reference(state, timeout=0.1)
+        assert refreshed is False
+        assert "quick_start_reference_image" not in state
+        assert "quick_start_reference_label" not in state
+        assert "quick_start_reference_source" not in state
+    finally:
+        sys.modules.pop("umbra.ui", None)
+
+
+def test_mutate_transmission_genes_allows_large_values(monkeypatch) -> None:
+    state: dict[str, object] = {
+        "sound_section_count": 8,
+        "sound_marker_duration": 0.1,
+        "_transmission_logistic": 0.42,
+    }
+
+    _install_ui_stubs(monkeypatch, state)
+    ui = importlib.import_module("umbra.ui")
+
+    class DummyRNG:
+        def __init__(self) -> None:
+            self._random_values = iter([0.2, 0.05, 0.01, 0.3, 0.9, 0.0])
+
+        def random(self) -> float:
+            return next(self._random_values)
+
+        def normal(self, _mean: float, scale: float) -> float:
+            return 20.0 * scale
+
+        def integers(self, _low: int, _high: int) -> int:
+            return max(_high - 1, 0)
+
+    monkeypatch.setattr(ui, "_transmission_mutation_rng", lambda _state, *, salt=0: DummyRNG())
+    monkeypatch.setattr(ui.np.fft, "rfft", lambda _arr: np.array([0.0, 128.0], dtype=np.float64))
+
+    class DummyGen:
+        index = 1
+        improvement = -0.5
+        reward_peak = 1.0
+
+    try:
+        ui._mutate_transmission_genes(state, generation=DummyGen(), boost=8)
+        assert state["sound_section_count"] > 256
+        assert state["sound_marker_duration"] > 3.0
+    finally:
+        sys.modules.pop("umbra.ui", None)
 
 def test_fetch_random_pinterest_image_uses_downloader(monkeypatch) -> None:
     _install_ui_stubs(monkeypatch, {})

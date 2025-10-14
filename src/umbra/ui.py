@@ -366,6 +366,11 @@ def _normalize_pinterest_url(url: str) -> str:
     cleaned = cleaned.replace("\\u002F", "/").replace("\\/", "/")
     cleaned = cleaned.split(")}")[0]
     cleaned = cleaned.strip("'\"}) ;")
+    if "/originals/" in cleaned:
+        # Pinterest frequently forbids direct downloads from /originals/ paths when
+        # no browser session is present. Fall back to the public 736px variant which
+        # is consistently accessible without authentication.
+        cleaned = cleaned.replace("/originals/", "/736x/")
     return cleaned
 
 
@@ -403,17 +408,36 @@ def _fetch_random_pinterest_image(
         raise RuntimeError(f"Pinterest feed at {feed_url} is invalid: {exc}") from exc
 
     image_url, title = random.choice(candidates)
-    try:
+    normalized_url = _normalize_pinterest_url(image_url)
+
+    def _attempt_fetch(url: str) -> bytes:
         if download is None:
-            image_bytes = _download_bytes(
-                image_url,
+            return _download_bytes(
+                url,
                 timeout=timeout,
                 referer=feed_url if feed_url.startswith("http") else "https://www.pinterest.com/",
             )
-        else:
-            image_bytes = downloader(image_url, timeout)
+        return downloader(url, timeout)
+
+    try:
+        image_bytes = _attempt_fetch(normalized_url)
     except RuntimeError as exc:
-        raise RuntimeError(f"Failed to download Pinterest image: {exc}") from exc
+        fallback_urls = [
+            normalized_url.replace("/736x/", "/564x/"),
+            normalized_url.replace("/736x/", "/236x/"),
+            normalized_url.replace("/736x/", "/474x/"),
+        ]
+        for candidate_url in fallback_urls:
+            candidate_url = candidate_url.strip()
+            if not candidate_url or candidate_url == normalized_url:
+                continue
+            try:
+                image_bytes = _attempt_fetch(candidate_url)
+                break
+            except RuntimeError:
+                continue
+        else:
+            raise RuntimeError(f"Failed to download Pinterest image: {exc}") from exc
 
     try:
         with Image.open(BytesIO(image_bytes)) as downloaded:
@@ -433,9 +457,17 @@ def _auto_refresh_pinterest_reference(
     """Refresh the active Pinterest inspiration image if Pinterest is selected."""
 
     active_source = state.get("quick_start_media_source")
-    reference_source = state.get("quick_start_reference_source")
-    if active_source != "pinterest" and reference_source != "pinterest":
+    if active_source != "pinterest":
+        state.pop("quick_start_reference_image", None)
+        state.pop("quick_start_reference_label", None)
+        state.pop("quick_start_reference_source", None)
         return False
+
+    reference_source = state.get("quick_start_reference_source")
+    if reference_source != "pinterest":
+        state.pop("quick_start_reference_image", None)
+        state.pop("quick_start_reference_label", None)
+        state.pop("quick_start_reference_source", None)
 
     try:
         image, label = _fetch_random_pinterest_image(None, timeout=timeout)
@@ -717,7 +749,11 @@ def _mutate_transmission_genes(
     if rng.random() < 0.08 and reward_peak > 0.5:
         sections = max(1, int(sections * (1.0 + logistic * exploration)))
 
-    sections = int(min(sections, 256))
+    spectral_probe = np.array([sections, leap * (1 + exploration), 1.0 + reward_peak], dtype=np.float64)
+    spectrum = np.abs(np.fft.rfft(spectral_probe))
+    harmonic = int(np.round(np.sum(spectrum)))
+    if harmonic > 0 and rng.random() < 0.3:
+        sections = max(1, sections + harmonic * max(1, exploration))
 
     drift = (logistic - 0.5) * (0.12 + 0.03 * exploration)
     marker += drift
@@ -725,8 +761,13 @@ def _mutate_transmission_genes(
     if rng.random() < 0.15:
         marker *= 1.0 + (rng.random() - 0.5) * (1.5 + 0.3 * exploration)
 
+    if rng.random() < 0.05:
+        golden = (1 + math.sqrt(5)) / 2
+        marker += float(np.sin(sections * golden) * 0.2 * (1 + exploration))
+
     marker = float(max(0.0, marker))
-    marker = float(min(marker, 3.0))
+    if not math.isfinite(marker):
+        marker = 0.0
 
     state["sound_section_count"] = sections
     state["sound_marker_duration"] = marker
