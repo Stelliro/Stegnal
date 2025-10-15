@@ -566,7 +566,7 @@ class EvolutionManager:
         seed: int,
         reference_clipped: np.ndarray,
         *,
-        waveform_payload: dict[str, Any] | None,
+        waveform_config: dict[str, Any] | None,
     ) -> CandidateResult:
         """Run the packet pipeline and optional waveform reconstruction for ``seed``."""
 
@@ -593,23 +593,44 @@ class EvolutionManager:
         waveform_segments: int | None = None
         waveform_marker_duration: float | None = None
 
-        if self.enable_waveform and waveform_payload is not None:
-            try:
+        if self.enable_waveform and waveform_config is not None:
+            waveform_sample_rate = int(waveform_config.get("sample_rate", 0)) or None
+            waveform_segments = int(waveform_config.get("segments", 0)) or None
+            marker_value = waveform_config.get("marker_duration", 0.0)
+            waveform_marker_duration = float(marker_value) if marker_value is not None else None
+
+            if (
+                waveform_sample_rate is not None
+                and waveform_segments is not None
+                and waveform_marker_duration is not None
+            ):
                 logger.info("Generating WAV reconstruction for seed %d", seed)
-                waveform = np.asarray(waveform_payload["waveform"], dtype=np.float32)
-                waveform_sample_rate = int(waveform_payload["sample_rate"])
-                waveform_segments = int(waveform_payload["segments"])
-                waveform_marker_duration = float(waveform_payload["marker_duration"])
-                waveform_image = decode_waveform_to_image(
-                    waveform,
-                    sample_rate=waveform_sample_rate,
-                    resolution=reference_clipped.shape[:2],
-                    segments=waveform_segments,
-                    marker_duration=waveform_marker_duration,
-                )
-                waveform_image = _ensure_three_channel(waveform_image).astype(
-                    np.float32
-                )
+                try:
+                    waveform = encode_image_to_waveform(
+                        recon_image,
+                        sample_rate=waveform_sample_rate,
+                        segments=waveform_segments,
+                        marker_duration=waveform_marker_duration,
+                    )
+                    waveform_image = decode_waveform_to_image(
+                        waveform,
+                        sample_rate=waveform_sample_rate,
+                        resolution=reference_clipped.shape[:2],
+                        segments=waveform_segments,
+                        marker_duration=waveform_marker_duration,
+                    )
+                    waveform_image = _ensure_three_channel(waveform_image).astype(
+                        np.float32
+                    )
+                except Exception as exc:  # pragma: no cover - diagnostic logging path
+                    logger.debug(
+                        "Waveform reconstruction failed for seed %d: %s",
+                        seed,
+                        exc,
+                        exc_info=True,
+                    )
+                    waveform_image = np.clip(recon_image, 0.0, 1.0)
+
                 waveform_reference_metrics = compute_metrics(
                     reference_clipped, waveform_image
                 )
@@ -620,21 +641,6 @@ class EvolutionManager:
                 _, waveform_packet_overlap = multiplicative_overlap(
                     recon_image, waveform_image
                 )
-            except Exception as exc:  # pragma: no cover - diagnostic logging path
-                logger.debug(
-                    "Waveform reconstruction failed for seed %d: %s",
-                    seed,
-                    exc,
-                    exc_info=True,
-                )
-                waveform_image = None
-                waveform_reference_metrics = None
-                waveform_reference_overlap = None
-                waveform_packet_metrics = None
-                waveform_packet_overlap = None
-                waveform_sample_rate = None
-                waveform_segments = None
-                waveform_marker_duration = None
 
         return CandidateResult(
             seed=int(seed),
@@ -832,37 +838,48 @@ class EvolutionManager:
         channel_axis = -1 if self.original.ndim == 3 else None
 
         reference_clipped = _ensure_three_channel(self.original)
-        waveform_payload: dict[str, Any] | None = None
+        waveform_config: dict[str, Any] | None = None
         if self.enable_waveform:
+            default_sample_rate = 24_000
+            default_segments = 1
+            default_marker = 0.05
             try:
-                sample_rate = suggest_sample_rate(reference_clipped)
-                segments, marker_duration = suggest_transmission_profile(reference_clipped)
-                waveform = encode_image_to_waveform(
-                    reference_clipped,
-                    sample_rate=sample_rate,
-                    segments=segments,
-                    marker_duration=marker_duration,
-                )
-                waveform_payload = {
-                    "waveform": waveform,
-                    "sample_rate": int(sample_rate),
-                    "segments": int(segments),
-                    "marker_duration": float(marker_duration),
-                }
+                sample_rate = int(suggest_sample_rate(reference_clipped))
             except Exception as exc:  # pragma: no cover - diagnostic waveform prep
                 logger.debug(
-                    "Failed to prepare waveform baseline for generation %d: %s",
+                    "Failed to suggest waveform sample rate for generation %d: %s",
                     generation_index,
                     exc,
                     exc_info=True,
                 )
-                waveform_payload = None
+                sample_rate = default_sample_rate
+            sample_rate = max(int(sample_rate), 1)
+
+            try:
+                segments, marker_duration = suggest_transmission_profile(reference_clipped)
+            except Exception as exc:  # pragma: no cover - diagnostic waveform prep
+                logger.debug(
+                    "Failed to suggest waveform transmission profile for generation %d: %s",
+                    generation_index,
+                    exc,
+                    exc_info=True,
+                )
+                segments = default_segments
+                marker_duration = default_marker
+
+            segments = max(int(segments), 1)
+            marker_duration = float(max(marker_duration, 0.0))
+            waveform_config = {
+                "sample_rate": sample_rate,
+                "segments": segments,
+                "marker_duration": marker_duration,
+            }
         start_time = time.perf_counter()
         for seed in seeds:
             candidate = self._evaluate_candidate(
                 int(seed),
                 reference_clipped,
-                waveform_payload=waveform_payload,
+                waveform_config=waveform_config,
             )
             reconstruction = np.asarray(candidate.reconstruction, dtype=np.float32)
             features = self._candidate_features(candidate, generation.index, previous_best_ssim)

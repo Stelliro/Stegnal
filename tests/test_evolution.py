@@ -145,7 +145,7 @@ def test_generation_metrics_track_sound_alignment() -> None:
     sample_rate = suggest_sample_rate(reference)
     segments, marker_duration = suggest_transmission_profile(reference)
     waveform = encode_image_to_waveform(
-        reference,
+        reconstruction,
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
