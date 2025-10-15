@@ -573,6 +573,7 @@ class UmbraDesktopApp:
         self._run_mode_var = tk.StringVar(value="finite")
         self._score_threshold = tk.DoubleVar(value=88.0)
         self._advanced_logging_var = tk.BooleanVar(value=False)
+        self._advanced_logging_enabled = bool(self._advanced_logging_var.get())
         self._primary_score_var = tk.StringVar(value="Sound score: –")
         self._readability_score_var = tk.StringVar(value="WAV readability score: –")
         self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
@@ -830,7 +831,8 @@ class UmbraDesktopApp:
         self._status_var.set("Evolution paused. Press start to resume.")
 
     def _handle_advanced_logging_toggle(self) -> None:
-        state = self._advanced_logging_var.get()
+        state = bool(self._advanced_logging_var.get())
+        self._advanced_logging_enabled = state
         if state:
             logger.info(
                 "Advanced logging enabled for audio reconstruction diagnostics."
@@ -892,7 +894,7 @@ class UmbraDesktopApp:
                     resolution=reconstruction.shape[:2],
                     segments=segments,
                     marker_duration=marker_duration,
-                    advanced_logging=self._advanced_logging_var.get(),
+                    advanced_logging=self._advanced_logging_enabled,
                 )
                 base_reference = (
                     self.reference_image if self.reference_image is not None else reconstruction
