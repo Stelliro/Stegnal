@@ -510,6 +510,7 @@ def reconstruct_from_waveform(
     sample_rate: int,
     segments: int | None = 1,
     marker_duration: float = 0.05,
+    advanced_logging: bool = False,
     return_segments: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, int]:
     """Approximate an RGB image from a mono waveform.
@@ -517,7 +518,9 @@ def reconstruct_from_waveform(
     When ``segments`` is ``None`` the decoder attempts to estimate how many
     fax-style stripes were transmitted by examining the waveform length. The
     ``return_segments`` flag can be used to retrieve the detected segment count
-    alongside the reconstructed image for bookkeeping purposes.
+    alongside the reconstructed image for bookkeeping purposes. Enabling
+    ``advanced_logging`` surfaces additional debug information that can help
+    diagnose decoding issues without polluting logs for standard workflows.
     """
 
     rows, cols = resolution
@@ -527,14 +530,36 @@ def reconstruct_from_waveform(
     if wave.size == 0:
         raise ValueError("Waveform must contain samples")
 
+    if advanced_logging:
+        logger.debug(
+            "Starting waveform reconstruction: samples=%d resolution=%s sample_rate=%d segments=%s marker_duration=%.5f",
+            wave.size,
+            resolution,
+            sample_rate,
+            "auto" if segments is None else int(segments),
+            marker_duration,
+        )
+
     if segments is None:
         safe_segments = _infer_segment_count(wave.size, sample_rate, marker_duration)
+        if advanced_logging:
+            logger.debug(
+                "Inferred %d segments from waveform length", safe_segments
+            )
     else:
         safe_segments = max(1, int(segments))
     marker_seconds = float(max(0.0, marker_duration))
     marker_samples = max(int(round(marker_seconds * sample_rate)), 0)
     payload_samples = max(sample_rate, 1)
     segment_length = marker_samples + payload_samples
+
+    if advanced_logging:
+        logger.debug(
+            "Segment configuration: marker_samples=%d payload_samples=%d segment_length=%d",
+            marker_samples,
+            payload_samples,
+            segment_length,
+        )
 
     if safe_segments == 1:
         usable = wave
@@ -545,11 +570,18 @@ def reconstruct_from_waveform(
         spectrum = np.abs(np.fft.rfft(usable, n=sample_rate))
         if spectrum.size == 0:
             raise ValueError("Unable to derive spectrum from waveform")
+        if advanced_logging:
+            logger.debug("Processed single-segment waveform for reconstruction")
     else:
         available_segments = max(1, wave.size // segment_length)
         available_segments = min(available_segments, safe_segments)
         if available_segments <= 0:
             raise ValueError("Waveform is shorter than one segment")
+
+        if advanced_logging:
+            logger.debug(
+                "Processing %d/%d available segments", available_segments, safe_segments
+            )
 
         stripes: list[np.ndarray] = []
         for idx in range(available_segments):
@@ -565,6 +597,15 @@ def reconstruct_from_waveform(
                 payload = payload[:payload_samples]
             spectrum = np.abs(np.fft.rfft(payload, n=payload_samples))
             stripes.append(spectrum.astype(np.float32))
+
+            if advanced_logging:
+                logger.debug(
+                    "Segment %d: start=%d end=%d payload_size=%d",
+                    idx + 1,
+                    start,
+                    min(end, wave.size),
+                    payload.size,
+                )
 
         total_pixels = rows * cols
         needed = total_pixels * 3
@@ -595,6 +636,11 @@ def reconstruct_from_waveform(
         spectrum = combined
         safe_segments = available_segments
 
+        if advanced_logging:
+            logger.debug(
+                "Combined %d stripes into %d values", len(stripes), spectrum.size
+            )
+
     spectrum = spectrum.astype(np.float32)
     max_val = float(spectrum.max())
     if max_val > 0:
@@ -611,7 +657,11 @@ def reconstruct_from_waveform(
     image = spectrum.reshape(3, rows, cols).transpose(1, 2, 0)
     reconstructed = np.clip(np.nan_to_num(image, nan=0.0), 0.0, 1.0).astype(np.float32)
     if return_segments:
+        if advanced_logging:
+            logger.debug("Reconstruction complete; returning segment count %d", safe_segments)
         return reconstructed, int(safe_segments)
+    if advanced_logging:
+        logger.debug("Reconstruction complete without segment count")
     return reconstructed
 
 

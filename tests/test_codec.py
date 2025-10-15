@@ -138,3 +138,19 @@ def test_decode_waveform_metadata_inference() -> None:
     metrics = compute_metrics(image, decoded)
     assert metrics.psnr > 0.0
 
+
+def test_decode_wav_bytes_supports_advanced_logging() -> None:
+    image = _random_image(size=6)
+    sample_rate = 4096
+
+    wav_bytes = encode_image_to_wav_bytes(image, sample_rate=sample_rate)
+    decoded, metadata = decode_wav_bytes_to_image(
+        wav_bytes,
+        resolution=image.shape[:2],
+        sample_rate=sample_rate,
+        return_metadata=True,
+        advanced_logging=True,
+    )
+
+    assert decoded.shape == image.shape
+    assert metadata.sample_rate == sample_rate

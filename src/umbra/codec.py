@@ -101,18 +101,29 @@ def decode_waveform_to_image(
     resolution: tuple[int, int],
     segments: int | None = 1,
     marker_duration: float = 0.05,
+    advanced_logging: bool = False,
 ) -> np.ndarray:
     """Decode ``waveform`` back into an RGB image."""
 
     rows, cols = resolution
     if rows <= 0 or cols <= 0:
         raise ValueError("resolution must contain positive dimensions")
+    if advanced_logging:
+        logger.debug(
+            "Decoding waveform with advanced logging: samples=%d resolution=%s sample_rate=%d segments=%s marker_duration=%.5f",
+            np.asarray(waveform).size,
+            resolution,
+            sample_rate,
+            "auto" if segments is None else int(segments),
+            marker_duration,
+        )
     image = reconstruct_from_waveform(
         waveform,
         resolution=(int(rows), int(cols)),
         sample_rate=int(sample_rate),
         segments=segments,
         marker_duration=float(marker_duration),
+        advanced_logging=advanced_logging,
     )
     return image.astype(np.float32)
 
@@ -125,6 +136,7 @@ def decode_wav_bytes_to_image(
     segments: int | None = 1,
     marker_duration: float = 0.05,
     return_metadata: bool = False,
+    advanced_logging: bool = False,
 ) -> tuple[np.ndarray, int] | tuple[np.ndarray, DecodedWavMetadata]:
     """Decode WAV ``data`` into an image.
 
@@ -148,6 +160,9 @@ def decode_wav_bytes_to_image(
         together with the segments and marker configuration used during
         reconstruction. The default behaviour preserves the legacy tuple of
         ``(image, sample_rate)``.
+    advanced_logging:
+        When ``True`` additional debug logging is emitted while reconstructing
+        the image, aiding investigations into problematic waveforms.
     """
 
     if not isinstance(data, (bytes, bytearray)):
@@ -155,12 +170,22 @@ def decode_wav_bytes_to_image(
 
     waveform, detected_rate = load_waveform_from_wav(bytes(data))
     target_rate = int(sample_rate or detected_rate)
+    if advanced_logging:
+        logger.debug(
+            "Loaded WAV bytes: detected_rate=%d override=%s resolution=%s segments=%s marker_duration=%.5f",
+            detected_rate,
+            sample_rate,
+            resolution,
+            "auto" if segments is None else int(segments),
+            marker_duration,
+        )
     reconstructed, used_segments = reconstruct_from_waveform(
         waveform,
         resolution=(int(resolution[0]), int(resolution[1])),
         sample_rate=target_rate,
         segments=segments,
         marker_duration=float(marker_duration),
+        advanced_logging=advanced_logging,
         return_segments=True,
     )
     logger.debug(

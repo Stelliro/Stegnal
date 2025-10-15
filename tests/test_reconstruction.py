@@ -76,3 +76,18 @@ def test_waveform_segment_detection() -> None:
     assert detected == 6
     assert recovered.shape == collage.shape
 
+
+def test_reconstruct_from_waveform_supports_advanced_logging() -> None:
+    collage, _ = generate_shape_collage(101, resolution=(32, 24))
+    waveform = image_to_waveform(collage, sample_rate=12_000, segments=2)
+
+    recovered = reconstruct_from_waveform(
+        waveform,
+        resolution=collage.shape[:2],
+        sample_rate=12_000,
+        segments=2,
+        advanced_logging=True,
+    )
+
+    assert recovered.shape == collage.shape
+
