@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from umbra import reconstruction
 from umbra.reconstruction import (
     create_variations,
     generate_shape_collage,
@@ -129,4 +130,30 @@ def test_generation_round_trip_with_mach_data() -> None:
     assert recovered.shape == mach_pattern.shape
     difference = np.mean(np.abs(recovered - mach_pattern))
     assert difference < 0.26
+
+
+def test_waveform_encoding_falls_back_to_numpy(monkeypatch) -> None:
+    stripe = np.ones((4, 4, 3), dtype=np.float32)
+    original_cp = reconstruction.cp
+
+    class BrokenCp:
+        float32 = np.float32
+        ndarray = np.ndarray
+
+        @staticmethod
+        def asarray(array: np.ndarray, dtype: np.dtype | None = None) -> np.ndarray:
+            raise RuntimeError("GPU backend unavailable")
+
+        @staticmethod
+        def asnumpy(array: np.ndarray) -> np.ndarray:
+            return np.asarray(array, dtype=np.float32)
+
+    monkeypatch.setattr(reconstruction, "cp", BrokenCp)
+    try:
+        waveform = reconstruction._encode_stripe_waveform(stripe, sample_count=16)
+    finally:
+        monkeypatch.setattr(reconstruction, "cp", original_cp)
+
+    assert waveform.shape == (16,)
+    assert np.isfinite(waveform).all()
 

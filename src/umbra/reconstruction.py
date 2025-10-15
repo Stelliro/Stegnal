@@ -327,30 +327,53 @@ def _encode_stripe_waveform(
     if sample_count <= 0:
         return np.zeros(0, dtype=np.float32)
 
-    xp = cp if cp is not None else np
+    backends: tuple[Any, ...]
+    if cp is not None:  # pragma: no branch - runtime guard
+        backends = (cp, np)
+    else:
+        backends = (np,)
 
-    weights = _as_backend([0.5, 0.35, 0.15], xp)
-    intensities = _as_backend(stripe, xp)[..., :3] @ weights
-    intensities = intensities.reshape(-1)
-    if intensities.size == 0:
-        return np.zeros(sample_count, dtype=np.float32)
+    last_error: Exception | None = None
+    for xp in backends:
+        try:
+            weights = _as_backend([0.5, 0.35, 0.15], xp)
+            intensities = _as_backend(stripe, xp)[..., :3] @ weights
+            intensities = intensities.reshape(-1)
+            if intensities.size == 0:
+                return np.zeros(sample_count, dtype=np.float32)
 
-    intensities -= intensities.min()
-    max_val = float(xp.max(intensities))
-    if max_val > 0:
-        intensities /= max_val
+            intensities -= intensities.min()
+            max_val = float(xp.max(intensities))
+            if max_val > 0:
+                intensities /= max_val
 
-    bins = sample_count // 2 + 1
-    xp_lin = xp.linspace(0.0, max(float(intensities.size - 1), 0.0), bins, dtype=xp.float32)
-    xp_idx = xp.arange(intensities.size, dtype=xp.float32)
-    spectrum = xp.interp(xp_lin, xp_idx, intensities)
-    waveform = xp.fft.irfft(spectrum, n=sample_count)
-    if waveform.size < sample_count:
-        waveform = xp.pad(waveform, (0, sample_count - waveform.size))
-    peak = float(xp.max(xp.abs(waveform)))
-    if peak > 0:
-        waveform /= peak
-    return _to_numpy(waveform)
+            bins = sample_count // 2 + 1
+            xp_lin = xp.linspace(
+                0.0,
+                max(float(intensities.size - 1), 0.0),
+                bins,
+                dtype=xp.float32,
+            )
+            xp_idx = xp.arange(intensities.size, dtype=xp.float32)
+            spectrum = xp.interp(xp_lin, xp_idx, intensities)
+            waveform = xp.fft.irfft(spectrum, n=sample_count)
+            if waveform.size < sample_count:
+                waveform = xp.pad(waveform, (0, sample_count - waveform.size))
+            peak = float(xp.max(xp.abs(waveform)))
+            if peak > 0:
+                waveform /= peak
+            return _to_numpy(waveform)
+        except Exception as exc:  # pragma: no cover - backend fallback
+            last_error = exc
+            if xp is cp:
+                logger.debug(
+                    "Falling back to NumPy for stripe waveform encoding: %s", exc
+                )
+                continue
+            raise
+
+    assert last_error is not None  # pragma: no cover - defensive
+    raise last_error
 
 
 def _marker_tone(
