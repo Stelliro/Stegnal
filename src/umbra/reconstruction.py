@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,10 @@ logger = logging.getLogger(__name__)
 # experiments flexible while bounding allocations to roughly 600 * sample_rate
 # samples (≈115 MB at 48 kHz float32).
 _MAX_FAX_DURATION_SECONDS = 600.0
+_MARKER_BASE_FREQUENCY = 1_600.0
+_MARKER_STEP_FREQUENCY = 220.0
+_MARKER_RATIO_BAND = 180.0
+_SEGMENT_RATIO_MIN = 0.05
 
 
 def suggest_sample_rate(image: np.ndarray) -> int:
@@ -376,24 +381,243 @@ def _encode_stripe_waveform(
     raise last_error
 
 
+def segment_image_rows(
+    image: np.ndarray, segments: int, *, minimum_rows: int = 8
+) -> list[tuple[int, int, float]]:
+    """Return adaptive row ranges for ``image`` split into ``segments`` parts."""
+
+    array = np.asarray(image, dtype=np.float32)
+    if array.ndim != 3:
+        raise ValueError("segment_image_rows expects an RGB image")
+
+    total_rows = int(array.shape[0])
+    if total_rows <= 0:
+        raise ValueError("image must contain at least one row")
+
+    safe_segments = max(1, int(segments))
+    if safe_segments == 1:
+        return [(0, total_rows, 1.0)]
+
+    gray = np.mean(array[..., :3], axis=2, dtype=np.float32)
+    diffs = np.abs(np.diff(gray, axis=0))
+    if diffs.size == 0:
+        stripe_height = int(np.ceil(total_rows / safe_segments))
+        slices: list[tuple[int, int, float]] = []
+        for idx in range(safe_segments):
+            start = min(idx * stripe_height, max(total_rows - 1, 0))
+            end = min(start + stripe_height, total_rows)
+            if idx == safe_segments - 1:
+                end = total_rows
+            height = max(end - start, 1)
+            slices.append((start, end, height / float(total_rows)))
+        return slices
+
+    energy = diffs.mean(axis=1)
+    energy = np.where(np.isfinite(energy), energy, 0.0)
+    energy = np.maximum(energy, 1e-6)
+    cumulative = np.cumsum(energy)
+    total_energy = float(cumulative[-1])
+    if total_energy <= 0:
+        total_energy = float(total_rows)
+        cumulative = np.arange(1, total_rows, dtype=np.float32)
+
+    boundaries: list[int] = []
+    for idx in range(1, safe_segments):
+        target = total_energy * (idx / safe_segments)
+        boundary = int(np.searchsorted(cumulative, target, side="left")) + 1
+        boundaries.append(boundary)
+
+    min_rows = max(int(minimum_rows), 1)
+    adjusted: list[int] = []
+    last = 0
+    for boundary in boundaries:
+        boundary = max(boundary, last + min_rows)
+        if boundary >= total_rows - min_rows:
+            break
+        adjusted.append(boundary)
+        last = boundary
+
+    adjusted = sorted(set(adjusted))
+    if len(adjusted) < safe_segments - 1:
+        stripe_height = int(np.ceil(total_rows / safe_segments))
+        while len(adjusted) < safe_segments - 1:
+            candidate = (len(adjusted) + 1) * stripe_height
+            if candidate >= total_rows - min_rows:
+                break
+            adjusted.append(candidate)
+        adjusted = sorted(set(adjusted))
+
+    start = 0
+    slices: list[tuple[int, int, float]] = []
+    for boundary in adjusted:
+        end = min(boundary, total_rows)
+        height = max(end - start, min_rows)
+        if end - start < min_rows and end < total_rows:
+            end = min(total_rows, start + min_rows)
+        height = max(end - start, 1)
+        slices.append((start, end, height / float(total_rows)))
+        start = end
+
+    if start < total_rows:
+        height = max(total_rows - start, 1)
+        slices.append((start, total_rows, height / float(total_rows)))
+
+    if len(slices) > safe_segments:
+        slices = slices[: safe_segments - 1] + [(slices[-1][0], total_rows, 1.0)]
+
+    while len(slices) < safe_segments:
+        slices.append((slices[-1][0], total_rows, (total_rows - slices[-1][0]) / float(total_rows)))
+
+    ratio_total = sum(max(segment[2], _SEGMENT_RATIO_MIN) for segment in slices)
+    if ratio_total <= 0:
+        ratio_total = float(len(slices))
+
+    normalised: list[tuple[int, int, float]] = []
+    cursor = 0
+    for idx, (start_row, end_row, ratio) in enumerate(slices):
+        start_row = max(start_row, cursor)
+        if idx == safe_segments - 1:
+            end_row = total_rows
+        else:
+            end_row = min(max(end_row, start_row + min_rows), total_rows)
+        if end_row <= start_row:
+            end_row = min(total_rows, start_row + min_rows)
+        cursor = end_row
+        height = max(end_row - start_row, 1)
+        clamped = max(float(ratio), _SEGMENT_RATIO_MIN)
+        normalised.append((start_row, end_row, clamped / ratio_total))
+
+    if normalised[-1][1] != total_rows:
+        start_row, _end_row, ratio = normalised[-1]
+        normalised[-1] = (start_row, total_rows, max(total_rows - start_row, 1) / float(total_rows))
+
+    return normalised[:safe_segments]
+
+
 def _marker_tone(
     *,
     sample_rate: int,
     marker_samples: int,
     index: int,
-    base_frequency: float = 1_600.0,
-    step: float = 220.0,
+    segment_ratio: float | None = None,
 ) -> np.ndarray:
     """Return a short sinusoidal marker identifying ``index``."""
 
     if marker_samples <= 0:
         return np.zeros(0, dtype=np.float32)
-    frequency = max(base_frequency + index * step, 80.0)
+
+    frequency = _MARKER_BASE_FREQUENCY + index * _MARKER_STEP_FREQUENCY
+    if segment_ratio is not None:
+        encoded = float(np.clip(segment_ratio, _SEGMENT_RATIO_MIN, 1.0))
+        frequency += encoded * _MARKER_RATIO_BAND
+
+    frequency = max(frequency, 80.0)
     t = np.linspace(0.0, marker_samples / sample_rate, marker_samples, endpoint=False)
     envelope = np.linspace(0.2, 1.0, marker_samples, dtype=np.float32)
     tone = np.sin(2 * np.pi * frequency * t)
     tone = tone.astype(np.float32) * envelope
     return tone
+
+
+def _estimate_marker_ratio(
+    marker: np.ndarray, *, index: int, sample_rate: int
+) -> float:
+    """Return the encoded segment ratio from ``marker`` if present."""
+
+    samples = np.asarray(marker, dtype=np.float32)
+    if samples.size <= 1:
+        return float("nan")
+
+    spectrum = np.abs(np.fft.rfft(samples))
+    if spectrum.size <= 1:
+        return float("nan")
+
+    spectrum[0] = 0.0
+    peak_index = int(np.argmax(spectrum))
+    freqs = np.fft.rfftfreq(samples.size, d=1.0 / float(sample_rate))
+    if peak_index >= freqs.size:
+        return float("nan")
+
+    peak_frequency = float(freqs[peak_index])
+    base_frequency = _MARKER_BASE_FREQUENCY + index * _MARKER_STEP_FREQUENCY
+    if _MARKER_RATIO_BAND <= 0:
+        return float("nan")
+    return (peak_frequency - base_frequency) / float(_MARKER_RATIO_BAND)
+
+
+def _normalise_segment_heights(
+    ratios: Sequence[float], *, rows: int, segments: int
+) -> list[int]:
+    """Convert ``ratios`` into integer stripe heights covering ``rows``."""
+
+    if rows <= 0:
+        return [1] * max(int(segments), 1)
+
+    if not ratios:
+        base = max(1, int(np.ceil(rows / max(segments, 1))))
+        return [base for _ in range(max(segments, 1))]
+
+    clamped = [
+        float(np.clip(ratio, _SEGMENT_RATIO_MIN, 1.0))
+        if np.isfinite(ratio)
+        else 1.0
+        for ratio in ratios
+    ]
+    total = sum(clamped)
+    if total <= 0:
+        clamped = [1.0 for _ in clamped]
+        total = float(len(clamped))
+
+    scale = rows / total
+    heights = [max(1, int(round(value * scale))) for value in clamped]
+    if not heights:
+        heights = [max(1, int(np.ceil(rows / max(segments, 1)))) for _ in range(max(segments, 1))]
+
+    diff = rows - sum(heights)
+    if diff != 0:
+        order = sorted(range(len(heights)), key=lambda idx: clamped[idx], reverse=True)
+        while diff > 0:
+            for idx in order:
+                heights[idx] += 1
+                diff -= 1
+                if diff == 0:
+                    break
+        while diff < 0:
+            candidates = [idx for idx in order if heights[idx] > 1]
+            if not candidates:
+                break
+            for idx in candidates:
+                if diff == 0:
+                    break
+                heights[idx] -= 1
+                diff += 1
+
+    if len(heights) < segments:
+        heights.extend([heights[-1] if heights else 1] * (segments - len(heights)))
+
+    return heights[:segments]
+
+
+def _decode_stripe_heights(
+    markers: Sequence[np.ndarray],
+    *,
+    rows: int,
+    sample_rate: int,
+    marker_samples: int,
+    segments: int,
+) -> list[int]:
+    """Infer stripe heights from encoded ``markers``."""
+
+    if marker_samples <= 0 or not markers:
+        base = max(1, int(np.ceil(rows / max(segments, 1))))
+        return [base for _ in range(max(segments, 1))]
+
+    ratios = [
+        _estimate_marker_ratio(marker[:marker_samples], index=idx, sample_rate=sample_rate)
+        for idx, marker in enumerate(markers)
+    ]
+
+    return _normalise_segment_heights(ratios, rows=rows, segments=max(segments, len(ratios)))
 
 
 def image_to_waveform(
@@ -444,15 +668,18 @@ def image_to_waveform(
         return waveform.astype(np.float32, copy=False)
 
     rows = array.shape[0]
-    stripe_height = int(np.ceil(rows / safe_segments))
+    segments_spec = segment_image_rows(array, safe_segments)
+    logger.debug(
+        "Segmenting image into %d stripes with adaptive rows: %s",
+        safe_segments,
+        [end - start for start, end, _ in segments_spec],
+    )
     segments_wave: list[np.ndarray] = []
     total_samples = 0
-    for idx in range(safe_segments):
+    for idx, (start_row, end_row, ratio) in enumerate(segments_spec):
         remaining = max_total_samples - total_samples
         if remaining <= 0:
             break
-        start_row = idx * stripe_height
-        end_row = min(rows, start_row + stripe_height)
         if start_row >= rows:
             stripe = array[-1:]
         else:
@@ -462,6 +689,7 @@ def image_to_waveform(
             sample_rate=sample_rate,
             marker_samples=marker_samples,
             index=idx,
+            segment_ratio=ratio,
         )
         segment_wave = np.concatenate(
             [marker.astype(np.float32), stripe_wave.astype(np.float32)]
@@ -607,12 +835,14 @@ def reconstruct_from_waveform(
             )
 
         stripes: list[np.ndarray] = []
+        markers: list[np.ndarray] = []
         for idx in range(available_segments):
             start = idx * segment_length
             end = start + segment_length
             segment_wave = wave[start:end]
             if segment_wave.size < segment_length:
                 segment_wave = np.pad(segment_wave, (0, segment_length - segment_wave.size))
+            marker = segment_wave[:marker_samples]
             payload = segment_wave[marker_samples : marker_samples + payload_samples]
             if payload.size < payload_samples:
                 payload = np.pad(payload, (0, payload_samples - payload.size))
@@ -620,6 +850,7 @@ def reconstruct_from_waveform(
                 payload = payload[:payload_samples]
             spectrum = np.abs(np.fft.rfft(payload, n=payload_samples))
             stripes.append(spectrum.astype(np.float32))
+            markers.append(np.asarray(marker, dtype=np.float32))
 
             if advanced_logging:
                 logger.debug(
@@ -633,25 +864,37 @@ def reconstruct_from_waveform(
         total_pixels = rows * cols
         needed = total_pixels * 3
         combined = np.zeros(needed, dtype=np.float32)
-        stripe_height = int(np.ceil(rows / available_segments))
+        stripe_heights = _decode_stripe_heights(
+            markers,
+            rows=rows,
+            sample_rate=sample_rate,
+            marker_samples=marker_samples,
+            segments=available_segments,
+        )
+        if advanced_logging:
+            logger.debug("Decoded adaptive stripe heights (rows): %s", stripe_heights)
         cursor = 0
-        for idx, spectrum in enumerate(stripes):
-            start_row = idx * stripe_height
-            end_row = min(rows, start_row + stripe_height)
+        start_row = 0
+        for idx, (spectrum_values, stripe_rows) in enumerate(zip(stripes, stripe_heights)):
             if start_row >= rows:
                 break
-            stripe_rows = max(end_row - start_row, 1)
+            remaining_rows = rows - start_row
+            stripe_rows = max(1, int(stripe_rows))
+            if idx == available_segments - 1 or stripe_rows > remaining_rows:
+                stripe_rows = remaining_rows
+            stripe_rows = max(stripe_rows, 1)
             stripe_pixels = stripe_rows * cols * 3
-            xp = np.linspace(0, max(spectrum.size - 1, 0), stripe_pixels)
-            source_idx = np.arange(spectrum.size, dtype=np.float32)
+            xp = np.linspace(0, max(spectrum_values.size - 1, 0), stripe_pixels)
+            source_idx = np.arange(spectrum_values.size, dtype=np.float32)
             stripe_values = np.interp(
                 xp,
                 source_idx if source_idx.size else np.array([0.0], dtype=np.float32),
-                spectrum,
+                spectrum_values,
             )
             end_cursor = min(cursor + stripe_pixels, needed)
             combined[cursor:end_cursor] = stripe_values[: end_cursor - cursor]
             cursor = end_cursor
+            start_row = min(rows, start_row + stripe_rows)
             if cursor >= needed:
                 break
         if cursor < needed and cursor > 0:
@@ -790,6 +1033,7 @@ __all__ = [
     "generate_shape_collage",
     "image_to_waveform",
     "predict_missing_pixels",
+    "segment_image_rows",
     "tiled_reconstruction",
     "reconstruct_from_waveform",
     "run_reconstruction_cycle",

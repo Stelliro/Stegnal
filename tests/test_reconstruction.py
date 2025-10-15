@@ -78,6 +78,21 @@ def test_waveform_segment_detection() -> None:
     assert recovered.shape == collage.shape
 
 
+def test_segment_image_rows_respects_contrast() -> None:
+    bright = np.ones((160, 64, 3), dtype=np.float32)
+    dark = np.zeros((32, 64, 3), dtype=np.float32)
+    gradient = np.linspace(0.0, 1.0, 64, dtype=np.float32)[None, :, None]
+    transition = np.repeat(gradient, 40, axis=0)
+    transition = np.repeat(transition, 3, axis=2)
+    image = np.vstack([bright, transition, dark])
+
+    segments = reconstruction.segment_image_rows(image, 5)
+    assert len(segments) == 5
+    heights = [end - start for start, end, _ in segments]
+    assert sum(heights) == image.shape[0]
+    assert max(heights) != min(heights)
+
+
 def test_reconstruct_from_waveform_supports_advanced_logging() -> None:
     collage, _ = generate_shape_collage(101, resolution=(32, 24))
     waveform = image_to_waveform(collage, sample_rate=12_000, segments=2)

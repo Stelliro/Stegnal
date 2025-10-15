@@ -93,16 +93,14 @@ _PINTEREST_THEME_FEEDS: dict[str, str] = {
     "technology": "https://www.pinterest.com/ideas/technology-art/945348402094/",
 }
 _PINTEREST_SIZE_SEQUENCE: tuple[int, ...] = (
-    64,
-    128,
-    256,
-    512,
-    1024,
     2048,
+    3072,
     4096,
+    6144,
     8192,
-    16384,
-    24576,
+    12_288,
+    16_384,
+    24_576,
 )
 _PINTEREST_DATASET_STATE_VERSION = 1
 _PINTEREST_IMAGE_PATTERN = re.compile(r"https://i\\.pinimg\\.com/[^'\"\\s>]+")
@@ -132,6 +130,8 @@ class PinterestDatasetEntry:
     size_bytes: int
     uses: int = 0
     size_index: int = 0
+    width: int = 0
+    height: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +143,8 @@ class PinterestDatasetEntry:
             "size_bytes": int(self.size_bytes),
             "uses": int(self.uses),
             "size_index": int(self.size_index),
+            "width": int(self.width),
+            "height": int(self.height),
         }
 
     @classmethod
@@ -156,6 +158,8 @@ class PinterestDatasetEntry:
             size_bytes=int(payload.get("size_bytes", 0)),
             uses=int(payload.get("uses", 0)),
             size_index=int(payload.get("size_index", 0)),
+            width=int(payload.get("width", 0)),
+            height=int(payload.get("height", 0)),
         )
 
 
@@ -194,9 +198,12 @@ class PinterestDatasetManager:
         root: Path,
         feed_sources: Mapping[str, str] | None = None,
         dataset_limit_bytes: int = 1_000_000_000,
-        uses_per_image: int = 5,
+        uses_per_image: int | None = None,
         size_sequence: Sequence[int] = _PINTEREST_SIZE_SEQUENCE,
         max_preview_pixels: int = 16_000_000,
+        pool_size: int = 5,
+        cycles_per_image: int = 5,
+        min_edge: int = 2048,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -205,16 +212,25 @@ class PinterestDatasetManager:
             or dict(_PINTEREST_THEME_FEEDS)
         )
         self.dataset_limit_bytes = int(max(dataset_limit_bytes, 1))
-        self.uses_per_image = max(int(uses_per_image), 1)
+        self.pool_size = max(int(pool_size), 1)
+        self.cycles_per_image = max(int(cycles_per_image), 1)
+        resolved_uses = (
+            self.cycles_per_image if uses_per_image is None else max(int(uses_per_image), 1)
+        )
+        self.uses_per_image = resolved_uses
+        self.min_edge = max(int(min_edge), 1)
         self.size_sequence: tuple[int, ...] = tuple(
-            size for size in (size_sequence or _PINTEREST_SIZE_SEQUENCE) if size > 0
-        ) or _PINTEREST_SIZE_SEQUENCE
+            max(int(size), self.min_edge)
+            for size in (size_sequence or _PINTEREST_SIZE_SEQUENCE)
+            if int(size) > 0
+        ) or tuple(max(size, self.min_edge) for size in _PINTEREST_SIZE_SEQUENCE)
         self.max_preview_pixels = max(int(max_preview_pixels), 262_144)
         self._lock = threading.Lock()
         self._state_path = self.root / "state.json"
         self._archive_path = self.root / "archive.json"
         self._state = self._load_state()
         self._archive = self._load_archive()
+        self._used_urls: set[str] = set(self._state.get("used_urls", []))
         self._builder_thread: threading.Thread | None = None
         self._first_entry_ready = threading.Event()
         self._build_status: dict[str, Any] = {}
@@ -226,6 +242,8 @@ class PinterestDatasetManager:
                 "version": _PINTEREST_DATASET_STATE_VERSION,
                 "dataset_id": None,
                 "entries": [],
+                "rotation": {"queue": [], "index": 0},
+                "used_urls": [],
             }
         try:
             data = json.loads(self._state_path.read_text())
@@ -235,13 +253,19 @@ class PinterestDatasetManager:
                 "version": _PINTEREST_DATASET_STATE_VERSION,
                 "dataset_id": None,
                 "entries": [],
+                "rotation": {"queue": [], "index": 0},
+                "used_urls": [],
             }
         if data.get("version") != _PINTEREST_DATASET_STATE_VERSION:
             return {
                 "version": _PINTEREST_DATASET_STATE_VERSION,
                 "dataset_id": data.get("dataset_id"),
                 "entries": data.get("entries", []),
+                "rotation": data.get("rotation", {"queue": [], "index": 0}),
+                "used_urls": data.get("used_urls", []),
             }
+        data.setdefault("rotation", {"queue": [], "index": 0})
+        data.setdefault("used_urls", [])
         return data
 
     def _save_state(self) -> None:
@@ -254,8 +278,85 @@ class PinterestDatasetManager:
                 else entry.to_dict()
                 for entry in self._state.get("entries", [])
             ],
+            "rotation": {
+                "queue": list(self._rotation_state().get("queue", [])),
+                "index": int(self._rotation_state().get("index", 0)),
+            },
+            "used_urls": sorted(self._used_urls),
         }
         self._state_path.write_text(json.dumps(payload, indent=2))
+
+    def _rotation_state(self) -> dict[str, Any]:
+        rotation = self._state.get("rotation")
+        if not isinstance(rotation, Mapping):
+            rotation = {"queue": [], "index": 0}
+        queue = [str(identifier) for identifier in rotation.get("queue", [])]
+        index = int(rotation.get("index", 0)) if rotation else 0
+        normalised = {"queue": queue, "index": index}
+        self._state["rotation"] = normalised
+        return normalised
+
+    def _ensure_rotation_queue_locked(
+        self, entries: Sequence[PinterestDatasetEntry]
+    ) -> None:
+        rotation = self._rotation_state()
+        available = {
+            entry.identifier
+            for entry in entries
+            if entry.uses < self.cycles_per_image
+        }
+        queue = [identifier for identifier in rotation.get("queue", []) if identifier in available]
+
+        desired = min(len(available), self.pool_size)
+        if desired <= 0:
+            rotation["queue"] = []
+            rotation["index"] = 0
+            self._state["rotation"] = rotation
+            return
+
+        if len(queue) < desired:
+            candidates = [
+                entry
+                for entry in entries
+                if entry.identifier not in queue and entry.uses < self.cycles_per_image
+            ]
+            candidates.sort(key=lambda entry: (entry.uses, entry.identifier))
+            for entry in candidates:
+                if len(queue) >= desired:
+                    break
+                queue.append(entry.identifier)
+
+        rotation["queue"] = queue[:desired]
+        if rotation["queue"]:
+            rotation["index"] = rotation.get("index", 0) % len(rotation["queue"])
+        else:
+            rotation["index"] = 0
+        self._state["rotation"] = rotation
+
+    def _pop_rotation_entry_locked(self) -> tuple[str | None, PinterestDatasetEntry | None]:
+        dataset_id = self._state.get("dataset_id")
+        if not dataset_id:
+            return None, None
+        entries = [
+            PinterestDatasetEntry.from_dict(entry)
+            for entry in self._state.get("entries", [])
+        ]
+        if not entries:
+            return dataset_id, None
+        self._ensure_rotation_queue_locked(entries)
+        rotation = self._rotation_state()
+        queue = rotation.get("queue", [])
+        if not queue:
+            rotation["index"] = 0
+            self._state["rotation"] = rotation
+            return dataset_id, None
+        index = int(rotation.get("index", 0)) % len(queue)
+        identifier = queue[index]
+        rotation["index"] = (index + 1) % len(queue) if queue else 0
+        self._state["rotation"] = rotation
+        entry = next((item for item in entries if item.identifier == identifier), None)
+        self._save_state()
+        return dataset_id, entry
 
     def _load_archive(self) -> list[dict[str, Any]]:
         if not self._archive_path.exists():
@@ -330,6 +431,8 @@ class PinterestDatasetManager:
                 "version": _PINTEREST_DATASET_STATE_VERSION,
                 "dataset_id": dataset_id,
                 "entries": [],
+                "rotation": {"queue": [], "index": 0},
+                "used_urls": sorted(self._used_urls),
             }
             self._save_state()
             self._build_status = {
@@ -355,10 +458,14 @@ class PinterestDatasetManager:
                 random.shuffle(candidates)
                 for image_url, label in candidates:
                     normalized = _normalize_pinterest_url(image_url)
+                    if normalized in self._used_urls:
+                        continue
                     if any(entry.url == normalized for entry in entries):
                         continue
                     try:
-                        image_bytes = self._download_image_variant(normalized, referer=feed_url)
+                        image_bytes, (width, height) = self._download_image_variant(
+                            normalized, referer=feed_url
+                        )
                     except PinterestDownloadError:
                         continue
                     if not image_bytes:
@@ -387,6 +494,8 @@ class PinterestDatasetManager:
                         theme=theme,
                         filename=filename,
                         size_bytes=file_size,
+                        width=int(width),
+                        height=int(height),
                     )
                     entries.append(entry)
                     total_bytes += file_size
@@ -418,6 +527,8 @@ class PinterestDatasetManager:
                     "version": _PINTEREST_DATASET_STATE_VERSION,
                     "dataset_id": dataset_id,
                     "entries": [entry.to_dict() for entry in entries],
+                    "rotation": {"queue": [], "index": 0},
+                    "used_urls": sorted(self._used_urls),
                 }
                 self._save_state()
                 self._build_status = {
@@ -441,12 +552,16 @@ class PinterestDatasetManager:
                         "version": _PINTEREST_DATASET_STATE_VERSION,
                         "dataset_id": dataset_id,
                         "entries": [entry.to_dict() for entry in entries],
+                        "rotation": {"queue": [], "index": 0},
+                        "used_urls": sorted(self._used_urls),
                     }
                 else:
                     self._state = {
                         "version": _PINTEREST_DATASET_STATE_VERSION,
                         "dataset_id": None,
                         "entries": [],
+                        "rotation": {"queue": [], "index": 0},
+                        "used_urls": sorted(self._used_urls),
                     }
                 self._save_state()
         finally:
@@ -455,7 +570,9 @@ class PinterestDatasetManager:
             with self._lock:
                 self._builder_thread = None
 
-    def _download_image_variant(self, url: str, *, referer: str | None = None) -> bytes:
+    def _download_image_variant(
+        self, url: str, *, referer: str | None = None
+    ) -> tuple[bytes, tuple[int, int]]:
         candidates = [url]
         for replacement in ("/originals/", "/1200x/", "/736x/", "/564x/", "/474x/", "/236x/"):
             if "/" in url:
@@ -466,20 +583,18 @@ class PinterestDatasetManager:
         referer_value = referer or "https://www.pinterest.com/"
         for candidate in dict.fromkeys(candidates):
             try:
-                return _download_bytes(candidate, timeout=15.0, referer=referer_value)
+                data = _download_bytes(candidate, timeout=15.0, referer=referer_value)
             except PinterestDownloadError:
                 continue
+            try:
+                with Image.open(BytesIO(data)) as image:
+                    width, height = image.size
+            except Exception:
+                continue
+            if min(width, height) < self.min_edge:
+                continue
+            return data, (int(width), int(height))
         raise PinterestDownloadError(f"Unable to download image {url}")
-
-    # ------------------------------------------------------------------ acquisition helpers
-    def _select_entry(self) -> PinterestDatasetEntry | None:
-        entries = [PinterestDatasetEntry.from_dict(entry) for entry in self._state.get("entries", [])]
-        available = [entry for entry in entries if entry.uses < self.uses_per_image]
-        if not available:
-            return None
-        available.sort(key=lambda entry: (entry.uses, entry.identifier))
-        chosen = available[0]
-        return chosen
 
     def _update_entry(self, updated: PinterestDatasetEntry) -> None:
         entries = [PinterestDatasetEntry.from_dict(entry) for entry in self._state.get("entries", [])]
@@ -488,7 +603,22 @@ class PinterestDatasetManager:
                 entries[index] = updated
                 break
         self._state["entries"] = [entry.to_dict() for entry in entries]
+        if updated.uses >= self.cycles_per_image:
+            self._retire_entry_locked(updated)
+        else:
+            self._state["used_urls"] = sorted(self._used_urls)
         self._save_state()
+
+    def _retire_entry_locked(self, entry: PinterestDatasetEntry) -> None:
+        rotation = self._rotation_state()
+        rotation["queue"] = [identifier for identifier in rotation.get("queue", []) if identifier != entry.identifier]
+        if rotation["queue"]:
+            rotation["index"] = rotation.get("index", 0) % len(rotation["queue"])
+        else:
+            rotation["index"] = 0
+        self._state["rotation"] = rotation
+        self._used_urls.add(entry.url)
+        self._state["used_urls"] = sorted(self._used_urls)
 
     def _archive_current_dataset(self) -> None:
         dataset_id = self._state.get("dataset_id")
@@ -519,6 +649,8 @@ class PinterestDatasetManager:
             "version": _PINTEREST_DATASET_STATE_VERSION,
             "dataset_id": None,
             "entries": [],
+            "rotation": {"queue": [], "index": 0},
+            "used_urls": sorted(self._used_urls),
         }
         self._save_state()
         self._save_archive()
@@ -533,8 +665,7 @@ class PinterestDatasetManager:
         self._ensure_dataset()
         while True:
             with self._lock:
-                dataset_id = self._state.get("dataset_id")
-                entry = self._select_entry()
+                dataset_id, entry = self._pop_rotation_entry_locked()
             if dataset_id and entry is not None:
                 directory = self._dataset_dir(str(dataset_id))
                 image_path = directory / entry.filename
@@ -548,10 +679,10 @@ class PinterestDatasetManager:
                 with self._lock:
                     entry.uses += 1
                     entry.size_index = (entry.size_index + 1) % len(self.size_sequence)
-                    remaining = max(self.uses_per_image - entry.uses, 0)
+                    remaining = max(self.cycles_per_image - entry.uses, 0)
                     self._update_entry(entry)
                     exhausted = all(
-                        PinterestDatasetEntry.from_dict(candidate).uses >= self.uses_per_image
+                        PinterestDatasetEntry.from_dict(candidate).uses >= self.cycles_per_image
                         for candidate in self._state.get("entries", [])
                     )
                     if exhausted:
@@ -583,6 +714,7 @@ class PinterestDatasetManager:
         self, path: Path, entry: PinterestDatasetEntry
     ) -> tuple[np.ndarray, int, int]:
         target_edge = self.size_sequence[entry.size_index % len(self.size_sequence)]
+        target_edge = max(int(target_edge), self.min_edge)
         with Image.open(path) as image:
             converted = image.convert("RGB")
             width, height = converted.size

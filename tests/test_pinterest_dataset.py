@@ -14,9 +14,11 @@ def test_dataset_manager_cycles_and_archives(tmp_path) -> None:
     manager = PinterestDatasetManager(
         root=root,
         feed_sources={},
-        uses_per_image=5,
         size_sequence=(64,),
         max_preview_pixels=128 * 128,
+        pool_size=1,
+        cycles_per_image=5,
+        min_edge=1,
     )
     dataset_id = "manual"
     dataset_dir = root / dataset_id
@@ -31,12 +33,17 @@ def test_dataset_manager_cycles_and_archives(tmp_path) -> None:
         theme="unit-test",
         filename=image_path.name,
         size_bytes=image_path.stat().st_size,
+        width=8,
+        height=8,
     )
     manager._state = {
         "version": 1,
         "dataset_id": dataset_id,
         "entries": [entry.to_dict()],
+        "rotation": {"queue": [entry.identifier], "index": 0},
+        "used_urls": [],
     }
+    manager._used_urls = set()
     manager._save_state()
 
     use_indices: list[int] = []
@@ -56,9 +63,11 @@ def test_dataset_manager_respects_size_sequence(tmp_path) -> None:
     manager = PinterestDatasetManager(
         root=root,
         feed_sources={},
-        uses_per_image=3,
         size_sequence=(64, 128, 512),
         max_preview_pixels=512 * 512,
+        pool_size=1,
+        cycles_per_image=3,
+        min_edge=1,
     )
     dataset_id = "sequence"
     dataset_dir = root / dataset_id
@@ -73,12 +82,17 @@ def test_dataset_manager_respects_size_sequence(tmp_path) -> None:
         theme="unit-test",
         filename=image_path.name,
         size_bytes=image_path.stat().st_size,
+        width=8,
+        height=8,
     )
     manager._state = {
         "version": 1,
         "dataset_id": dataset_id,
         "entries": [entry.to_dict()],
+        "rotation": {"queue": [entry.identifier], "index": 0},
+        "used_urls": [],
     }
+    manager._used_urls = set()
     manager._save_state()
 
     declared_edges: list[int] = []
