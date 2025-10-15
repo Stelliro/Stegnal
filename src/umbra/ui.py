@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import datetime
 import html
 import json
 import logging
@@ -13,6 +14,7 @@ import queue
 import random
 import re
 import secrets
+import shutil
 import string
 import sys
 import threading
@@ -22,7 +24,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import OrderedDict, deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -78,6 +80,27 @@ _PINTEREST_USER_AGENT = (
 _PINTEREST_DEFAULT_FEEDS = (
     "https://www.pinterest.com/ideas/pictures-of-the-universe/935563701058/",
 )
+_PINTEREST_THEME_FEEDS: dict[str, str] = {
+    "cosmos": "https://www.pinterest.com/ideas/pictures-of-the-universe/935563701058/",
+    "architecture": "https://www.pinterest.com/ideas/futuristic-architecture/929517069328/",
+    "wildlife": "https://www.pinterest.com/ideas/wildlife-photography/918017224616/",
+    "abstract": "https://www.pinterest.com/ideas/abstract-art/913507195182/",
+    "landscape": "https://www.pinterest.com/ideas/nature-photography/908094929974/",
+    "technology": "https://www.pinterest.com/ideas/technology-art/945348402094/",
+}
+_PINTEREST_SIZE_SEQUENCE: tuple[int, ...] = (
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    24576,
+)
+_PINTEREST_DATASET_STATE_VERSION = 1
 _PINTEREST_IMAGE_PATTERN = re.compile(r"https://i\\.pinimg\\.com/[^'\"\\s>]+")
 _PINTEREST_IMAGE_TAG_PATTERN = re.compile(
     r"<img[^>]+src=\"(?P<url>https://i\\.pinimg\\.com/[^\"]+)\"[^>]*alt=\"(?P<title>[^\"]*)\"",
@@ -91,6 +114,378 @@ _PINTEREST_JSON_SCRIPT_PATTERN = re.compile(
 
 class PinterestDownloadError(RuntimeError):
     """Raised when a Pinterest download fails."""
+
+
+@dataclass
+class PinterestDatasetEntry:
+    """Metadata describing a cached Pinterest image on disk."""
+
+    identifier: str
+    url: str
+    label: str
+    theme: str
+    filename: str
+    size_bytes: int
+    uses: int = 0
+    size_index: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "identifier": self.identifier,
+            "url": self.url,
+            "label": self.label,
+            "theme": self.theme,
+            "filename": self.filename,
+            "size_bytes": int(self.size_bytes),
+            "uses": int(self.uses),
+            "size_index": int(self.size_index),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> PinterestDatasetEntry:
+        return cls(
+            identifier=str(payload.get("identifier", "")),
+            url=str(payload.get("url", "")),
+            label=str(payload.get("label", "Pinterest inspiration")),
+            theme=str(payload.get("theme", "misc")),
+            filename=str(payload.get("filename", "")),
+            size_bytes=int(payload.get("size_bytes", 0)),
+            uses=int(payload.get("uses", 0)),
+            size_index=int(payload.get("size_index", 0)),
+        )
+
+
+@dataclass
+class PinterestAcquisition:
+    """Return value describing a dataset-provided Pinterest image."""
+
+    array: np.ndarray
+    label: str
+    theme: str
+    dataset_id: str
+    url: str
+    use_index: int
+    remaining_uses: int
+    declared_edge: int
+    actual_edge: int
+
+
+class PinterestDatasetManager:
+    """Manage rotating Pinterest datasets with deterministic reuse semantics."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        feed_sources: Mapping[str, str] | None = None,
+        dataset_limit_bytes: int = 1_000_000_000,
+        uses_per_image: int = 5,
+        size_sequence: Sequence[int] = _PINTEREST_SIZE_SEQUENCE,
+        max_preview_pixels: int = 16_000_000,
+    ) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.feed_sources: dict[str, str] = (
+            {key: value for key, value in (feed_sources or _PINTEREST_THEME_FEEDS).items() if value}
+            or dict(_PINTEREST_THEME_FEEDS)
+        )
+        self.dataset_limit_bytes = int(max(dataset_limit_bytes, 1))
+        self.uses_per_image = max(int(uses_per_image), 1)
+        self.size_sequence: tuple[int, ...] = tuple(
+            size for size in (size_sequence or _PINTEREST_SIZE_SEQUENCE) if size > 0
+        ) or _PINTEREST_SIZE_SEQUENCE
+        self.max_preview_pixels = max(int(max_preview_pixels), 262_144)
+        self._lock = threading.Lock()
+        self._state_path = self.root / "state.json"
+        self._archive_path = self.root / "archive.json"
+        self._state = self._load_state()
+        self._archive = self._load_archive()
+
+    # ------------------------------------------------------------------ persistence helpers
+    def _load_state(self) -> dict[str, Any]:
+        if not self._state_path.exists():
+            return {
+                "version": _PINTEREST_DATASET_STATE_VERSION,
+                "dataset_id": None,
+                "entries": [],
+            }
+        try:
+            data = json.loads(self._state_path.read_text())
+        except Exception:
+            logger.debug("Failed to read Pinterest dataset state; starting fresh", exc_info=True)
+            return {
+                "version": _PINTEREST_DATASET_STATE_VERSION,
+                "dataset_id": None,
+                "entries": [],
+            }
+        if data.get("version") != _PINTEREST_DATASET_STATE_VERSION:
+            return {
+                "version": _PINTEREST_DATASET_STATE_VERSION,
+                "dataset_id": data.get("dataset_id"),
+                "entries": data.get("entries", []),
+            }
+        return data
+
+    def _save_state(self) -> None:
+        payload = {
+            "version": _PINTEREST_DATASET_STATE_VERSION,
+            "dataset_id": self._state.get("dataset_id"),
+            "entries": [
+                PinterestDatasetEntry.from_dict(entry).to_dict()
+                if isinstance(entry, Mapping)
+                else entry.to_dict()
+                for entry in self._state.get("entries", [])
+            ],
+        }
+        self._state_path.write_text(json.dumps(payload, indent=2))
+
+    def _load_archive(self) -> list[dict[str, Any]]:
+        if not self._archive_path.exists():
+            return []
+        try:
+            return json.loads(self._archive_path.read_text())
+        except Exception:
+            logger.debug("Failed to read Pinterest archive metadata", exc_info=True)
+            return []
+
+    def _save_archive(self) -> None:
+        self._archive_path.write_text(json.dumps(self._archive, indent=2))
+
+    # ------------------------------------------------------------------ dataset lifecycle
+    def _ensure_dataset(self) -> None:
+        dataset_id = self._state.get("dataset_id")
+        entries = self._state.get("entries", [])
+        if dataset_id and entries:
+            return
+        self._build_dataset()
+
+    def _dataset_dir(self, dataset_id: str) -> Path:
+        directory = self.root / dataset_id
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _build_dataset(self) -> None:
+        dataset_id = secrets.token_hex(6)
+        logger.info("Building Pinterest dataset %s", dataset_id)
+        directory = self._dataset_dir(dataset_id)
+        entries: list[PinterestDatasetEntry] = []
+        total_bytes = 0
+        themes = list(self.feed_sources.items())
+        random.shuffle(themes)
+        if not themes:
+            raise PinterestDownloadError("No Pinterest feeds configured")
+        theme_cycle = deque(themes)
+        attempts = 0
+        max_attempts = len(themes) * 60
+        while total_bytes < self.dataset_limit_bytes and attempts < max_attempts:
+            theme_cycle.rotate(-1)
+            theme, feed_url = theme_cycle[0]
+            attempts += 1
+            try:
+                feed_bytes = _download_bytes(feed_url, timeout=12.0)
+                candidates = _parse_pinterest_feed(feed_bytes)
+            except PinterestDownloadError as exc:
+                logger.debug("Pinterest feed %s failed: %s", feed_url, exc)
+                continue
+            random.shuffle(candidates)
+            for image_url, label in candidates:
+                normalized = _normalize_pinterest_url(image_url)
+                if any(entry.url == normalized for entry in entries):
+                    continue
+                try:
+                    image_bytes = self._download_image_variant(normalized, referer=feed_url)
+                except PinterestDownloadError:
+                    continue
+                if not image_bytes:
+                    continue
+                file_size = len(image_bytes)
+                if total_bytes + file_size > self.dataset_limit_bytes:
+                    logger.info(
+                        "Dataset %s reached size limit at %.2f MB", dataset_id, (total_bytes + file_size) / 1_048_576
+                    )
+                    total_bytes = self.dataset_limit_bytes
+                    break
+                suffix = Path(urllib.parse.urlparse(normalized).path).suffix or ".jpg"
+                filename = f"{secrets.token_hex(8)}{suffix}"
+                file_path = directory / filename
+                try:
+                    file_path.write_bytes(image_bytes)
+                except Exception:
+                    logger.debug("Failed to persist Pinterest image %s", filename, exc_info=True)
+                    continue
+                entry = PinterestDatasetEntry(
+                    identifier=secrets.token_hex(5),
+                    url=normalized,
+                    label=label or "Pinterest inspiration",
+                    theme=theme,
+                    filename=filename,
+                    size_bytes=file_size,
+                )
+                entries.append(entry)
+                total_bytes += file_size
+                if len(entries) >= 32:
+                    break
+            if len(entries) >= 32 or total_bytes >= self.dataset_limit_bytes:
+                break
+        if not entries:
+            raise PinterestDownloadError("Unable to populate Pinterest dataset")
+        logger.info(
+            "Prepared Pinterest dataset %s with %d images (%.2f MB)",
+            dataset_id,
+            len(entries),
+            total_bytes / 1_048_576,
+        )
+        self._state = {
+            "version": _PINTEREST_DATASET_STATE_VERSION,
+            "dataset_id": dataset_id,
+            "entries": [entry.to_dict() for entry in entries],
+        }
+        self._save_state()
+
+    def _download_image_variant(self, url: str, *, referer: str | None = None) -> bytes:
+        candidates = [url]
+        for replacement in ("/originals/", "/1200x/", "/736x/", "/564x/", "/474x/", "/236x/"):
+            if "/" in url:
+                candidates.append(url.replace("/736x/", replacement))
+                candidates.append(url.replace("/564x/", replacement))
+                candidates.append(url.replace("/474x/", replacement))
+                candidates.append(url.replace("/236x/", replacement))
+        referer_value = referer or "https://www.pinterest.com/"
+        for candidate in dict.fromkeys(candidates):
+            try:
+                return _download_bytes(candidate, timeout=15.0, referer=referer_value)
+            except PinterestDownloadError:
+                continue
+        raise PinterestDownloadError(f"Unable to download image {url}")
+
+    # ------------------------------------------------------------------ acquisition helpers
+    def _select_entry(self) -> PinterestDatasetEntry | None:
+        entries = [PinterestDatasetEntry.from_dict(entry) for entry in self._state.get("entries", [])]
+        available = [entry for entry in entries if entry.uses < self.uses_per_image]
+        if not available:
+            return None
+        available.sort(key=lambda entry: (entry.uses, entry.identifier))
+        chosen = available[0]
+        return chosen
+
+    def _update_entry(self, updated: PinterestDatasetEntry) -> None:
+        entries = [PinterestDatasetEntry.from_dict(entry) for entry in self._state.get("entries", [])]
+        for index, entry in enumerate(entries):
+            if entry.identifier == updated.identifier:
+                entries[index] = updated
+                break
+        self._state["entries"] = [entry.to_dict() for entry in entries]
+        self._save_state()
+
+    def _archive_current_dataset(self) -> None:
+        dataset_id = self._state.get("dataset_id")
+        entries = [PinterestDatasetEntry.from_dict(entry) for entry in self._state.get("entries", [])]
+        if not dataset_id:
+            return
+        directory = self.root / dataset_id
+        completed_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+        archive_entry = {
+            "dataset_id": dataset_id,
+            "completed_at": completed_at,
+            "links": [
+                {
+                    "url": entry.url,
+                    "label": entry.label,
+                    "theme": entry.theme,
+                }
+                for entry in entries
+            ],
+        }
+        self._archive.append(archive_entry)
+        try:
+            if directory.exists():
+                shutil.rmtree(directory)
+        except Exception:
+            logger.debug("Failed to remove Pinterest dataset directory %s", directory, exc_info=True)
+        self._state = {
+            "version": _PINTEREST_DATASET_STATE_VERSION,
+            "dataset_id": None,
+            "entries": [],
+        }
+        self._save_state()
+        self._save_archive()
+
+    def acquire_image(self) -> PinterestAcquisition:
+        with self._lock:
+            self._ensure_dataset()
+            entry = self._select_entry()
+            if entry is None:
+                self._archive_current_dataset()
+                self._ensure_dataset()
+                entry = self._select_entry()
+                if entry is None:
+                    raise PinterestDownloadError("Pinterest dataset is empty")
+            dataset_id = str(self._state.get("dataset_id"))
+            directory = self._dataset_dir(dataset_id)
+            image_path = directory / entry.filename
+            if not image_path.exists():
+                logger.debug("Pinterest image %s missing; rebuilding dataset", image_path)
+                self._archive_current_dataset()
+                self._ensure_dataset()
+                entry = self._select_entry()
+                if entry is None:
+                    raise PinterestDownloadError("Pinterest dataset is empty")
+                dataset_id = str(self._state.get("dataset_id"))
+                directory = self._dataset_dir(dataset_id)
+                image_path = directory / entry.filename
+            array, declared_edge, actual_edge = self._load_resized_image(image_path, entry)
+            entry.uses += 1
+            entry.size_index = (entry.size_index + 1) % len(self.size_sequence)
+            remaining = max(self.uses_per_image - entry.uses, 0)
+            self._update_entry(entry)
+            if all(
+                PinterestDatasetEntry.from_dict(candidate).uses >= self.uses_per_image
+                for candidate in self._state.get("entries", [])
+            ):
+                self._archive_current_dataset()
+            return PinterestAcquisition(
+                array=array,
+                label=entry.label,
+                theme=entry.theme,
+                dataset_id=dataset_id,
+                url=entry.url,
+                use_index=entry.uses,
+                remaining_uses=remaining,
+                declared_edge=declared_edge,
+                actual_edge=actual_edge,
+            )
+
+    def _load_resized_image(
+        self, path: Path, entry: PinterestDatasetEntry
+    ) -> tuple[np.ndarray, int, int]:
+        target_edge = self.size_sequence[entry.size_index % len(self.size_sequence)]
+        with Image.open(path) as image:
+            converted = image.convert("RGB")
+            width, height = converted.size
+            longest = max(width, height, 1)
+            scale = float(target_edge) / float(longest)
+            if math.isclose(scale, 1.0, rel_tol=1e-3):
+                resized = converted
+            else:
+                new_width = max(1, int(round(width * scale)))
+                new_height = max(1, int(round(height * scale)))
+                resized = converted.resize((new_width, new_height), Image.BICUBIC)
+            max_pixels = self.max_preview_pixels
+            if resized.width * resized.height > max_pixels:
+                reduction = math.sqrt(max_pixels / float(resized.width * resized.height))
+                clipped_width = max(1, int(resized.width * reduction))
+                clipped_height = max(1, int(resized.height * reduction))
+                logger.debug(
+                    "Clipping Pinterest image %s from %dx%d to %dx%d for preview memory safety",
+                    entry.filename,
+                    resized.width,
+                    resized.height,
+                    clipped_width,
+                    clipped_height,
+                )
+                resized = resized.resize((clipped_width, clipped_height), Image.BILINEAR)
+            array = np.asarray(resized, dtype=np.float32) / 255.0
+            return np.clip(array, 0.0, 1.0), target_edge, max(resized.width, resized.height)
 
 
 def _process_memory_usage() -> tuple[int, int] | None:
@@ -525,6 +920,11 @@ def _download_bytes(
 
 
 def _normalize_pinterest_source(_source: str | None) -> str:
+    if _source:
+        return _source
+    feeds = [url for url in _PINTEREST_THEME_FEEDS.values() if url]
+    if feeds:
+        return random.choice(feeds)
     return _PINTEREST_DEFAULT_FEEDS[0]
 
 
@@ -688,7 +1088,7 @@ class UmbraDesktopApp:
         self.sound_reconstruction: np.ndarray | None = None
         self.state = UmbraAppState()
         self._status_var = tk.StringVar(value="Select a reference image to begin.")
-        self._run_mode_var = tk.StringVar(value="finite")
+        self._run_mode_var = tk.StringVar(value="infinite")
         self._score_threshold = tk.DoubleVar(value=88.0)
         self._advanced_logging_var = tk.BooleanVar(value=False)
         self._advanced_logging_enabled = bool(self._advanced_logging_var.get())
@@ -708,6 +1108,7 @@ class UmbraDesktopApp:
         self._latest_generation_entry: dict[str, float] | None = None
         self._latest_text_metadata: TextEncodingMetadata | None = None
         self._latest_text_payload: str | None = None
+        self._pinterest_manager: PinterestDatasetManager | None = None
 
         self._reference_label_widget: tk.Label | None = None
         self._reference_image_widget: tk.Label | None = None
@@ -753,6 +1154,18 @@ class UmbraDesktopApp:
             time.sleep(delay)
         else:
             time.sleep(0.0)
+
+    def _ensure_pinterest_manager(self) -> PinterestDatasetManager:
+        if self._pinterest_manager is not None:
+            return self._pinterest_manager
+        dataset_root = Path.home() / ".umbra" / "pinterest_datasets"
+        try:
+            manager = PinterestDatasetManager(root=dataset_root)
+        except Exception as exc:
+            logger.debug("Failed to initialise Pinterest dataset manager: %s", exc, exc_info=True)
+            raise
+        self._pinterest_manager = manager
+        return manager
 
     # ------------------------------------------------------------------ Modal helpers
     def _show_loading_modal(self, message: str) -> None:
@@ -1140,6 +1553,28 @@ class UmbraDesktopApp:
         thread.start()
 
     def _download_pinterest_image(self) -> None:
+        acquisition: PinterestAcquisition | None = None
+        manager: PinterestDatasetManager | None = None
+        try:
+            manager = self._ensure_pinterest_manager()
+        except Exception as exc:
+            logger.debug("Pinterest dataset manager unavailable: %s", exc, exc_info=True)
+        if manager is not None:
+            try:
+                acquisition = manager.acquire_image()
+            except PinterestDownloadError as exc:
+                logger.debug("Dataset Pinterest fetch failed: %s", exc)
+            except Exception as exc:
+                logger.warning("Dataset Pinterest fetch crashed: %s", exc, exc_info=True)
+        if acquisition is not None:
+            total_cycles = max(acquisition.use_index + acquisition.remaining_uses, acquisition.use_index)
+            info_label = (
+                f"{acquisition.label} (Pinterest · {acquisition.theme} · dataset {acquisition.dataset_id}"
+                f" · use {acquisition.use_index}/{total_cycles}"
+                f" · target {acquisition.declared_edge}px, actual {acquisition.actual_edge}px)"
+            )
+            self._queue.put(("pinterest", acquisition.array, info_label))
+            return
         try:
             image, label = fetch_pinterest_inspiration(timeout=12.0)
         except Exception as exc:
@@ -2097,17 +2532,9 @@ def main() -> None:
 __all__ = [
     "UmbraDesktopApp",
     "UmbraAppState",
-    "fetch_pinterest_inspiration",
-    "_compute_composite_score",
-    "_compute_readability_score",
-    "_normalize_pinterest_url",
-    "_generate_unique_model_path",
-    "main",
-]
-
-__all__ = [
-    "UmbraDesktopApp",
-    "UmbraAppState",
+    "PinterestDatasetManager",
+    "PinterestDatasetEntry",
+    "PinterestAcquisition",
     "fetch_pinterest_inspiration",
     "_compute_composite_score",
     "_compute_readability_score",
