@@ -62,7 +62,13 @@ from .decoding import NoiseStreamDecoder
 from .demo_packager import build_demo_executable
 from .encoding import NoiseStreamEncoder
 from .evolution import EvolutionManager
-from .metrics import ReconstructionMetrics, compute_metrics
+from .metrics import (
+    AI_PSNR_BASELINE,
+    ReconstructionMetrics,
+    composite_score,
+    compute_metrics,
+    readability_score,
+)
 from .visualization import multiplicative_overlap
 
 logger = logging.getLogger(__name__)
@@ -71,8 +77,6 @@ _DISPLAY_MAX_EDGE = 720
 _GRAPH_WIDTH = 900
 _GRAPH_HEIGHT = 320
 _HISTORY_LIMIT = 600
-_AI_PSNR_BASELINE = 20.0
-_AI_PSNR_TARGET = 60.0
 _PINTEREST_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
@@ -170,6 +174,17 @@ class PinterestAcquisition:
     actual_edge: int
 
 
+@dataclass
+class ReadingSample:
+    """Alphabet training sample used by the reading lab."""
+
+    token: str
+    image: np.ndarray
+    image_metadata: TextEncodingMetadata
+    waveform: np.ndarray
+    waveform_metadata: TextEncodingMetadata
+
+
 class PinterestDatasetManager:
     """Manage rotating Pinterest datasets with deterministic reuse semantics."""
 
@@ -200,6 +215,9 @@ class PinterestDatasetManager:
         self._archive_path = self.root / "archive.json"
         self._state = self._load_state()
         self._archive = self._load_archive()
+        self._builder_thread: threading.Thread | None = None
+        self._first_entry_ready = threading.Event()
+        self._build_status: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ persistence helpers
     def _load_state(self) -> dict[str, Any]:
@@ -251,13 +269,29 @@ class PinterestDatasetManager:
     def _save_archive(self) -> None:
         self._archive_path.write_text(json.dumps(self._archive, indent=2))
 
+    def build_status(self) -> dict[str, Any] | None:
+        """Return the current dataset build status if a build is in progress."""
+
+        with self._lock:
+            if not self._build_status:
+                return None
+            return dict(self._build_status)
+
     # ------------------------------------------------------------------ dataset lifecycle
     def _ensure_dataset(self) -> None:
-        dataset_id = self._state.get("dataset_id")
-        entries = self._state.get("entries", [])
+        with self._lock:
+            dataset_id = self._state.get("dataset_id")
+            entries = list(self._state.get("entries", []))
         if dataset_id and entries:
+            self._first_entry_ready.set()
             return
-        self._build_dataset()
+        if self._builder_thread is not None and self._builder_thread.is_alive():
+            self._first_entry_ready.wait(timeout=45.0)
+            return
+        self._first_entry_ready.clear()
+        self._builder_thread = threading.Thread(target=self._build_dataset, daemon=True)
+        self._builder_thread.start()
+        self._first_entry_ready.wait(timeout=45.0)
 
     def _dataset_dir(self, dataset_id: str) -> Path:
         directory = self.root / dataset_id
@@ -273,74 +307,153 @@ class PinterestDatasetManager:
         themes = list(self.feed_sources.items())
         random.shuffle(themes)
         if not themes:
-            raise PinterestDownloadError("No Pinterest feeds configured")
+            error = "No Pinterest feeds configured"
+            with self._lock:
+                self._build_status = {
+                    "dataset_id": dataset_id,
+                    "entries": 0,
+                    "bytes": 0,
+                    "complete": True,
+                    "error": error,
+                }
+                self._state = {
+                    "version": _PINTEREST_DATASET_STATE_VERSION,
+                    "dataset_id": None,
+                    "entries": [],
+                }
+                self._save_state()
+            self._first_entry_ready.set()
+            logger.warning("Pinterest dataset build aborted: %s", error)
+            return
+        with self._lock:
+            self._state = {
+                "version": _PINTEREST_DATASET_STATE_VERSION,
+                "dataset_id": dataset_id,
+                "entries": [],
+            }
+            self._save_state()
+            self._build_status = {
+                "dataset_id": dataset_id,
+                "entries": 0,
+                "bytes": 0,
+                "complete": False,
+            }
         theme_cycle = deque(themes)
         attempts = 0
         max_attempts = len(themes) * 60
-        while total_bytes < self.dataset_limit_bytes and attempts < max_attempts:
-            theme_cycle.rotate(-1)
-            theme, feed_url = theme_cycle[0]
-            attempts += 1
-            try:
-                feed_bytes = _download_bytes(feed_url, timeout=12.0)
-                candidates = _parse_pinterest_feed(feed_bytes)
-            except PinterestDownloadError as exc:
-                logger.debug("Pinterest feed %s failed: %s", feed_url, exc)
-                continue
-            random.shuffle(candidates)
-            for image_url, label in candidates:
-                normalized = _normalize_pinterest_url(image_url)
-                if any(entry.url == normalized for entry in entries):
-                    continue
+        try:
+            while total_bytes < self.dataset_limit_bytes and attempts < max_attempts:
+                theme_cycle.rotate(-1)
+                theme, feed_url = theme_cycle[0]
+                attempts += 1
                 try:
-                    image_bytes = self._download_image_variant(normalized, referer=feed_url)
-                except PinterestDownloadError:
+                    feed_bytes = _download_bytes(feed_url, timeout=12.0)
+                    candidates = _parse_pinterest_feed(feed_bytes)
+                except PinterestDownloadError as exc:
+                    logger.debug("Pinterest feed %s failed: %s", feed_url, exc)
                     continue
-                if not image_bytes:
-                    continue
-                file_size = len(image_bytes)
-                if total_bytes + file_size > self.dataset_limit_bytes:
-                    logger.info(
-                        "Dataset %s reached size limit at %.2f MB", dataset_id, (total_bytes + file_size) / 1_048_576
+                random.shuffle(candidates)
+                for image_url, label in candidates:
+                    normalized = _normalize_pinterest_url(image_url)
+                    if any(entry.url == normalized for entry in entries):
+                        continue
+                    try:
+                        image_bytes = self._download_image_variant(normalized, referer=feed_url)
+                    except PinterestDownloadError:
+                        continue
+                    if not image_bytes:
+                        continue
+                    file_size = len(image_bytes)
+                    if total_bytes + file_size > self.dataset_limit_bytes:
+                        logger.info(
+                            "Dataset %s reached size limit at %.2f MB",
+                            dataset_id,
+                            (total_bytes + file_size) / 1_048_576,
+                        )
+                        total_bytes = self.dataset_limit_bytes
+                        break
+                    suffix = Path(urllib.parse.urlparse(normalized).path).suffix or ".jpg"
+                    filename = f"{secrets.token_hex(8)}{suffix}"
+                    file_path = directory / filename
+                    try:
+                        file_path.write_bytes(image_bytes)
+                    except Exception:
+                        logger.debug("Failed to persist Pinterest image %s", filename, exc_info=True)
+                        continue
+                    entry = PinterestDatasetEntry(
+                        identifier=secrets.token_hex(5),
+                        url=normalized,
+                        label=label or "Pinterest inspiration",
+                        theme=theme,
+                        filename=filename,
+                        size_bytes=file_size,
                     )
-                    total_bytes = self.dataset_limit_bytes
+                    entries.append(entry)
+                    total_bytes += file_size
+                    with self._lock:
+                        self._state["entries"] = [item.to_dict() for item in entries]
+                        self._save_state()
+                        self._build_status = {
+                            "dataset_id": dataset_id,
+                            "entries": len(entries),
+                            "bytes": total_bytes,
+                            "complete": False,
+                        }
+                    if not self._first_entry_ready.is_set():
+                        self._first_entry_ready.set()
+                    if len(entries) >= 32:
+                        break
+                if len(entries) >= 32 or total_bytes >= self.dataset_limit_bytes:
                     break
-                suffix = Path(urllib.parse.urlparse(normalized).path).suffix or ".jpg"
-                filename = f"{secrets.token_hex(8)}{suffix}"
-                file_path = directory / filename
-                try:
-                    file_path.write_bytes(image_bytes)
-                except Exception:
-                    logger.debug("Failed to persist Pinterest image %s", filename, exc_info=True)
-                    continue
-                entry = PinterestDatasetEntry(
-                    identifier=secrets.token_hex(5),
-                    url=normalized,
-                    label=label or "Pinterest inspiration",
-                    theme=theme,
-                    filename=filename,
-                    size_bytes=file_size,
-                )
-                entries.append(entry)
-                total_bytes += file_size
-                if len(entries) >= 32:
-                    break
-            if len(entries) >= 32 or total_bytes >= self.dataset_limit_bytes:
-                break
-        if not entries:
-            raise PinterestDownloadError("Unable to populate Pinterest dataset")
-        logger.info(
-            "Prepared Pinterest dataset %s with %d images (%.2f MB)",
-            dataset_id,
-            len(entries),
-            total_bytes / 1_048_576,
-        )
-        self._state = {
-            "version": _PINTEREST_DATASET_STATE_VERSION,
-            "dataset_id": dataset_id,
-            "entries": [entry.to_dict() for entry in entries],
-        }
-        self._save_state()
+            if not entries:
+                raise PinterestDownloadError("Unable to populate Pinterest dataset")
+            logger.info(
+                "Prepared Pinterest dataset %s with %d images (%.2f MB)",
+                dataset_id,
+                len(entries),
+                total_bytes / 1_048_576,
+            )
+            with self._lock:
+                self._state = {
+                    "version": _PINTEREST_DATASET_STATE_VERSION,
+                    "dataset_id": dataset_id,
+                    "entries": [entry.to_dict() for entry in entries],
+                }
+                self._save_state()
+                self._build_status = {
+                    "dataset_id": dataset_id,
+                    "entries": len(entries),
+                    "bytes": total_bytes,
+                    "complete": True,
+                }
+        except Exception as exc:
+            logger.warning("Pinterest dataset build failed: %s", exc, exc_info=True)
+            with self._lock:
+                self._build_status = {
+                    "dataset_id": dataset_id,
+                    "entries": len(entries),
+                    "bytes": total_bytes,
+                    "complete": True,
+                    "error": str(exc),
+                }
+                if entries:
+                    self._state = {
+                        "version": _PINTEREST_DATASET_STATE_VERSION,
+                        "dataset_id": dataset_id,
+                        "entries": [entry.to_dict() for entry in entries],
+                    }
+                else:
+                    self._state = {
+                        "version": _PINTEREST_DATASET_STATE_VERSION,
+                        "dataset_id": None,
+                        "entries": [],
+                    }
+                self._save_state()
+        finally:
+            if not self._first_entry_ready.is_set():
+                self._first_entry_ready.set()
+            with self._lock:
+                self._builder_thread = None
 
     def _download_image_variant(self, url: str, *, referer: str | None = None) -> bytes:
         candidates = [url]
@@ -410,50 +523,61 @@ class PinterestDatasetManager:
         self._save_state()
         self._save_archive()
 
-    def acquire_image(self) -> PinterestAcquisition:
-        with self._lock:
-            self._ensure_dataset()
-            entry = self._select_entry()
-            if entry is None:
-                self._archive_current_dataset()
-                self._ensure_dataset()
+    def acquire_image(
+        self,
+        *,
+        timeout: float = 60.0,
+        progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> PinterestAcquisition:
+        deadline = time.monotonic() + max(float(timeout), 5.0)
+        self._ensure_dataset()
+        while True:
+            with self._lock:
+                dataset_id = self._state.get("dataset_id")
                 entry = self._select_entry()
-                if entry is None:
-                    raise PinterestDownloadError("Pinterest dataset is empty")
-            dataset_id = str(self._state.get("dataset_id"))
-            directory = self._dataset_dir(dataset_id)
-            image_path = directory / entry.filename
-            if not image_path.exists():
-                logger.debug("Pinterest image %s missing; rebuilding dataset", image_path)
-                self._archive_current_dataset()
-                self._ensure_dataset()
-                entry = self._select_entry()
-                if entry is None:
-                    raise PinterestDownloadError("Pinterest dataset is empty")
-                dataset_id = str(self._state.get("dataset_id"))
-                directory = self._dataset_dir(dataset_id)
+            if dataset_id and entry is not None:
+                directory = self._dataset_dir(str(dataset_id))
                 image_path = directory / entry.filename
-            array, declared_edge, actual_edge = self._load_resized_image(image_path, entry)
-            entry.uses += 1
-            entry.size_index = (entry.size_index + 1) % len(self.size_sequence)
-            remaining = max(self.uses_per_image - entry.uses, 0)
-            self._update_entry(entry)
-            if all(
-                PinterestDatasetEntry.from_dict(candidate).uses >= self.uses_per_image
-                for candidate in self._state.get("entries", [])
-            ):
-                self._archive_current_dataset()
-            return PinterestAcquisition(
-                array=array,
-                label=entry.label,
-                theme=entry.theme,
-                dataset_id=dataset_id,
-                url=entry.url,
-                use_index=entry.uses,
-                remaining_uses=remaining,
-                declared_edge=declared_edge,
-                actual_edge=actual_edge,
-            )
+                if not image_path.exists():
+                    logger.debug("Pinterest image %s missing; rebuilding dataset", image_path)
+                    with self._lock:
+                        self._archive_current_dataset()
+                    self._ensure_dataset()
+                    continue
+                array, declared_edge, actual_edge = self._load_resized_image(image_path, entry)
+                with self._lock:
+                    entry.uses += 1
+                    entry.size_index = (entry.size_index + 1) % len(self.size_sequence)
+                    remaining = max(self.uses_per_image - entry.uses, 0)
+                    self._update_entry(entry)
+                    exhausted = all(
+                        PinterestDatasetEntry.from_dict(candidate).uses >= self.uses_per_image
+                        for candidate in self._state.get("entries", [])
+                    )
+                    if exhausted:
+                        self._archive_current_dataset()
+                return PinterestAcquisition(
+                    array=array,
+                    label=entry.label,
+                    theme=entry.theme,
+                    dataset_id=str(dataset_id),
+                    url=entry.url,
+                    use_index=entry.uses,
+                    remaining_uses=remaining,
+                    declared_edge=declared_edge,
+                    actual_edge=actual_edge,
+                )
+            if progress_callback is not None:
+                status = self.build_status()
+                if status is not None:
+                    progress_callback(status)
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                raise PinterestDownloadError("Pinterest dataset is empty")
+            wait_window = min(2.0, max(remaining_time, 0.5))
+            self._first_entry_ready.clear()
+            self._first_entry_ready.wait(wait_window)
+            self._ensure_dataset()
 
     def _load_resized_image(
         self, path: Path, entry: PinterestDatasetEntry
@@ -627,14 +751,14 @@ class UmbraAppState:
         """Store metrics for a completed generation and return the entry."""
 
         overlap_value = _nan_guard(overlap, 0.0)
-        psnr_value = _nan_guard(metrics.psnr, _AI_PSNR_BASELINE)
+        psnr_value = _nan_guard(metrics.psnr, AI_PSNR_BASELINE)
         ssim_value = _nan_guard(metrics.ssim, 0.0)
 
-        ai_score = _compute_composite_score(overlap_value, psnr_value, ssim_value)
+        ai_score = composite_score(overlap_value, psnr_value, ssim_value)
         # Default to a zero composite score so generations without a successful
         # sound reconstruction never receive credit from the sound-first
         # scoreboard.
-        composite_score = 0.0
+        composite_value = 0.0
         entry: dict[str, float] = {
             "generation": float(generation_index),
             "overlap": overlap_value,
@@ -647,14 +771,14 @@ class UmbraAppState:
         }
         if sound_metrics is not None and sound_overlap is not None:
             sound_overlap_value = _nan_guard(sound_overlap, 0.0)
-            sound_psnr_value = _nan_guard(sound_metrics.psnr, _AI_PSNR_BASELINE)
+            sound_psnr_value = _nan_guard(sound_metrics.psnr, AI_PSNR_BASELINE)
             sound_ssim_value = _nan_guard(sound_metrics.ssim, 0.0)
-            sound_score = _compute_composite_score(
+            sound_score = composite_score(
                 sound_overlap_value,
                 sound_psnr_value,
                 sound_ssim_value,
             )
-            readability_score = _compute_readability_score(
+            readability_value = readability_score(
                 sound_overlap_value,
                 sound_psnr_value,
                 sound_ssim_value,
@@ -665,27 +789,30 @@ class UmbraAppState:
                     "sound_ssim": sound_ssim_value,
                     "sound_overlap": sound_overlap_value,
                     "sound_score": sound_score,
-                    "sound_readability_score": readability_score,
+                    "sound_readability_score": readability_value,
                 }
             )
             if math.isfinite(sound_score):
                 self.sound_scores.append(sound_score)
-            if math.isfinite(readability_score):
-                self.readability_scores.append(readability_score)
-            composite_score = float(sound_score)
+            if math.isfinite(readability_value):
+                self.readability_scores.append(readability_value)
+            if math.isfinite(sound_score):
+                combined = float(np.clip((2.0 * sound_score + ai_score) / 3.0, 0.0, 100.0))
+                severity = float(np.clip((sound_score / 100.0) ** 1.4, 0.0, 1.0))
+                composite_value = float(np.clip(combined * severity, 0.0, 100.0))
         if sound_reference_metrics is not None and sound_reference_overlap is not None:
             entry.update(
                 {
                     "sound_reference_psnr": _nan_guard(
-                        sound_reference_metrics.psnr, _AI_PSNR_BASELINE
+                        sound_reference_metrics.psnr, AI_PSNR_BASELINE
                     ),
                     "sound_reference_ssim": _nan_guard(sound_reference_metrics.ssim, 0.0),
                     "sound_reference_overlap": _nan_guard(sound_reference_overlap, 0.0),
                 }
             )
-        entry["composite_score"] = composite_score
+        entry["composite_score"] = composite_value
         self.history.append(entry)
-        self.composite_scores.append(float(composite_score))
+        self.composite_scores.append(float(composite_value))
         return entry
 
     def as_rows(self) -> list[dict[str, float]]:
@@ -696,38 +823,6 @@ class UmbraAppState:
 
 def _nan_guard(value: float, fallback: float) -> float:
     return float(np.nan_to_num(value, nan=fallback, posinf=fallback, neginf=fallback))
-
-
-def _compute_composite_score(overlap_pct: float, psnr: float, ssim: float) -> float:
-    """Combine overlap, PSNR, and SSIM into a single performance score."""
-
-    overlap_value = _nan_guard(overlap_pct, 0.0)
-    psnr_value = _nan_guard(psnr, _AI_PSNR_BASELINE)
-    ssim_value = _nan_guard(ssim, 0.0)
-
-    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
-    psnr_span = max(_AI_PSNR_TARGET - _AI_PSNR_BASELINE, 1e-6)
-    psnr_norm = float(np.clip((psnr_value - _AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
-    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
-
-    composite = float(np.clip(0.4 * overlap_norm + 0.3 * psnr_norm + 0.3 * ssim_norm, 0.0, 1.0))
-    return composite * 100.0
-
-
-def _compute_readability_score(overlap_pct: float, psnr: float, ssim: float) -> float:
-    """Derive a readability score emphasising agreement between sound and AI images."""
-
-    overlap_value = _nan_guard(overlap_pct, 0.0)
-    psnr_value = _nan_guard(psnr, _AI_PSNR_BASELINE)
-    ssim_value = _nan_guard(ssim, 0.0)
-
-    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
-    psnr_span = max(_AI_PSNR_TARGET - _AI_PSNR_BASELINE, 1e-6)
-    psnr_norm = float(np.clip((psnr_value - _AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
-    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
-
-    readability = float(np.clip((overlap_norm + psnr_norm + ssim_norm) / 3.0, 0.0, 1.0))
-    return readability * 100.0
 
 
 def _clamp_image(array: np.ndarray) -> np.ndarray:
@@ -1092,7 +1187,7 @@ class UmbraDesktopApp:
         self._score_threshold = tk.DoubleVar(value=88.0)
         self._advanced_logging_var = tk.BooleanVar(value=False)
         self._advanced_logging_enabled = bool(self._advanced_logging_var.get())
-        self._primary_score_var = tk.StringVar(value="Sound score: –")
+        self._primary_score_var = tk.StringVar(value="Overall score: –")
         self._readability_score_var = tk.StringVar(value="WAV readability score: –")
         self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
         self._reference_info_var = tk.StringVar(value="No reference loaded.")
@@ -1100,6 +1195,7 @@ class UmbraDesktopApp:
         self._sound_info_var = tk.StringVar(value="Sound preview pending…")
         self._loading_message_var = tk.StringVar(value="")
         self._text_status_var = tk.StringVar(value="Enter text to encode into colour static.")
+        self._reading_status_var = tk.StringVar(value="Reading lab idle.")
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._running = False
@@ -1108,6 +1204,9 @@ class UmbraDesktopApp:
         self._latest_generation_entry: dict[str, float] | None = None
         self._latest_text_metadata: TextEncodingMetadata | None = None
         self._latest_text_payload: str | None = None
+        self._reading_samples: deque[ReadingSample] = deque()
+        self._reading_thread: threading.Thread | None = None
+        self._reading_waveform: np.ndarray | None = None
         self._pinterest_manager: PinterestDatasetManager | None = None
 
         self._reference_label_widget: tk.Label | None = None
@@ -1243,11 +1342,11 @@ class UmbraDesktopApp:
 
         generation = _safe_float("generation", 0.0)
         overlap = _safe_float("sound_overlap", _safe_float("overlap", 0.0))
-        psnr = _safe_float("sound_psnr", _safe_float("psnr", _AI_PSNR_BASELINE))
+        psnr = _safe_float("sound_psnr", _safe_float("psnr", AI_PSNR_BASELINE))
         ssim = _safe_float("sound_ssim", _safe_float("ssim", 0.0))
         readability = entry.get("sound_readability_score")
         if readability is None:
-            readability = _compute_readability_score(overlap, psnr, ssim)
+            readability = readability_score(overlap, psnr, ssim)
         try:
             readability_value = float(readability)
         except (TypeError, ValueError):
@@ -1398,6 +1497,26 @@ class UmbraDesktopApp:
             text="Save text as WAV…",
             command=self._save_text_as_wav,
         ).pack(side=tk.LEFT, padx=4, pady=2)
+
+        reading_controls = tk.Frame(text_frame, bg="#181818")
+        reading_controls.pack(fill=tk.X, padx=4, pady=(0, 4))
+
+        tk.Button(
+            reading_controls,
+            text="Learn to read (A–Z)",
+            command=self._start_reading_session,
+        ).pack(side=tk.LEFT, padx=4, pady=2)
+        tk.Button(
+            reading_controls,
+            text="Next reading sample ▶",
+            command=self._advance_reading_sample,
+        ).pack(side=tk.LEFT, padx=4, pady=2)
+        tk.Label(
+            reading_controls,
+            textvariable=self._reading_status_var,
+            fg="#c9d1d9",
+            bg="#181818",
+        ).pack(side=tk.LEFT, padx=8)
         tk.Button(
             text_buttons,
             text="Decode preview to text",
@@ -1560,8 +1679,11 @@ class UmbraDesktopApp:
         except Exception as exc:
             logger.debug("Pinterest dataset manager unavailable: %s", exc, exc_info=True)
         if manager is not None:
+            def _report_status(snapshot: Mapping[str, Any]) -> None:
+                self._queue.put(("pinterest_status", dict(snapshot)))
+
             try:
-                acquisition = manager.acquire_image()
+                acquisition = manager.acquire_image(progress_callback=_report_status)
             except PinterestDownloadError as exc:
                 logger.debug("Dataset Pinterest fetch failed: %s", exc)
             except Exception as exc:
@@ -1648,6 +1770,66 @@ class UmbraDesktopApp:
         self._latest_text_metadata = metadata
         self._latest_text_payload = text
         self._text_status_var.set(f"Saved text signal to {destination}")
+
+    def _start_reading_session(self) -> None:
+        if self._reading_thread is not None and self._reading_thread.is_alive():
+            self._reading_status_var.set("Reading lab is already preparing samples…")
+            return
+        self._reading_samples.clear()
+        self._reading_waveform = None
+        self._reading_status_var.set("Preparing alphabet curriculum…")
+        thread = threading.Thread(target=self._prepare_reading_samples, daemon=True)
+        self._reading_thread = thread
+        thread.start()
+
+    def _prepare_reading_samples(self) -> None:
+        tokens = list(string.ascii_uppercase) + list(string.digits)
+        samples: deque[ReadingSample] = deque()
+        for token in tokens:
+            try:
+                image, image_meta = encode_text_to_image(token)
+                waveform, wave_meta = encode_text_to_waveform(token)
+            except Exception as exc:
+                logger.debug("Reading sample %s failed: %s", token, exc, exc_info=True)
+                continue
+            samples.append(
+                ReadingSample(
+                    token=token,
+                    image=np.asarray(image, dtype=np.float32),
+                    image_metadata=image_meta,
+                    waveform=np.asarray(waveform, dtype=np.float32),
+                    waveform_metadata=wave_meta,
+                )
+            )
+        self._reading_samples = samples
+        self._queue.put(("reading_ready", len(samples)))
+        self._reading_thread = None
+
+    def _advance_reading_sample(self) -> None:
+        if not self._reading_samples:
+            self._reading_status_var.set("Start a reading session to queue samples.")
+            return
+        sample = self._reading_samples[0]
+        self._reading_samples.rotate(-1)
+        if self._text_input is not None:
+            self._text_input.delete("1.0", tk.END)
+            self._text_input.insert("1.0", sample.token)
+        self._latest_text_metadata = sample.image_metadata
+        self._latest_text_payload = sample.token
+        self._text_status_var.set(f"Alphabet sample '{sample.token}' ready.")
+        self._reading_waveform = sample.waveform.copy()
+        self._set_reference(sample.image, f"Alphabet · {sample.token}")
+        metadata = sample.waveform_metadata
+        self._latest_sound_payload = {
+            "sample_rate": int(metadata.sample_rate or 16_000),
+            "segments": metadata.segments,
+            "marker_duration": metadata.marker_duration,
+            "text_token": sample.token,
+        }
+        queue_length = len(self._reading_samples)
+        self._reading_status_var.set(
+            f"Learning '{sample.token}'. {queue_length} samples queued."
+        )
 
     def _decode_sound_to_text(self) -> None:
         source: np.ndarray | None = None
@@ -1782,6 +1964,8 @@ class UmbraDesktopApp:
                     sound_payload["segments"] = int(best.waveform_segments)
                 if best.waveform_marker_duration is not None:
                     sound_payload["marker_duration"] = float(best.waveform_marker_duration)
+                if best.waveform_sound_score is not None:
+                    sound_payload["sound_score"] = float(best.waveform_sound_score)
             else:
                 logger.debug(
                     "Waveform reconstruction unavailable for seed %d", best.seed
@@ -1848,10 +2032,37 @@ class UmbraDesktopApp:
             elif kind == "status":
                 _, text = message
                 self._status_var.set(str(text))
+            elif kind == "pinterest_status":
+                _, payload = message
+                dataset_id = payload.get("dataset_id", "?")
+                image_count = int(payload.get("entries", 0) or 0)
+                total_mb = float(payload.get("bytes", 0.0) or 0.0) / 1_048_576
+                complete = bool(payload.get("complete"))
+                error = payload.get("error")
+                status = (
+                    f"Preparing Pinterest dataset {dataset_id} · {image_count} images · {total_mb:.2f} MB"
+                )
+                if complete:
+                    status += " · ready"
+                if error:
+                    status += f" · {error}"
+                self._status_var.set(status)
             elif kind == "pinterest":
                 _, image, label = message
                 self._set_reference(image, label)
                 self._status_var.set(f"Loaded Pinterest inspiration: {label}")
+            elif kind == "reading_ready":
+                _, count = message
+                sample_count = int(count or 0)
+                if sample_count <= 0:
+                    self._reading_status_var.set(
+                        "Reading lab could not prepare samples; check logs."
+                    )
+                else:
+                    self._reading_status_var.set(
+                        f"Alphabet curriculum ready ({sample_count} samples)."
+                    )
+                    self._advance_reading_sample()
             elif kind == "refresh_pinterest":
                 self._fetch_pinterest_async()
 
@@ -2084,7 +2295,7 @@ class UmbraDesktopApp:
         if sanitized_entry:
             self._apply_generation_entry(sanitized_entry)
         else:
-            self._primary_score_var.set("Sound score: –")
+            self._primary_score_var.set("Overall score: –")
             self._readability_score_var.set("WAV readability score: –")
             self._baseline_score_var.set("AI baseline score: –")
             self._recon_info_var.set("Awaiting AI reconstruction metrics…")
@@ -2254,7 +2465,8 @@ class UmbraDesktopApp:
         sound_score = entry.get("sound_score")
         if sound_score is not None:
             status_parts.append(f"Sound overlap {_as_float('sound_overlap'):.2f}%")
-            status_parts.append(f"Sound PSNR {_as_float('sound_psnr', _AI_PSNR_BASELINE):.2f} dB")
+        status_parts.append(f"Sound PSNR {_as_float('sound_psnr', AI_PSNR_BASELINE):.2f} dB")
+        if sound_score is not None:
             status_parts.append(f"Sound SSIM {_as_float('sound_ssim'):.3f}")
             try:
                 status_parts.append(f"Sound score {float(sound_score):.2f}")
@@ -2262,19 +2474,20 @@ class UmbraDesktopApp:
                 status_parts.append("Sound score unavailable")
         else:
             status_parts.append("Sound score unavailable")
+        composite_score = entry.get("composite_score")
+        if composite_score is not None:
+            status_parts.append(f"Overall score {float(composite_score):.2f}")
         status_parts.append(f"AI overlap {_as_float('overlap'):.2f}%")
-        status_parts.append(f"AI PSNR {_as_float('psnr', _AI_PSNR_BASELINE):.2f} dB")
+        status_parts.append(f"AI PSNR {_as_float('psnr', AI_PSNR_BASELINE):.2f} dB")
         status_parts.append(f"AI SSIM {_as_float('ssim'):.3f}")
         self._status_var.set(" · ".join(status_parts))
-
-        composite_score = entry.get("composite_score")
-        if sound_score is not None and composite_score is not None:
+        if composite_score is not None:
             try:
-                self._primary_score_var.set(f"Sound score: {float(composite_score):.2f}")
+                self._primary_score_var.set(f"Overall score: {float(composite_score):.2f}")
             except (TypeError, ValueError):
-                self._primary_score_var.set("Sound score: –")
+                self._primary_score_var.set("Overall score: –")
         else:
-            self._primary_score_var.set("Sound score: – (waiting for sound)")
+            self._primary_score_var.set("Overall score: – (waiting for sound)")
 
         readability_score = entry.get("sound_readability_score")
         if sound_score is not None and readability_score is not None:
@@ -2309,7 +2522,7 @@ class UmbraDesktopApp:
 
         ai_text = (
             f"Overlap {_as_float('overlap'):.2f}% · "
-            f"PSNR {_as_float('psnr', _AI_PSNR_BASELINE):.2f} dB · "
+            f"PSNR {_as_float('psnr', AI_PSNR_BASELINE):.2f} dB · "
             f"SSIM {_as_float('ssim'):.3f}"
         )
         ai_score = entry.get("ai_score")
@@ -2323,7 +2536,7 @@ class UmbraDesktopApp:
         if "sound_score" in entry or "sound_overlap" in entry:
             sound_text = (
                 f"Overlap {_as_float('sound_overlap'):.2f}% · "
-                f"PSNR {_as_float('sound_psnr', _AI_PSNR_BASELINE):.2f} dB · "
+                f"PSNR {_as_float('sound_psnr', AI_PSNR_BASELINE):.2f} dB · "
                 f"SSIM {_as_float('sound_ssim'):.3f}"
             )
             sound_score = entry.get("sound_score")
@@ -2453,7 +2666,7 @@ class UmbraDesktopApp:
             self._graph_canvas.create_text(
                 margin,
                 legend_y,
-                text="Sound score",
+                text="Overall score",
                 fill="#f4d35e",
                 anchor=tk.W,
             )
@@ -2486,7 +2699,7 @@ class UmbraDesktopApp:
             self._graph_canvas.create_text(
                 width - margin,
                 label_y,
-                text=f"Sound {composite_rows[-1][1]:.2f}",
+                text=f"Overall {composite_rows[-1][1]:.2f}",
                 fill="#f4d35e",
                 anchor=tk.E,
             )
@@ -2535,9 +2748,8 @@ __all__ = [
     "PinterestDatasetManager",
     "PinterestDatasetEntry",
     "PinterestAcquisition",
+    "ReadingSample",
     "fetch_pinterest_inspiration",
-    "_compute_composite_score",
-    "_compute_readability_score",
     "_normalize_pinterest_url",
     "_generate_unique_model_path",
     "main",

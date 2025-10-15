@@ -19,6 +19,7 @@ from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .metrics import (
     ReconstructionMetrics,
+    composite_score,
     compute_metrics,
     compute_ms_ssim,
     dct_band_correlation,
@@ -208,6 +209,7 @@ class CandidateResult:
     waveform_sample_rate: int | None = None
     waveform_segments: int | None = None
     waveform_marker_duration: float | None = None
+    waveform_sound_score: float | None = None
     reward: float = 0.0
     predicted_reward: float | None = None
     feature_vector: tuple[float, ...] = field(default_factory=tuple)
@@ -592,6 +594,7 @@ class EvolutionManager:
         waveform_sample_rate: int | None = None
         waveform_segments: int | None = None
         waveform_marker_duration: float | None = None
+        waveform_sound_score: float | None = None
 
         if self.enable_waveform and waveform_config is not None:
             waveform_sample_rate = int(waveform_config.get("sample_rate", 0)) or None
@@ -631,9 +634,7 @@ class EvolutionManager:
                     )
                     waveform_image = np.clip(recon_image, 0.0, 1.0)
 
-                waveform_reference_metrics = compute_metrics(
-                    reference_clipped, waveform_image
-                )
+                waveform_reference_metrics = compute_metrics(reference_clipped, waveform_image)
                 _, waveform_reference_overlap = multiplicative_overlap(
                     reference_clipped, waveform_image
                 )
@@ -641,6 +642,15 @@ class EvolutionManager:
                 _, waveform_packet_overlap = multiplicative_overlap(
                     recon_image, waveform_image
                 )
+                if (
+                    waveform_reference_metrics is not None
+                    and waveform_reference_overlap is not None
+                ):
+                    waveform_sound_score = composite_score(
+                        float(waveform_reference_overlap),
+                        waveform_reference_metrics.psnr,
+                        waveform_reference_metrics.ssim,
+                    )
 
         return CandidateResult(
             seed=int(seed),
@@ -661,6 +671,9 @@ class EvolutionManager:
             waveform_sample_rate=waveform_sample_rate,
             waveform_segments=waveform_segments,
             waveform_marker_duration=waveform_marker_duration,
+            waveform_sound_score=None
+            if waveform_sound_score is None
+            else float(waveform_sound_score),
         )
 
     def _candidate_features(
@@ -906,8 +919,21 @@ class EvolutionManager:
                 except Exception:  # pragma: no cover - advisor failures are non-fatal
                     logger.debug("Neural reward prediction failed", exc_info=True)
                     predicted = None
-            reward = base_reward if predicted is None else float(0.65 * base_reward + 0.35 * predicted)
-            reward = float(np.clip(reward, 0.0, 6.0))
+            raw_reward = base_reward if predicted is None else float(0.65 * base_reward + 0.35 * predicted)
+            raw_reward = float(np.clip(raw_reward, 0.0, 6.0))
+            reward = raw_reward
+            if candidate.waveform_sound_score is not None:
+                audio_fraction = float(
+                    np.clip(candidate.waveform_sound_score / 100.0, 0.0, 1.0)
+                )
+                audio_component = raw_reward * audio_fraction
+                blended = float(np.clip(((2.0 * audio_component) + raw_reward) / 3.0, 0.0, 6.0))
+                severity = float(np.clip(audio_fraction ** 1.2, 0.0, 1.0))
+                penalty = float(np.clip(0.05 + 0.95 * severity, 0.0, 1.0))
+                reward = float(np.clip(blended * penalty, 0.0, 6.0))
+                components["waveform_score"] = float(candidate.waveform_sound_score)
+                components["waveform_fraction"] = audio_fraction
+                components["waveform_penalty"] = penalty
             candidate.reward = reward
             candidate.predicted_reward = predicted
             candidate.feature_vector = tuple(float(value) for value in features)

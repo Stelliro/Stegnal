@@ -1,21 +1,15 @@
 import itertools
 
 import umbra.ui as ui
-from umbra.metrics import ReconstructionMetrics
-from umbra.ui import (
-    UmbraAppState,
-    _compute_composite_score,
-    _compute_readability_score,
-    _generate_unique_model_path,
-    _normalize_pinterest_url,
-)
+from umbra.metrics import ReconstructionMetrics, composite_score, readability_score
+from umbra.ui import UmbraAppState, _generate_unique_model_path, _normalize_pinterest_url
 
 
 def test_compute_composite_score_increases_with_metrics() -> None:
-    baseline = _compute_composite_score(50.0, 30.0, 0.5)
-    improved_overlap = _compute_composite_score(80.0, 30.0, 0.5)
-    improved_psnr = _compute_composite_score(50.0, 55.0, 0.5)
-    improved_ssim = _compute_composite_score(50.0, 30.0, 0.9)
+    baseline = composite_score(50.0, 30.0, 0.5)
+    improved_overlap = composite_score(80.0, 30.0, 0.5)
+    improved_psnr = composite_score(50.0, 55.0, 0.5)
+    improved_ssim = composite_score(50.0, 30.0, 0.9)
 
     assert improved_overlap > baseline
     assert improved_psnr > baseline
@@ -23,10 +17,10 @@ def test_compute_composite_score_increases_with_metrics() -> None:
 
 
 def test_readability_score_tracks_metrics() -> None:
-    baseline = _compute_readability_score(50.0, 30.0, 0.5)
-    improved_overlap = _compute_readability_score(80.0, 30.0, 0.5)
-    improved_psnr = _compute_readability_score(50.0, 55.0, 0.5)
-    improved_ssim = _compute_readability_score(50.0, 30.0, 0.9)
+    baseline = readability_score(50.0, 30.0, 0.5)
+    improved_overlap = readability_score(80.0, 30.0, 0.5)
+    improved_psnr = readability_score(50.0, 55.0, 0.5)
+    improved_ssim = readability_score(50.0, 30.0, 0.9)
 
     assert improved_overlap > baseline
     assert improved_psnr > baseline
@@ -52,7 +46,7 @@ def test_app_state_records_generations() -> None:
     assert entry["psnr"] == 42.0
     assert entry["ssim"] == 0.92
     assert entry["ai_score"] > 0
-    assert entry["composite_score"] == entry["sound_score"]
+    assert 0.0 < entry["composite_score"] <= entry["sound_score"]
     assert entry["sound_psnr"] == sound_metrics.psnr
     assert entry["sound_ssim"] == sound_metrics.ssim
     assert entry["sound_overlap"] == 64.0
