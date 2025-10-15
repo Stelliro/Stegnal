@@ -5,6 +5,7 @@ from umbra.codec import (
     DecodedWavMetadata,
     _ensure_rgb_image,
     decode_wav_bytes_to_image,
+    decode_waveform_to_image,
     encode_image_to_wav_bytes,
     encode_image_to_waveform,
 )
@@ -154,3 +155,52 @@ def test_decode_wav_bytes_supports_advanced_logging() -> None:
 
     assert decoded.shape == image.shape
     assert metadata.sample_rate == sample_rate
+
+
+def test_decode_waveform_to_image_returns_blank_on_failure() -> None:
+    waveform = np.zeros(0, dtype=np.float32)
+
+    decoded = decode_waveform_to_image(
+        waveform,
+        sample_rate=1024,
+        resolution=(4, 4),
+    )
+
+    assert decoded.shape == (4, 4, 3)
+    assert decoded.dtype == np.float32
+    assert np.all(decoded == 0.0)
+
+
+def test_decode_wav_bytes_to_image_returns_blank_on_failure() -> None:
+    bogus = b"not a wav"
+
+    decoded, detected_rate = decode_wav_bytes_to_image(
+        bogus,
+        resolution=(4, 4),
+        sample_rate=22_050,
+    )
+
+    assert detected_rate == 22_050
+    assert decoded.shape == (4, 4, 3)
+    assert decoded.dtype == np.float32
+    assert np.all(decoded == 0.0)
+
+
+def test_decode_wav_bytes_to_image_metadata_on_failure() -> None:
+    bogus = b"still not a wav"
+    marker = 0.12
+
+    decoded, metadata = decode_wav_bytes_to_image(
+        bogus,
+        resolution=(2, 2),
+        segments=None,
+        return_metadata=True,
+        marker_duration=marker,
+    )
+
+    assert decoded.shape == (2, 2, 3)
+    assert decoded.dtype == np.float32
+    assert np.all(decoded == 0.0)
+    assert metadata.sample_rate == 16_000
+    assert metadata.segments == 1
+    assert metadata.marker_duration == pytest.approx(marker, rel=1e-6)

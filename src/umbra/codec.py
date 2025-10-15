@@ -104,9 +104,10 @@ def decode_waveform_to_image(
 ) -> np.ndarray:
     """Decode ``waveform`` back into an RGB image."""
 
-    rows, cols = resolution
+    rows, cols = int(resolution[0]), int(resolution[1])
     if rows <= 0 or cols <= 0:
         raise ValueError("resolution must contain positive dimensions")
+    fallback = np.zeros((rows, cols, 3), dtype=np.float32)
     if advanced_logging:
         logger.debug(
             "Decoding waveform with advanced logging: samples=%d resolution=%s sample_rate=%d segments=%s marker_duration=%.5f",
@@ -116,14 +117,21 @@ def decode_waveform_to_image(
             "auto" if segments is None else int(segments),
             marker_duration,
         )
-    image = reconstruct_from_waveform(
-        waveform,
-        resolution=(int(rows), int(cols)),
-        sample_rate=int(sample_rate),
-        segments=segments,
-        marker_duration=float(marker_duration),
-        advanced_logging=advanced_logging,
-    )
+    try:
+        image = reconstruct_from_waveform(
+            waveform,
+            resolution=(rows, cols),
+            sample_rate=int(sample_rate),
+            segments=segments,
+            marker_duration=float(marker_duration),
+            advanced_logging=advanced_logging,
+        )
+    except Exception as exc:  # pragma: no cover - defensive audio fallback
+        logger.warning(
+            "Failed to reconstruct image from waveform; returning blank image: %s",
+            exc,
+        )
+        return fallback
     return image.astype(np.float32)
 
 
@@ -167,39 +175,81 @@ def decode_wav_bytes_to_image(
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("Expected WAV bytes for decoding")
 
-    waveform, detected_rate = load_waveform_from_wav(bytes(data))
-    target_rate = int(sample_rate or detected_rate)
-    if advanced_logging:
-        logger.debug(
-            "Loaded WAV bytes: detected_rate=%d override=%s resolution=%s segments=%s marker_duration=%.5f",
-            detected_rate,
-            sample_rate,
-            resolution,
-            "auto" if segments is None else int(segments),
-            marker_duration,
-        )
-    reconstructed, used_segments = reconstruct_from_waveform(
-        waveform,
-        resolution=(int(resolution[0]), int(resolution[1])),
-        sample_rate=target_rate,
-        segments=segments,
-        marker_duration=float(marker_duration),
-        advanced_logging=advanced_logging,
-        return_segments=True,
-    )
-    logger.debug(
-        "Decoded WAV bytes to image at %d Hz with resolution %s",
-        target_rate,
-        resolution,
-    )
-    if return_metadata:
-        metadata = DecodedWavMetadata(
+    rows, cols = int(resolution[0]), int(resolution[1])
+    if rows <= 0 or cols <= 0:
+        raise ValueError("resolution must contain positive dimensions")
+
+    fallback_image = np.zeros((rows, cols, 3), dtype=np.float32)
+    fallback_segments = 1
+    if isinstance(segments, int) and segments > 0:
+        fallback_segments = int(segments)
+
+    detected_rate: int | None = None
+    target_rate: int | None = None
+    used_segments: int | None = None
+
+    try:
+        waveform, detected_rate = load_waveform_from_wav(bytes(data))
+        target_rate = int(sample_rate or detected_rate)
+        if advanced_logging:
+            logger.debug(
+                "Loaded WAV bytes: detected_rate=%d override=%s resolution=%s segments=%s marker_duration=%.5f",
+                detected_rate,
+                sample_rate,
+                resolution,
+                "auto" if segments is None else int(segments),
+                marker_duration,
+            )
+        reconstructed, used_segments = reconstruct_from_waveform(
+            waveform,
+            resolution=(rows, cols),
             sample_rate=target_rate,
-            segments=int(used_segments),
+            segments=segments,
             marker_duration=float(marker_duration),
+            advanced_logging=advanced_logging,
+            return_segments=True,
         )
-        return reconstructed.astype(np.float32), metadata
-    return reconstructed.astype(np.float32), target_rate
+        logger.debug(
+            "Decoded WAV bytes to image at %d Hz with resolution %s",
+            target_rate,
+            resolution,
+        )
+        if return_metadata:
+            metadata = DecodedWavMetadata(
+                sample_rate=target_rate,
+                segments=int(used_segments),
+                marker_duration=float(marker_duration),
+            )
+            return reconstructed.astype(np.float32), metadata
+        return reconstructed.astype(np.float32), target_rate
+    except Exception as exc:  # pragma: no cover - defensive audio fallback
+        logger.warning(
+            "Failed to decode WAV bytes into image; returning blank image: %s",
+            exc,
+        )
+        fallback_rate_candidates = (
+            sample_rate,
+            target_rate,
+            detected_rate,
+        )
+        fallback_rate = 16_000
+        for candidate in fallback_rate_candidates:
+            try:
+                rate = int(candidate)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if rate > 0:
+                fallback_rate = rate
+                break
+
+        if return_metadata:
+            metadata = DecodedWavMetadata(
+                sample_rate=fallback_rate,
+                segments=int(used_segments) if used_segments else fallback_segments,
+                marker_duration=float(marker_duration),
+            )
+            return fallback_image, metadata
+        return fallback_image, fallback_rate
 
 
 def save_image_as_png(data: np.ndarray, path: str | Path) -> Path:
