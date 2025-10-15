@@ -747,6 +747,8 @@ class UmbraAppState:
         sound_overlap: float | None = None,
         sound_reference_metrics: ReconstructionMetrics | None = None,
         sound_reference_overlap: float | None = None,
+        sound_score: float | None = None,
+        sound_readability_score: float | None = None,
     ) -> dict[str, float]:
         """Store metrics for a completed generation and return the entry."""
 
@@ -755,9 +757,6 @@ class UmbraAppState:
         ssim_value = _nan_guard(metrics.ssim, 0.0)
 
         ai_score = composite_score(overlap_value, psnr_value, ssim_value)
-        # Default to a zero composite score so generations without a successful
-        # sound reconstruction never receive credit from the sound-first
-        # scoreboard.
         composite_value = 0.0
         entry: dict[str, float] = {
             "generation": float(generation_index),
@@ -769,47 +768,96 @@ class UmbraAppState:
             "ai_ssim": ssim_value,
             "ai_score": ai_score,
         }
-        if sound_metrics is not None and sound_overlap is not None:
+
+        sound_psnr_value: float | None = None
+        sound_ssim_value: float | None = None
+        sound_overlap_value: float | None = None
+
+        if sound_reference_metrics is not None and sound_reference_overlap is not None:
+            ref_overlap_value = _nan_guard(sound_reference_overlap, 0.0)
+            ref_psnr_value = _nan_guard(sound_reference_metrics.psnr, AI_PSNR_BASELINE)
+            ref_ssim_value = _nan_guard(sound_reference_metrics.ssim, 0.0)
+            entry.update(
+                {
+                    "sound_reference_psnr": ref_psnr_value,
+                    "sound_reference_ssim": ref_ssim_value,
+                    "sound_reference_overlap": ref_overlap_value,
+                }
+            )
+            sound_overlap_value = ref_overlap_value
+            sound_psnr_value = ref_psnr_value
+            sound_ssim_value = ref_ssim_value
+
+        if sound_psnr_value is None and sound_metrics is not None and sound_overlap is not None:
             sound_overlap_value = _nan_guard(sound_overlap, 0.0)
             sound_psnr_value = _nan_guard(sound_metrics.psnr, AI_PSNR_BASELINE)
             sound_ssim_value = _nan_guard(sound_metrics.ssim, 0.0)
-            sound_score = composite_score(
-                sound_overlap_value,
-                sound_psnr_value,
-                sound_ssim_value,
-            )
-            readability_value = readability_score(
-                sound_overlap_value,
-                sound_psnr_value,
-                sound_ssim_value,
-            )
+
+        computed_sound_score: float | None = None
+        if (
+            sound_overlap_value is not None
+            and sound_psnr_value is not None
+            and sound_ssim_value is not None
+        ):
             entry.update(
                 {
                     "sound_psnr": sound_psnr_value,
                     "sound_ssim": sound_ssim_value,
                     "sound_overlap": sound_overlap_value,
-                    "sound_score": sound_score,
-                    "sound_readability_score": readability_value,
                 }
             )
-            if math.isfinite(sound_score):
-                self.sound_scores.append(sound_score)
+            computed_sound_score = composite_score(
+                sound_overlap_value, sound_psnr_value, sound_ssim_value
+            )
+
+        sound_score_value: float | None = None
+        if sound_score is not None:
+            try:
+                sound_score_value = float(np.clip(sound_score, 0.0, 100.0))
+            except (TypeError, ValueError):
+                sound_score_value = None
+        elif computed_sound_score is not None:
+            sound_score_value = float(np.clip(computed_sound_score, 0.0, 100.0))
+
+        readability_value: float | None = None
+        if sound_readability_score is not None:
+            try:
+                readability_value = float(np.clip(sound_readability_score, 0.0, 100.0))
+            except (TypeError, ValueError):
+                readability_value = None
+        elif (
+            sound_overlap_value is not None
+            and sound_psnr_value is not None
+            and sound_ssim_value is not None
+        ):
+            readability_value = readability_score(
+                sound_overlap_value, sound_psnr_value, sound_ssim_value
+            )
+
+        if sound_score_value is not None:
+            entry["sound_score"] = sound_score_value
+            if math.isfinite(sound_score_value):
+                self.sound_scores.append(sound_score_value)
+        if readability_value is not None:
+            readability_value = float(np.clip(readability_value, 0.0, 100.0))
+            entry["sound_readability_score"] = readability_value
             if math.isfinite(readability_value):
                 self.readability_scores.append(readability_value)
-            if math.isfinite(sound_score):
-                combined = float(np.clip((2.0 * sound_score + ai_score) / 3.0, 0.0, 100.0))
-                severity = float(np.clip((sound_score / 100.0) ** 1.4, 0.0, 1.0))
-                composite_value = float(np.clip(combined * severity, 0.0, 100.0))
-        if sound_reference_metrics is not None and sound_reference_overlap is not None:
-            entry.update(
-                {
-                    "sound_reference_psnr": _nan_guard(
-                        sound_reference_metrics.psnr, AI_PSNR_BASELINE
-                    ),
-                    "sound_reference_ssim": _nan_guard(sound_reference_metrics.ssim, 0.0),
-                    "sound_reference_overlap": _nan_guard(sound_reference_overlap, 0.0),
-                }
+
+        if sound_score_value is not None:
+            readability_fraction = 1.0
+            if readability_value is not None and math.isfinite(readability_value):
+                readability_fraction = float(
+                    np.clip(readability_value / 100.0, 0.0, 1.0)
+                )
+            composite_value = float(
+                np.clip(
+                    (ai_score * sound_score_value / 100.0) * readability_fraction,
+                    0.0,
+                    100.0,
+                )
             )
+
         entry["composite_score"] = composite_value
         self.history.append(entry)
         self.composite_scores.append(float(composite_value))
@@ -1966,6 +2014,10 @@ class UmbraDesktopApp:
                     sound_payload["marker_duration"] = float(best.waveform_marker_duration)
                 if best.waveform_sound_score is not None:
                     sound_payload["sound_score"] = float(best.waveform_sound_score)
+                if getattr(best, "waveform_readability_score", None) is not None:
+                    sound_payload["sound_readability_score"] = float(
+                        best.waveform_readability_score
+                    )
             else:
                 logger.debug(
                     "Waveform reconstruction unavailable for seed %d", best.seed
@@ -1980,6 +2032,8 @@ class UmbraDesktopApp:
                 sound_overlap=sound_payload.get("sound_overlap"),
                 sound_reference_metrics=sound_payload.get("sound_reference_metrics"),
                 sound_reference_overlap=sound_payload.get("sound_reference_overlap"),
+                sound_score=sound_payload.get("sound_score"),
+                sound_readability_score=sound_payload.get("sound_readability_score"),
             )
             self._latest_sound_payload = dict(sound_payload) if sound_payload else None
             self._latest_generation_entry = dict(entry)
@@ -2463,15 +2517,27 @@ class UmbraDesktopApp:
         if "generation" in entry:
             status_parts.append(f"Generation {_as_float('generation'):.0f}")
         sound_score = entry.get("sound_score")
-        if sound_score is not None:
+        if (
+            sound_score is not None
+            and "sound_overlap" in entry
+            and "sound_psnr" in entry
+            and "sound_ssim" in entry
+        ):
             status_parts.append(f"Sound overlap {_as_float('sound_overlap'):.2f}%")
-        status_parts.append(f"Sound PSNR {_as_float('sound_psnr', AI_PSNR_BASELINE):.2f} dB")
-        if sound_score is not None:
+            status_parts.append(f"Sound PSNR {_as_float('sound_psnr'):.2f} dB")
             status_parts.append(f"Sound SSIM {_as_float('sound_ssim'):.3f}")
             try:
                 status_parts.append(f"Sound score {float(sound_score):.2f}")
             except (TypeError, ValueError):
                 status_parts.append("Sound score unavailable")
+            readability_value = entry.get("sound_readability_score")
+            if readability_value is not None:
+                try:
+                    status_parts.append(
+                        f"Sound readability {float(readability_value):.2f}"
+                    )
+                except (TypeError, ValueError):
+                    status_parts.append("Sound readability unavailable")
         else:
             status_parts.append("Sound score unavailable")
         composite_score = entry.get("composite_score")
@@ -2533,18 +2599,22 @@ class UmbraDesktopApp:
                 pass
         self._recon_info_var.set(ai_text)
 
-        if "sound_score" in entry or "sound_overlap" in entry:
+        sound_score = entry.get("sound_score")
+        if (
+            sound_score is not None
+            and "sound_overlap" in entry
+            and "sound_psnr" in entry
+            and "sound_ssim" in entry
+        ):
             sound_text = (
                 f"Overlap {_as_float('sound_overlap'):.2f}% · "
-                f"PSNR {_as_float('sound_psnr', AI_PSNR_BASELINE):.2f} dB · "
+                f"PSNR {_as_float('sound_psnr'):.2f} dB · "
                 f"SSIM {_as_float('sound_ssim'):.3f}"
             )
-            sound_score = entry.get("sound_score")
-            if sound_score is not None:
-                try:
-                    sound_text += f" · Score {float(sound_score):.2f}"
-                except (TypeError, ValueError):
-                    pass
+            try:
+                sound_text += f" · Score {float(sound_score):.2f}"
+            except (TypeError, ValueError):
+                pass
             readability = entry.get("sound_readability_score")
             if readability is not None:
                 try:

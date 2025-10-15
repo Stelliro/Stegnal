@@ -1,5 +1,7 @@
 import itertools
 
+import pytest
+
 import umbra.ui as ui
 from umbra.metrics import ReconstructionMetrics, composite_score, readability_score
 from umbra.ui import UmbraAppState, _generate_unique_model_path, _normalize_pinterest_url
@@ -32,6 +34,8 @@ def test_app_state_records_generations() -> None:
     metrics = ReconstructionMetrics(psnr=42.0, ssim=0.92)
 
     sound_metrics = ReconstructionMetrics(psnr=28.0, ssim=0.66)
+    sound_score = composite_score(70.0, metrics.psnr, metrics.ssim)
+    sound_readability = readability_score(70.0, metrics.psnr, metrics.ssim)
     entry = state.record_generation(
         5,
         metrics,
@@ -40,18 +44,22 @@ def test_app_state_records_generations() -> None:
         sound_overlap=64.0,
         sound_reference_metrics=metrics,
         sound_reference_overlap=70.0,
+        sound_score=sound_score,
+        sound_readability_score=sound_readability,
     )
     assert entry["generation"] == 5
     assert entry["overlap"] == 76.0
     assert entry["psnr"] == 42.0
     assert entry["ssim"] == 0.92
     assert entry["ai_score"] > 0
-    assert 0.0 < entry["composite_score"] <= entry["sound_score"]
-    assert entry["sound_psnr"] == sound_metrics.psnr
-    assert entry["sound_ssim"] == sound_metrics.ssim
-    assert entry["sound_overlap"] == 64.0
-    assert entry["sound_score"] > 0
-    assert entry["sound_readability_score"] > 0
+    assert entry["sound_psnr"] == pytest.approx(metrics.psnr)
+    assert entry["sound_ssim"] == pytest.approx(metrics.ssim)
+    assert entry["sound_overlap"] == pytest.approx(70.0)
+    assert entry["sound_score"] == pytest.approx(sound_score)
+    assert entry["sound_readability_score"] == pytest.approx(sound_readability)
+    ai_score = entry["ai_score"]
+    expected_overall = (ai_score * sound_score / 100.0) * (sound_readability / 100.0)
+    assert entry["composite_score"] == pytest.approx(expected_overall)
     assert state.sound_scores[-1] == entry["sound_score"]
     assert state.readability_scores[-1] == entry["sound_readability_score"]
 

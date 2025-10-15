@@ -23,6 +23,7 @@ from .metrics import (
     compute_metrics,
     compute_ms_ssim,
     dct_band_correlation,
+    readability_score,
 )
 from .reconstruction import suggest_sample_rate, suggest_transmission_profile
 from .runs import append_history, get_run_paths, load_history, new_run
@@ -210,6 +211,7 @@ class CandidateResult:
     waveform_segments: int | None = None
     waveform_marker_duration: float | None = None
     waveform_sound_score: float | None = None
+    waveform_readability_score: float | None = None
     reward: float = 0.0
     predicted_reward: float | None = None
     feature_vector: tuple[float, ...] = field(default_factory=tuple)
@@ -595,6 +597,7 @@ class EvolutionManager:
         waveform_segments: int | None = None
         waveform_marker_duration: float | None = None
         waveform_sound_score: float | None = None
+        waveform_readability_score: float | None = None
 
         if self.enable_waveform and waveform_config is not None:
             waveform_sample_rate = int(waveform_config.get("sample_rate", 0)) or None
@@ -651,6 +654,11 @@ class EvolutionManager:
                         waveform_reference_metrics.psnr,
                         waveform_reference_metrics.ssim,
                     )
+                    waveform_readability_score = readability_score(
+                        float(waveform_reference_overlap),
+                        waveform_reference_metrics.psnr,
+                        waveform_reference_metrics.ssim,
+                    )
 
         return CandidateResult(
             seed=int(seed),
@@ -674,6 +682,9 @@ class EvolutionManager:
             waveform_sound_score=None
             if waveform_sound_score is None
             else float(waveform_sound_score),
+            waveform_readability_score=None
+            if waveform_readability_score is None
+            else float(waveform_readability_score),
         )
 
     def _candidate_features(
@@ -923,17 +934,23 @@ class EvolutionManager:
             raw_reward = float(np.clip(raw_reward, 0.0, 6.0))
             reward = raw_reward
             if candidate.waveform_sound_score is not None:
-                audio_fraction = float(
+                sound_fraction = float(
                     np.clip(candidate.waveform_sound_score / 100.0, 0.0, 1.0)
                 )
-                audio_component = raw_reward * audio_fraction
-                blended = float(np.clip(((2.0 * audio_component) + raw_reward) / 3.0, 0.0, 6.0))
-                severity = float(np.clip(audio_fraction ** 1.2, 0.0, 1.0))
-                penalty = float(np.clip(0.05 + 0.95 * severity, 0.0, 1.0))
-                reward = float(np.clip(blended * penalty, 0.0, 6.0))
+                readability_fraction = 1.0
+                readability_value = getattr(
+                    candidate, "waveform_readability_score", None
+                )
+                if readability_value is not None:
+                    readability_fraction = float(
+                        np.clip(readability_value / 100.0, 0.0, 1.0)
+                    )
+                combined_fraction = sound_fraction * readability_fraction
+                reward = float(np.clip(raw_reward * combined_fraction, 0.0, 6.0))
                 components["waveform_score"] = float(candidate.waveform_sound_score)
-                components["waveform_fraction"] = audio_fraction
-                components["waveform_penalty"] = penalty
+                components["waveform_fraction"] = combined_fraction
+                components["waveform_match"] = sound_fraction
+                components["waveform_readability"] = readability_fraction
             candidate.reward = reward
             candidate.predicted_reward = predicted
             candidate.feature_vector = tuple(float(value) for value in features)
@@ -1218,6 +1235,16 @@ class EvolutionManager:
                             if getattr(candidate, "waveform_marker_duration", None) is None
                             else float(candidate.waveform_marker_duration)
                         ),
+                        waveform_sound_score=(
+                            None
+                            if getattr(candidate, "waveform_sound_score", None) is None
+                            else float(candidate.waveform_sound_score)
+                        ),
+                        waveform_readability_score=(
+                            None
+                            if getattr(candidate, "waveform_readability_score", None) is None
+                            else float(candidate.waveform_readability_score)
+                        ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(
                             None
@@ -1362,6 +1389,16 @@ class EvolutionManager:
                             None
                             if getattr(candidate, "waveform_marker_duration", None) is None
                             else float(candidate.waveform_marker_duration)
+                        ),
+                        waveform_sound_score=(
+                            None
+                            if getattr(candidate, "waveform_sound_score", None) is None
+                            else float(candidate.waveform_sound_score)
+                        ),
+                        waveform_readability_score=(
+                            None
+                            if getattr(candidate, "waveform_readability_score", None) is None
+                            else float(candidate.waveform_readability_score)
                         ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(
