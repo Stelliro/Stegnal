@@ -93,6 +93,67 @@ def encode_image_to_wav_bytes(
     return waveform_to_wav_bytes(waveform, sample_rate)
 
 
+def _reconstruct_with_strategies(
+    waveform: np.ndarray,
+    *,
+    resolution: tuple[int, int],
+    sample_rate: int,
+    marker_duration: float,
+    segments: int | None,
+    advanced_logging: bool,
+) -> tuple[np.ndarray, int]:
+    """Attempt waveform reconstruction using multiple segment strategies."""
+
+    attempts: list[tuple[str, int | None]] = []
+    if segments is not None:
+        attempts.append(("requested", int(segments)))
+    attempts.append(("auto", None))
+    attempts.append(("single", 1))
+
+    tried: set[int | str] = set()
+    failures: list[str] = []
+
+    for label, segment_hint in attempts:
+        key: int | str = "auto" if segment_hint is None else int(segment_hint)
+        if key in tried:
+            continue
+        tried.add(key)
+
+        if advanced_logging:
+            logger.debug(
+                "Attempting waveform reconstruction with %s segments", key
+            )
+
+        try:
+            result = reconstruct_from_waveform(
+                waveform,
+                resolution=resolution,
+                sample_rate=sample_rate,
+                segments=segment_hint,
+                marker_duration=marker_duration,
+                advanced_logging=advanced_logging,
+                return_segments=True,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            message = f"{label} ({key}) failed: {exc}"
+            failures.append(message)
+            if advanced_logging:
+                logger.debug(message)
+            continue
+
+        image: np.ndarray
+        used_segments: int
+        if isinstance(result, tuple):
+            image, used_segments = result
+        else:  # pragma: no cover - legacy behaviour guard
+            image = result
+            used_segments = 1 if segment_hint in (None, 0) else int(segment_hint)
+
+        return np.asarray(image, dtype=np.float32), int(max(used_segments, 1))
+
+    raise RuntimeError("; ".join(failures) if failures else "reconstruction failed")
+
+
 def decode_waveform_to_image(
     waveform: np.ndarray,
     *,
@@ -118,7 +179,7 @@ def decode_waveform_to_image(
             marker_duration,
         )
     try:
-        image = reconstruct_from_waveform(
+        image, _used_segments = _reconstruct_with_strategies(
             waveform,
             resolution=(rows, cols),
             sample_rate=int(sample_rate),
@@ -126,13 +187,13 @@ def decode_waveform_to_image(
             marker_duration=float(marker_duration),
             advanced_logging=advanced_logging,
         )
+        return image.astype(np.float32)
     except Exception as exc:  # pragma: no cover - defensive audio fallback
         logger.warning(
             "Failed to reconstruct image from waveform; returning blank image: %s",
             exc,
         )
         return fallback
-    return image.astype(np.float32)
 
 
 def decode_wav_bytes_to_image(
@@ -200,14 +261,13 @@ def decode_wav_bytes_to_image(
                 "auto" if segments is None else int(segments),
                 marker_duration,
             )
-        reconstructed, used_segments = reconstruct_from_waveform(
+        reconstructed, used_segments = _reconstruct_with_strategies(
             waveform,
             resolution=(rows, cols),
             sample_rate=target_rate,
             segments=segments,
             marker_duration=float(marker_duration),
             advanced_logging=advanced_logging,
-            return_segments=True,
         )
         logger.debug(
             "Decoded WAV bytes to image at %d Hz with resolution %s",

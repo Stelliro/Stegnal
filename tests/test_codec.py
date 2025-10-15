@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import umbra.codec as codec_module
 from umbra.codec import (
     DecodedWavMetadata,
     _ensure_rgb_image,
@@ -171,6 +172,45 @@ def test_decode_waveform_to_image_returns_blank_on_failure() -> None:
     assert np.all(decoded == 0.0)
 
 
+def test_decode_waveform_to_image_attempts_alternative_segments(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int | None] = []
+
+    def fake_reconstruct(
+        waveform: np.ndarray,
+        *,
+        resolution: tuple[int, int],
+        sample_rate: int,
+        segments: int | None,
+        marker_duration: float,
+        advanced_logging: bool,
+        return_segments: bool,
+    ) -> tuple[np.ndarray, int]:
+        calls.append(segments)
+        rows, cols = resolution
+        if segments == 2:
+            raise ValueError("requested segments invalid")
+        image = np.full((rows, cols, 3), 0.25, dtype=np.float32)
+        detected = 5 if segments is None else int(segments)
+        return image, detected
+
+    monkeypatch.setattr(codec_module, "reconstruct_from_waveform", fake_reconstruct)
+
+    waveform = np.ones(16, dtype=np.float32)
+    decoded = decode_waveform_to_image(
+        waveform,
+        sample_rate=16,
+        resolution=(2, 2),
+        segments=2,
+        marker_duration=0.01,
+        advanced_logging=True,
+    )
+
+    assert calls == [2, None]
+    assert decoded.shape == (2, 2, 3)
+    assert decoded.dtype == np.float32
+    assert np.allclose(decoded, 0.25)
+
+
 def test_decode_wav_bytes_to_image_returns_blank_on_failure() -> None:
     bogus = b"not a wav"
 
@@ -184,6 +224,49 @@ def test_decode_wav_bytes_to_image_returns_blank_on_failure() -> None:
     assert decoded.shape == (4, 4, 3)
     assert decoded.dtype == np.float32
     assert np.all(decoded == 0.0)
+
+
+def test_decode_wav_bytes_to_image_attempts_segment_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    waveform = np.ones(32, dtype=np.float32)
+
+    def fake_loader(data: bytes) -> tuple[np.ndarray, int]:
+        return waveform, 22_050
+
+    calls: list[int | None] = []
+
+    def fake_reconstruct(
+        waveform: np.ndarray,
+        *,
+        resolution: tuple[int, int],
+        sample_rate: int,
+        segments: int | None,
+        marker_duration: float,
+        advanced_logging: bool,
+        return_segments: bool,
+    ) -> tuple[np.ndarray, int]:
+        calls.append(segments)
+        rows, cols = resolution
+        if segments == 3:
+            raise RuntimeError("primary attempt failed")
+        image = np.full((rows, cols, 3), 0.5, dtype=np.float32)
+        detected = 7 if segments is None else int(segments)
+        return image, detected
+
+    monkeypatch.setattr(codec_module, "load_waveform_from_wav", fake_loader)
+    monkeypatch.setattr(codec_module, "reconstruct_from_waveform", fake_reconstruct)
+
+    decoded, metadata = decode_wav_bytes_to_image(
+        b"fake wav",
+        resolution=(3, 3),
+        segments=3,
+        return_metadata=True,
+    )
+
+    assert calls == [3, None]
+    assert decoded.shape == (3, 3, 3)
+    assert np.allclose(decoded, 0.5)
+    assert metadata.sample_rate == 22_050
+    assert metadata.segments == 7
 
 
 def test_decode_wav_bytes_to_image_metadata_on_failure() -> None:
