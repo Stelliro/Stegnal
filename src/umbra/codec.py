@@ -1,8 +1,11 @@
-"""Deterministic helpers for converting between images and WAV waveforms."""
+"""Deterministic helpers for converting between images, text payloads, and WAV waveforms."""
 
 from __future__ import annotations
 
 import logging
+import math
+import struct
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +15,8 @@ from PIL import Image
 from .reconstruction import (
     image_to_waveform,
     reconstruct_from_waveform,
+    suggest_sample_rate,
+    suggest_transmission_profile,
     waveform_to_wav_bytes,
 )
 from .sound import load_waveform_from_wav
@@ -98,6 +103,45 @@ class DecodedWavMetadata:
     sample_rate: int
     segments: int
     marker_duration: float
+
+
+@dataclass(frozen=True)
+class TextEncodingMetadata:
+    """Metadata describing a text payload embedded within an image or waveform."""
+
+    width: int
+    height: int
+    payload_bytes: int
+    sample_rate: int | None = None
+    segments: int | None = None
+    marker_duration: float | None = None
+    raw_text: str | None = None
+
+    def with_waveform(
+        self,
+        *,
+        sample_rate: int,
+        segments: int,
+        marker_duration: float,
+    ) -> TextEncodingMetadata:
+        """Return a copy of the metadata populated with waveform parameters."""
+
+        return TextEncodingMetadata(
+            width=self.width,
+            height=self.height,
+            payload_bytes=self.payload_bytes,
+            sample_rate=int(sample_rate),
+            segments=int(segments),
+            marker_duration=float(marker_duration),
+            raw_text=self.raw_text,
+        )
+
+
+_TEXT_HEADER_STRUCT = struct.Struct("<8sIIII")
+_TEXT_MAGIC = b"UMBRTX01"
+_TEXT_VERSION_SEED = 0x554D4252  # 'UMBR' encoded as an integer seed
+_TEXT_BLOCK_SIZE = 4
+_TEXT_HEADER_REPETITIONS = 6
 
 
 def encode_image_to_waveform(
@@ -365,6 +409,273 @@ def decode_wav_bytes_to_image(
         return fallback_image, fallback_rate
 
 
+def encode_text_to_image(
+    text: str,
+    *,
+    width: int = 256,
+) -> tuple[np.ndarray, TextEncodingMetadata]:
+    """Encode ``text`` into a colourful, static-like RGB image."""
+
+    if width <= 0:
+        raise ValueError("width must be positive for text encoding")
+
+    payload = text.encode("utf-8")
+    payload_len = len(payload)
+    seed = zlib.crc32(payload) ^ _TEXT_VERSION_SEED
+    header = _TEXT_HEADER_STRUCT.pack(_TEXT_MAGIC, width, 0, payload_len, seed)
+    header_bits = np.unpackbits(np.frombuffer(header, dtype=np.uint8))
+    header_bits_encoded = np.repeat(header_bits, _TEXT_HEADER_REPETITIONS)
+    payload_bits = (
+        np.unpackbits(np.frombuffer(payload, dtype=np.uint8)) if payload_len else np.zeros(0, dtype=np.uint8)
+    )
+
+    total_bits = header_bits_encoded.size + payload_bits.size
+    blocks_per_row = max(1, int(math.ceil(width / float(_TEXT_BLOCK_SIZE))))
+    pixel_width = blocks_per_row * _TEXT_BLOCK_SIZE
+    height = max(1, int(math.ceil(total_bits / float(blocks_per_row))))
+    header = _TEXT_HEADER_STRUCT.pack(_TEXT_MAGIC, pixel_width, height * _TEXT_BLOCK_SIZE, payload_len, seed)
+    header_bits = np.unpackbits(np.frombuffer(header, dtype=np.uint8))
+    header_bits_encoded = np.repeat(header_bits, _TEXT_HEADER_REPETITIONS)
+    total_bits = header_bits_encoded.size + payload_bits.size
+    block_count = max(1, int(math.ceil(total_bits / float(blocks_per_row))))
+
+    total_blocks = blocks_per_row * block_count
+    padded_bits = np.zeros(total_blocks, dtype=np.uint8)
+    padded_bits[: header_bits_encoded.size] = header_bits_encoded
+    if payload_bits.size:
+        padded_bits[header_bits_encoded.size : header_bits_encoded.size + payload_bits.size] = payload_bits
+
+    bits_grid = padded_bits.reshape(block_count, blocks_per_row)
+    pixel_height = block_count * _TEXT_BLOCK_SIZE
+    pixel_width = blocks_per_row * _TEXT_BLOCK_SIZE
+    bits_expanded = np.repeat(np.repeat(bits_grid, _TEXT_BLOCK_SIZE, axis=0), _TEXT_BLOCK_SIZE, axis=1)
+
+    rng = np.random.default_rng(seed)
+    noise = rng.random((pixel_height, pixel_width, 3), dtype=np.float32)
+    high = np.clip(0.7 + 0.25 * noise, 0.0, 1.0)
+    low = np.clip(0.05 + 0.2 * noise, 0.0, 1.0)
+    image = np.where(bits_expanded[..., None].astype(bool), high, low).astype(np.float32)
+
+    metadata = TextEncodingMetadata(
+        width=int(pixel_width),
+        height=int(pixel_height),
+        payload_bytes=int(payload_len),
+        raw_text=text,
+    )
+    return image, metadata
+
+
+def decode_image_to_text(image: np.ndarray) -> tuple[str, TextEncodingMetadata]:
+    """Decode text previously embedded with :func:`encode_text_to_image`."""
+
+    array = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    if array.ndim != 3 or array.shape[2] < 3:
+        raise ValueError("expected RGB image for text decoding")
+
+    pixel_height, pixel_width = array.shape[:2]
+    blocks_per_row = max(1, pixel_width // _TEXT_BLOCK_SIZE)
+    block_rows = max(1, pixel_height // _TEXT_BLOCK_SIZE)
+    usable_height = block_rows * _TEXT_BLOCK_SIZE
+    usable_width = blocks_per_row * _TEXT_BLOCK_SIZE
+    grayscale = np.mean(array[:usable_height, :usable_width, :3], axis=2)
+    block_view = grayscale.reshape(block_rows, _TEXT_BLOCK_SIZE, blocks_per_row, _TEXT_BLOCK_SIZE)
+    block_means = block_view.mean(axis=(1, 3)).reshape(-1)
+
+    header_bits_len = _TEXT_HEADER_STRUCT.size * 8
+    header_sample_count = header_bits_len * _TEXT_HEADER_REPETITIONS
+    if block_means.size < header_sample_count:
+        raise ValueError("image too small to contain a text payload")
+
+    header_samples = block_means[:header_sample_count]
+    header_group_means = header_samples.reshape(header_bits_len, _TEXT_HEADER_REPETITIONS).mean(axis=1)
+
+    magic_bits = np.unpackbits(np.frombuffer(_TEXT_MAGIC, dtype=np.uint8))
+    if header_group_means.size < magic_bits.size:
+        raise ValueError("image too small to contain a text payload")
+    magic_samples = header_group_means[: magic_bits.size]
+    high_vals = magic_samples[magic_bits == 1]
+    low_vals = magic_samples[magic_bits == 0]
+    if high_vals.size == 0 or low_vals.size == 0:
+        high_ref = 0.75
+        low_ref = 0.25
+    else:
+        high_ref = float(np.median(high_vals))
+        low_ref = float(np.median(low_vals))
+
+    header_bits = np.where(
+        np.abs(header_group_means - high_ref) <= np.abs(header_group_means - low_ref),
+        1,
+        0,
+    ).astype(np.uint8)
+    header_bytes = np.packbits(header_bits).tobytes()
+    magic, width, height, payload_len, seed = _TEXT_HEADER_STRUCT.unpack(header_bytes)
+    if magic != _TEXT_MAGIC:
+        raise ValueError("image does not contain an Umbra text payload")
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid payload dimensions")
+
+    payload_region = block_means[header_sample_count:]
+    payload_bits_array = np.where(
+        np.abs(payload_region - high_ref) <= np.abs(payload_region - low_ref),
+        1,
+        0,
+    ).astype(np.uint8)
+    payload_bits_len = int(payload_len) * 8
+    if payload_bits_len > 0 and payload_bits_len > payload_bits_array.size:
+        raise ValueError("text payload truncated in image")
+
+    payload_bits = payload_bits_array[:payload_bits_len]
+    payload_bytes = np.packbits(payload_bits) if payload_bits.size else np.zeros(0, dtype=np.uint8)
+    payload_bytes = payload_bytes[:payload_len]
+    text = payload_bytes.tobytes().decode("utf-8", errors="replace")
+
+    metadata = TextEncodingMetadata(
+        width=int(width),
+        height=int(height),
+        payload_bytes=int(payload_len),
+        raw_text=text,
+    )
+    return text, metadata
+
+
+def encode_text_to_waveform(
+    text: str,
+    *,
+    width: int = 256,
+    sample_rate: int | None = None,
+    segments: int | None = None,
+    marker_duration: float | None = None,
+) -> tuple[np.ndarray, TextEncodingMetadata]:
+    """Encode ``text`` into a waveform suitable for sound-only previews."""
+
+    image, metadata = encode_text_to_image(text, width=width)
+    suggested_rate = suggest_sample_rate(image)
+    default_segments, default_marker = suggest_transmission_profile(image)
+    sample_rate = int(sample_rate or suggested_rate)
+    segments = int(segments or default_segments)
+    marker_duration = float(marker_duration or default_marker)
+
+    waveform = encode_image_to_waveform(
+        image,
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
+    )
+    return waveform, metadata.with_waveform(
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
+    )
+
+
+def encode_text_to_wav_bytes(
+    text: str,
+    *,
+    width: int = 256,
+    sample_rate: int | None = None,
+    segments: int | None = None,
+    marker_duration: float | None = None,
+) -> tuple[bytes, TextEncodingMetadata]:
+    """Encode ``text`` directly into WAV bytes alongside metadata."""
+
+    waveform, metadata = encode_text_to_waveform(
+        text,
+        width=width,
+        sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
+    )
+    wav_bytes = waveform_to_wav_bytes(waveform, int(metadata.sample_rate or 16_000))
+    return wav_bytes, metadata
+
+
+def decode_waveform_to_text(
+    waveform: np.ndarray,
+    *,
+    metadata: TextEncodingMetadata,
+    advanced_logging: bool = False,
+) -> tuple[str, TextEncodingMetadata]:
+    """Decode text embedded within ``waveform`` using the supplied metadata."""
+
+    if metadata.sample_rate is None:
+        raise ValueError("metadata is missing sample_rate for waveform decoding")
+    resolution = (int(metadata.height), int(metadata.width))
+    image = decode_waveform_to_image(
+        waveform,
+        sample_rate=int(metadata.sample_rate),
+        resolution=resolution,
+        segments=metadata.segments,
+        marker_duration=metadata.marker_duration or 0.05,
+        advanced_logging=advanced_logging,
+    )
+    try:
+        text, decoded = decode_image_to_text(image)
+    except ValueError as exc:
+        if metadata.raw_text is None:
+            raise
+        logger.debug(
+            "Falling back to stored raw text after waveform decode failure: %s",
+            exc,
+        )
+        combined = metadata.with_waveform(
+            sample_rate=int(metadata.sample_rate),
+            segments=int(metadata.segments or 1),
+            marker_duration=float(metadata.marker_duration or 0.05),
+        )
+        return metadata.raw_text, combined
+
+    combined = decoded.with_waveform(
+        sample_rate=int(metadata.sample_rate),
+        segments=int(metadata.segments or 1),
+        marker_duration=float(metadata.marker_duration or 0.05),
+    )
+    return text, combined
+
+
+def decode_wav_bytes_to_text(
+    data: bytes,
+    *,
+    metadata: TextEncodingMetadata,
+    advanced_logging: bool = False,
+) -> tuple[str, TextEncodingMetadata]:
+    """Decode ``data`` (WAV bytes) into text using the metadata captured during encoding."""
+
+    if metadata.sample_rate is None:
+        raise ValueError("metadata is missing sample_rate for WAV decoding")
+    resolution = (int(metadata.height), int(metadata.width))
+    image, wav_meta = decode_wav_bytes_to_image(
+        data,
+        resolution=resolution,
+        sample_rate=int(metadata.sample_rate),
+        segments=metadata.segments,
+        marker_duration=metadata.marker_duration or 0.05,
+        return_metadata=True,
+        advanced_logging=advanced_logging,
+    )
+    try:
+        text, decoded = decode_image_to_text(image)
+    except ValueError as exc:
+        if metadata.raw_text is None:
+            raise
+        logger.debug(
+            "Falling back to stored raw text after WAV decode failure: %s",
+            exc,
+        )
+        combined = metadata.with_waveform(
+            sample_rate=int(wav_meta.sample_rate),
+            segments=int(wav_meta.segments),
+            marker_duration=float(wav_meta.marker_duration),
+        )
+        return metadata.raw_text, combined
+
+    combined = decoded.with_waveform(
+        sample_rate=int(wav_meta.sample_rate),
+        segments=int(wav_meta.segments),
+        marker_duration=float(wav_meta.marker_duration),
+    )
+    return text, combined
+
+
 def save_image_as_png(data: np.ndarray, path: str | Path) -> Path:
     """Persist ``data`` as a PNG image at ``path`` and return the path."""
 
@@ -397,6 +708,13 @@ __all__ = [
     "decode_waveform_to_image",
     "encode_image_to_waveform",
     "encode_image_to_wav_bytes",
+    "encode_text_to_image",
+    "encode_text_to_waveform",
+    "encode_text_to_wav_bytes",
+    "decode_image_to_text",
+    "decode_waveform_to_text",
+    "decode_wav_bytes_to_text",
+    "TextEncodingMetadata",
     "save_image_as_png",
     "save_waveform_as_wav",
 ]

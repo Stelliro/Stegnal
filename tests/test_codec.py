@@ -5,10 +5,14 @@ import umbra.codec as codec_module
 from umbra.codec import (
     DecodedWavMetadata,
     _ensure_rgb_image,
+    decode_image_to_text,
     decode_wav_bytes_to_image,
     decode_waveform_to_image,
     encode_image_to_wav_bytes,
     encode_image_to_waveform,
+    encode_text_to_image,
+    encode_text_to_wav_bytes,
+    encode_text_to_waveform,
 )
 from umbra.metrics import compute_metrics
 
@@ -326,3 +330,41 @@ def test_decode_waveform_to_image_returns_preview_when_reconstruction_fails(
     assert preview.min() >= 0.0
     assert preview.max() <= 1.0
     assert not np.allclose(preview, preview[0, 0, 0])
+
+
+def test_text_image_round_trip() -> None:
+    payload = "The quick brown fox jumps over the lazy dog." * 5
+    image, metadata = encode_text_to_image(payload, width=64)
+
+    assert metadata.payload_bytes == len(payload.encode("utf-8"))
+    assert image.dtype == np.float32
+    assert image.shape[2] == 3
+
+    decoded, decoded_meta = decode_image_to_text(image)
+    assert decoded.rstrip("\0") == payload
+    assert decoded_meta.payload_bytes == metadata.payload_bytes
+
+
+def test_text_waveform_round_trip() -> None:
+    payload = "Bee movie script line " * 200
+    waveform, metadata = encode_text_to_waveform(payload, width=128)
+
+    assert waveform.ndim == 1
+    assert metadata.sample_rate is not None
+    assert metadata.segments is not None
+
+    text, decoded_meta = codec_module.decode_waveform_to_text(
+        waveform,
+        metadata=metadata,
+    )
+    assert text.rstrip("\0") == payload
+    assert decoded_meta.payload_bytes == metadata.payload_bytes
+
+
+def test_text_wav_bytes_round_trip() -> None:
+    payload = "Signal data" * 100
+    wav_bytes, metadata = encode_text_to_wav_bytes(payload, width=96)
+
+    text, decoded_meta = codec_module.decode_wav_bytes_to_text(wav_bytes, metadata=metadata)
+    assert text.rstrip("\0") == payload
+    assert decoded_meta.sample_rate == metadata.sample_rate

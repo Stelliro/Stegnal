@@ -48,7 +48,14 @@ try:  # pragma: no cover - optional dependency for memory accounting
 except Exception:  # pragma: no cover - optional dependency
     psutil = None
 
-from .codec import encode_image_to_wav_bytes
+from .codec import (
+    TextEncodingMetadata,
+    decode_image_to_text,
+    encode_image_to_wav_bytes,
+    encode_text_to_image,
+    encode_text_to_waveform,
+    save_waveform_as_wav,
+)
 from .decoding import NoiseStreamDecoder
 from .demo_packager import build_demo_executable
 from .encoding import NoiseStreamEncoder
@@ -692,12 +699,15 @@ class UmbraDesktopApp:
         self._recon_info_var = tk.StringVar(value="Awaiting AI reconstruction metrics…")
         self._sound_info_var = tk.StringVar(value="Sound preview pending…")
         self._loading_message_var = tk.StringVar(value="")
+        self._text_status_var = tk.StringVar(value="Enter text to encode into colour static.")
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._running = False
         self._last_refresh = 0.0
         self._latest_sound_payload: dict[str, Any] | None = None
         self._latest_generation_entry: dict[str, float] | None = None
+        self._latest_text_metadata: TextEncodingMetadata | None = None
+        self._latest_text_payload: str | None = None
 
         self._reference_label_widget: tk.Label | None = None
         self._reference_image_widget: tk.Label | None = None
@@ -714,6 +724,7 @@ class UmbraDesktopApp:
         self._graph_canvas: tk.Canvas | None = None
         self._loading_modal: tk.Toplevel | None = None
         self._loading_progress: Any = None
+        self._text_input: tk.Text | None = None
 
         self._build_layout()
         self._use_demo_image()
@@ -803,6 +814,40 @@ class UmbraDesktopApp:
         self._loading_modal = None
         self._loading_progress = None
         self._loading_message_var.set("")
+
+    def _update_loading_modal(self, entry: Mapping[str, Any] | None = None) -> None:
+        if not self._running and entry is None:
+            return
+        if entry is None:
+            self._show_loading_modal("Evolution running…\nPreparing first generation…")
+            return
+
+        def _safe_float(key: str, default: float) -> float:
+            try:
+                return float(entry.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        generation = _safe_float("generation", 0.0)
+        overlap = _safe_float("sound_overlap", _safe_float("overlap", 0.0))
+        psnr = _safe_float("sound_psnr", _safe_float("psnr", _AI_PSNR_BASELINE))
+        ssim = _safe_float("sound_ssim", _safe_float("ssim", 0.0))
+        readability = entry.get("sound_readability_score")
+        if readability is None:
+            readability = _compute_readability_score(overlap, psnr, ssim)
+        try:
+            readability_value = float(readability)
+        except (TypeError, ValueError):
+            readability_value = 0.0
+
+        message = (
+            "Evolution running…"
+            f"\nGeneration {generation:.0f}"
+            f"\nOverlap {overlap:.2f}%"
+            f"\nPSNR {psnr:.2f} dB"
+            f"\nReadability {readability_value:.2f}"
+        )
+        self._show_loading_modal(message)
 
     def _build_layout(self) -> None:
         control_frame = tk.Frame(self.root, bg="#101010")
@@ -896,6 +941,65 @@ class UmbraDesktopApp:
         tk.Label(control_frame, textvariable=self._status_var, fg="white", bg="#101010").pack(
             side=tk.RIGHT, padx=12
         )
+
+        text_frame = tk.LabelFrame(
+            self.root,
+            text="Text ↔ Sound lab",
+            bg="#181818",
+            fg="white",
+            labelanchor="nw",
+            padx=4,
+            pady=4,
+        )
+        text_frame.pack(fill=tk.X, padx=10, pady=(4, 6))
+
+        text_container = tk.Frame(text_frame, bg="#181818")
+        text_container.pack(fill=tk.X, expand=True, padx=4, pady=4)
+
+        scrollbar = tk.Scrollbar(text_container)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._text_input = tk.Text(
+            text_container,
+            height=5,
+            wrap=tk.WORD,
+            bg="#101010",
+            fg="#f0f0f0",
+            insertbackground="#f0f0f0",
+            relief=tk.FLAT,
+            yscrollcommand=scrollbar.set,
+        )
+        self._text_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scrollbar.config(command=self._text_input.yview)
+
+        text_buttons = tk.Frame(text_frame, bg="#181818")
+        text_buttons.pack(fill=tk.X, padx=4, pady=(0, 4))
+
+        tk.Button(
+            text_buttons,
+            text="Encode text as reference",
+            command=self._encode_text_reference,
+        ).pack(side=tk.LEFT, padx=4, pady=2)
+        tk.Button(
+            text_buttons,
+            text="Save text as WAV…",
+            command=self._save_text_as_wav,
+        ).pack(side=tk.LEFT, padx=4, pady=2)
+        tk.Button(
+            text_buttons,
+            text="Decode preview to text",
+            command=self._decode_sound_to_text,
+        ).pack(side=tk.LEFT, padx=4, pady=2)
+
+        tk.Label(
+            text_frame,
+            textvariable=self._text_status_var,
+            fg="#9be9a8",
+            bg="#181818",
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=920,
+        ).pack(fill=tk.X, padx=4, pady=(0, 2))
 
         preview_frame = tk.Frame(self.root, bg="#181818")
         preview_frame.pack(fill=tk.BOTH, expand=True)
@@ -1044,6 +1148,100 @@ class UmbraDesktopApp:
             return
         self._queue.put(("pinterest", image, label))
 
+    def _encode_text_reference(self) -> None:
+        if self._text_input is None:
+            return
+        text = self._text_input.get("1.0", tk.END).strip()
+        if not text:
+            self._text_status_var.set("Enter text to encode into a reference image.")
+            return
+        try:
+            image, metadata = encode_text_to_image(text)
+        except Exception as exc:
+            logger.exception("Text encoding failed", exc_info=exc)
+            self._text_status_var.set(f"Text encoding failed: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Text encoding failed", f"Could not encode text: {exc}")
+            return
+        self._latest_text_metadata = metadata
+        self._latest_text_payload = text
+        self._text_status_var.set(
+            f"Encoded {metadata.payload_bytes} bytes into {metadata.width}×{metadata.height} reference."
+        )
+        self._set_reference(image, f"Text payload · {len(text)} chars")
+
+    def _save_text_as_wav(self) -> None:
+        if self._text_input is None:
+            return
+        text = self._text_input.get("1.0", tk.END).strip()
+        if not text:
+            self._text_status_var.set("Enter text before saving a WAV preview.")
+            return
+        try:
+            waveform, metadata = encode_text_to_waveform(text)
+        except Exception as exc:
+            logger.exception("Text-to-WAV encoding failed", exc_info=exc)
+            self._text_status_var.set(f"Text-to-WAV encoding failed: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Text to WAV", f"Could not create WAV: {exc}")
+            return
+        default_name = f"umbra_text_{int(time.time())}.wav"
+        if filedialog is not None:
+            destination = filedialog.asksaveasfilename(
+                title="Save text WAV",
+                defaultextension=".wav",
+                initialfile=default_name,
+                filetypes=(("WAV", "*.wav"), ("All files", "*.*")),
+            )
+        else:
+            destination = str(Path.cwd() / default_name)
+        if not destination:
+            self._text_status_var.set("WAV save cancelled.")
+            return
+        try:
+            save_waveform_as_wav(
+                waveform,
+                sample_rate=int(metadata.sample_rate or 16_000),
+                path=destination,
+            )
+        except Exception as exc:
+            logger.exception("Failed to save text WAV", exc_info=exc)
+            self._text_status_var.set(f"WAV save failed: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("WAV save failed", f"Could not write WAV file:\n{exc}")
+            return
+        self._latest_text_metadata = metadata
+        self._latest_text_payload = text
+        self._text_status_var.set(f"Saved text signal to {destination}")
+
+    def _decode_sound_to_text(self) -> None:
+        source: np.ndarray | None = None
+        if self.sound_reconstruction is not None:
+            source = self.sound_reconstruction
+        elif self.reconstruction is not None:
+            source = self.reconstruction
+        elif self.reference_image is not None:
+            source = self.reference_image
+        if source is None:
+            self._text_status_var.set("No image available to decode.")
+            return
+        try:
+            text, metadata = decode_image_to_text(source)
+        except Exception as exc:
+            logger.debug("Decoding text from preview failed: %s", exc)
+            self._text_status_var.set(f"Decoding failed: {exc}")
+            if messagebox is not None:
+                messagebox.showwarning("Decode text", f"Could not decode text: {exc}")
+            return
+        if self._text_input is not None:
+            self._text_input.delete("1.0", tk.END)
+            self._text_input.insert("1.0", text)
+        self._latest_text_metadata = metadata
+        self._latest_text_payload = text
+        self._text_status_var.set(
+            f"Decoded {len(text)} characters from {metadata.width}×{metadata.height} preview."
+        )
+
     # ------------------------------------------------------------------ Evolution loop
     def start_evolution(self) -> None:
         if self._running:
@@ -1053,9 +1251,9 @@ class UmbraDesktopApp:
             return
         if self.manager is None:
             self.manager = self._create_manager()
-        self._show_loading_modal("Preparing evolution…")
         self._clear_sound_preview("Waiting for sound reconstruction…", info_text="Sound preview pending…")
         self._running = True
+        self._update_loading_modal(None)
         self._status_var.set("Evolution running…")
         self._worker = threading.Thread(target=self._run_loop, daemon=True)
         self._worker.start()
@@ -1224,6 +1422,10 @@ class UmbraDesktopApp:
 
         if processed:
             self._draw_graph()
+        if self._running and (self._worker is None or not self._worker.is_alive()):
+            logger.info("Evolution worker stopped unexpectedly; restarting.")
+            self._worker = threading.Thread(target=self._run_loop, daemon=True)
+            self._worker.start()
         self.root.after(200, self._poll_queue)
 
     def _collect_model_export_payload(self) -> tuple[dict[str, Any], str]:
@@ -1610,7 +1812,7 @@ class UmbraDesktopApp:
             except (TypeError, ValueError):
                 return default
 
-        self._hide_loading_modal()
+        self._update_loading_modal(entry)
         status_parts: list[str] = []
         if "generation" in entry:
             status_parts.append(f"Generation {_as_float('generation'):.0f}")
@@ -1755,15 +1957,19 @@ class UmbraDesktopApp:
             x_values.extend(generation for generation, _ in baseline_rows)
         if not y_values:
             y_values.extend(score for _, score in baseline_rows)
+        if not x_values:
+            x_values = [0.0]
+        if not y_values:
+            y_values = [0.0]
         x_min, x_max = min(x_values), max(x_values)
-        y_min = min(y_values)
-        y_max = max(y_values)
-        if baseline_rows:
-            baseline_vals = [val for _, val in baseline_rows]
-            y_min = min(y_min, min(baseline_vals))
-            y_max = max(y_max, max(baseline_vals))
         if x_max == x_min:
             x_max = x_min + 1
+
+        baseline_vals = [val for _, val in baseline_rows] if baseline_rows else []
+        y_max_candidate = max(y_values + baseline_vals) if y_values or baseline_vals else 0.0
+        y_min_candidate = min(y_values + baseline_vals) if y_values or baseline_vals else 0.0
+        y_min = 0.0 if y_min_candidate >= 0 else float(y_min_candidate)
+        y_max = max(100.0, float(y_max_candidate))
         if y_max == y_min:
             y_max = y_min + 1
 
@@ -1773,21 +1979,38 @@ class UmbraDesktopApp:
         def _scale_y(val: float) -> float:
             return height - margin - (val - y_min) / (y_max - y_min) * (height - 2 * margin)
 
+        for tick in range(0, 101, 25):
+            y = _scale_y(float(tick))
+            self._graph_canvas.create_line(margin, y, width - margin, y, fill="#1f1f1f")
+            self._graph_canvas.create_text(margin - 6, y, text=f"{tick}", fill="#555", anchor=tk.E)
+
         if len(composite_rows) >= 2:
             composite_points: list[float] = []
             for generation, score in composite_rows:
                 composite_points.extend([_scale_x(generation), _scale_y(score)])
             self._graph_canvas.create_line(composite_points, fill="#f4d35e", width=3, smooth=True)
+        elif len(composite_rows) == 1:
+            gx, gy = composite_rows[0]
+            x_pos, y_pos = _scale_x(gx), _scale_y(gy)
+            self._graph_canvas.create_oval(x_pos - 3, y_pos - 3, x_pos + 3, y_pos + 3, fill="#f4d35e", outline="")
         if len(readability_rows) >= 2:
             readability_points: list[float] = []
             for generation, score in readability_rows:
                 readability_points.extend([_scale_x(generation), _scale_y(score)])
             self._graph_canvas.create_line(readability_points, fill="#9be9a8", width=2, smooth=True)
+        elif len(readability_rows) == 1:
+            gx, gy = readability_rows[0]
+            x_pos, y_pos = _scale_x(gx), _scale_y(gy)
+            self._graph_canvas.create_oval(x_pos - 3, y_pos - 3, x_pos + 3, y_pos + 3, fill="#9be9a8", outline="")
         if len(baseline_rows) >= 2:
             baseline_points: list[float] = []
             for generation, score in baseline_rows:
                 baseline_points.extend([_scale_x(generation), _scale_y(score)])
             self._graph_canvas.create_line(baseline_points, fill="#58a6ff", width=2, dash=(4, 3))
+        elif len(baseline_rows) == 1:
+            gx, gy = baseline_rows[0]
+            x_pos, y_pos = _scale_x(gx), _scale_y(gy)
+            self._graph_canvas.create_oval(x_pos - 3, y_pos - 3, x_pos + 3, y_pos + 3, fill="#58a6ff", outline="")
         self._graph_canvas.create_line(margin, height - margin, width - margin, height - margin, fill="#333")
         self._graph_canvas.create_line(margin, margin, margin, height - margin, fill="#333")
         legend_y = margin - 10

@@ -232,19 +232,38 @@ _DEMO_GUI_TEMPLATE = Template(
 
             # ---------------------------------------------------------- layout
             def _build_layout(self) -> None:
-                main = ttk.Frame(self.root, padding=12)
+                main = ttk.Frame(self.root, padding=16)
                 main.pack(fill=tk.BOTH, expand=True)
 
-                preview_frame = ttk.LabelFrame(main, text="Sample reconstruction")
+                header = ttk.Label(main, text="Project Umbra demo player", font=("Segoe UI", 16, "bold"))
+                header.pack(anchor=tk.W)
+                ttk.Label(
+                    main,
+                    text=(
+                        "Preview the bundled reconstruction, export the assets, or convert your own "
+                        "images and WAV files using the model defaults."
+                    ),
+                    wraplength=520,
+                ).pack(anchor=tk.W, pady=(4, 12))
+
+                content = ttk.Frame(main)
+                content.pack(fill=tk.BOTH, expand=True)
+
+                preview_frame = ttk.LabelFrame(content, text="Sample reconstruction")
                 preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
 
                 self.preview_label = ttk.Label(preview_frame, image=self.sample_photo)
                 self.preview_label.pack(padx=8, pady=8)
 
                 label_text = self.sample_metadata.get("label", "Best candidate")
-                ttk.Label(preview_frame, text=label_text, font=("Arial", 12, "bold")).pack(
-                    pady=(0, 8)
+                meta_lines = (
+                    f"Label: {label_text}",
+                    f"Sample rate: {self.sample_rate_var.get()} Hz",
+                    f"Segments: {self.segments_var.get()}",
+                    f"Marker: {self.marker_var.get():.3f} s",
+                    f"Resolution: {self.rows_var.get()}×{self.cols_var.get()}",
                 )
+                ttk.Label(preview_frame, text="\n".join(meta_lines), justify=tk.LEFT).pack(padx=8, pady=(0, 12))
 
                 preview_buttons = ttk.Frame(preview_frame)
                 preview_buttons.pack(fill=tk.X, padx=8, pady=(0, 12))
@@ -264,72 +283,36 @@ _DEMO_GUI_TEMPLATE = Template(
                     command=self.preview_sample_wav,
                 ).pack(fill=tk.X, pady=2)
 
-                controls = ttk.LabelFrame(main, text="Conversions")
-                controls.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                actions = ttk.LabelFrame(content, text="Quick actions")
+                actions.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-                grid = ttk.Frame(controls)
-                grid.pack(fill=tk.X, padx=8, pady=8)
-
-                ttk.Label(grid, text="Sample rate (Hz)").grid(row=0, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=8000,
-                    to=96000,
-                    increment=1000,
-                    textvariable=self.sample_rate_var,
-                    width=8,
-                ).grid(row=0, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Segments").grid(row=1, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=1,
-                    to=128,
-                    textvariable=self.segments_var,
-                    width=8,
-                ).grid(row=1, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Marker duration (s)").grid(row=2, column=0, sticky=tk.W)
-                ttk.Entry(grid, textvariable=self.marker_var, width=10).grid(row=2, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Image rows").grid(row=3, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=16,
-                    to=2048,
-                    textvariable=self.rows_var,
-                    width=8,
-                ).grid(row=3, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Image cols").grid(row=4, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=16,
-                    to=2048,
-                    textvariable=self.cols_var,
-                    width=8,
-                ).grid(row=4, column=1, padx=(8, 0))
+                ttk.Label(
+                    actions,
+                    text=(
+                        "The buttons below reuse the demo settings shown on the left so you can "
+                        "test your own assets without tweaking parameters."
+                    ),
+                    wraplength=320,
+                ).pack(fill=tk.X, padx=12, pady=(8, 12))
 
                 ttk.Button(
-                    controls,
-                    text="Encode image to WAV…",
+                    actions,
+                    text="Encode a new image to WAV…",
                     command=self.encode_image_to_wav,
-                ).pack(fill=tk.X, padx=8, pady=4)
-
+                ).pack(fill=tk.X, padx=12, pady=4)
                 ttk.Button(
-                    controls,
-                    text="Decode WAV to image…",
+                    actions,
+                    text="Decode an existing WAV to image…",
                     command=self.decode_wav_to_image,
-                ).pack(fill=tk.X, padx=8, pady=4)
-
+                ).pack(fill=tk.X, padx=12, pady=4)
                 ttk.Button(
-                    controls,
-                    text="Upload WAV for preview…",
+                    actions,
+                    text="Preview a WAV with these settings…",
                     command=self.preview_uploaded_wav,
-                ).pack(fill=tk.X, padx=8, pady=(4, 8))
+                ).pack(fill=tk.X, padx=12, pady=4)
 
-                ttk.Label(controls, textvariable=self.status_var, wraplength=320).pack(
-                    fill=tk.X, padx=8, pady=(0, 8)
+                ttk.Label(actions, textvariable=self.status_var, wraplength=320).pack(
+                    fill=tk.X, padx=12, pady=(12, 8)
                 )
 
             # ----------------------------------------------------------- helpers
