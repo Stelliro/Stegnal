@@ -12,6 +12,8 @@ import os
 import queue
 import random
 import re
+import secrets
+import string
 import sys
 import threading
 import time
@@ -31,11 +33,12 @@ from PIL import Image, ImageTk
 
 try:  # pragma: no cover - optional dependency during import on minimal envs
     import tkinter as tk
-    from tkinter import filedialog, messagebox
+    from tkinter import filedialog, messagebox, ttk
 except Exception as exc:  # pragma: no cover - import is deferred until runtime
     tk = None  # type: ignore[assignment]
     filedialog = None  # type: ignore[assignment]
     messagebox = None  # type: ignore[assignment]
+    ttk = None  # type: ignore[assignment]
     _IMPORT_ERROR = exc
 else:
     _IMPORT_ERROR = None
@@ -338,6 +341,119 @@ def _clamp_image(array: np.ndarray) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0)
 
 
+_ID_ALPHABET = string.ascii_lowercase + string.digits
+
+
+def _generate_unique_model_path(
+    base_dir: Path, generation_index: float | None = None, *, extension: str = ".json"
+) -> Path:
+    """Return a unique file path for saving model snapshots."""
+
+    directory = Path(base_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    suffix_value = 0
+    if generation_index is not None:
+        try:
+            suffix_value = max(int(round(float(generation_index))), 0)
+        except (TypeError, ValueError):
+            suffix_value = 0
+    suffix = f"{suffix_value:02d}"
+
+    while True:
+        token = "".join(secrets.choice(_ID_ALPHABET) for _ in range(8))
+        candidate = directory / f"{token}_{suffix}{extension}"
+        if not candidate.exists():
+            return candidate
+
+
+def _encode_image_to_base64(image: np.ndarray | None) -> str | None:
+    """Encode an ``image`` array into a base64 PNG string."""
+
+    if image is None:
+        return None
+    try:
+        clamped = _clamp_image(image)
+    except ValueError:
+        return None
+    buffer = BytesIO()
+    png_image = Image.fromarray((clamped * 255.0).astype(np.uint8))
+    png_image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _decode_image_from_base64(data: str | None) -> np.ndarray | None:
+    """Decode a base64 PNG ``data`` string into a float image array."""
+
+    if not data:
+        return None
+    try:
+        binary = base64.b64decode(data)
+    except (TypeError, ValueError):
+        return None
+    try:
+        with Image.open(BytesIO(binary)) as image:
+            array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    except Exception:
+        return None
+    return _clamp_image(array)
+
+
+def _metrics_from_mapping(mapping: Mapping[str, Any]) -> ReconstructionMetrics | None:
+    """Rebuild :class:`ReconstructionMetrics` from a JSON-style mapping."""
+
+    try:
+        psnr = float(mapping.get("psnr"))
+        ssim = float(mapping.get("ssim"))
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(psnr) and math.isfinite(ssim)):
+        return None
+    return ReconstructionMetrics(psnr=psnr, ssim=ssim)
+
+
+def _serialize_sound_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert the latest sound payload to a JSON-serialisable mapping."""
+
+    serialised: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, ReconstructionMetrics):
+            serialised[key] = value.as_dict()
+        elif isinstance(value, np.ndarray):
+            serialised[key] = np.asarray(value).tolist()
+        elif isinstance(value, (np.floating, np.integer)):
+            serialised[key] = float(value)
+        else:
+            serialised[key] = value
+    return serialised
+
+
+def _deserialize_sound_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a serialised sound payload back into runtime objects."""
+
+    restored: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, Mapping):
+            metrics = _metrics_from_mapping(value)
+            if metrics is not None:
+                restored[key] = metrics
+                continue
+        restored[key] = value
+    return restored
+
+
+def _sanitize_history_entry(entry: Mapping[str, Any]) -> dict[str, float]:
+    """Convert arbitrary JSON history rows into numeric UI entries."""
+
+    sanitized: dict[str, float] = {}
+    for key, value in entry.items():
+        try:
+            sanitized[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return sanitized
+
+
 def _to_photo_image(array: np.ndarray, *, max_edge: int = _DISPLAY_MAX_EDGE) -> ImageTk.PhotoImage:
     clamped = _clamp_image(array)
     data = (clamped * 255.0).astype(np.uint8)
@@ -572,6 +688,10 @@ class UmbraDesktopApp:
         self._primary_score_var = tk.StringVar(value="Sound score: –")
         self._readability_score_var = tk.StringVar(value="WAV readability score: –")
         self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
+        self._reference_info_var = tk.StringVar(value="No reference loaded.")
+        self._recon_info_var = tk.StringVar(value="Awaiting AI reconstruction metrics…")
+        self._sound_info_var = tk.StringVar(value="Sound preview pending…")
+        self._loading_message_var = tk.StringVar(value="")
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._running = False
@@ -581,14 +701,19 @@ class UmbraDesktopApp:
 
         self._reference_label_widget: tk.Label | None = None
         self._reference_image_widget: tk.Label | None = None
+        self._reference_info_label: tk.Label | None = None
         self._reference_photo: ImageTk.PhotoImage | None = None
         self._recon_label_widget: tk.Label | None = None
         self._recon_image_widget: tk.Label | None = None
+        self._recon_info_label: tk.Label | None = None
         self._recon_photo: ImageTk.PhotoImage | None = None
         self._sound_label_widget: tk.Label | None = None
         self._sound_image_widget: tk.Label | None = None
+        self._sound_info_label: tk.Label | None = None
         self._sound_photo: ImageTk.PhotoImage | None = None
         self._graph_canvas: tk.Canvas | None = None
+        self._loading_modal: tk.Toplevel | None = None
+        self._loading_progress: Any = None
 
         self._build_layout()
         self._use_demo_image()
@@ -618,6 +743,67 @@ class UmbraDesktopApp:
         else:
             time.sleep(0.0)
 
+    # ------------------------------------------------------------------ Modal helpers
+    def _show_loading_modal(self, message: str) -> None:
+        if tk is None:
+            return
+        if self._loading_modal is not None:
+            self._loading_message_var.set(message)
+            return
+        modal = tk.Toplevel(self.root)
+        modal.configure(bg="#202020")
+        modal.title("Please wait…")
+        modal.resizable(False, False)
+        modal.transient(self.root)
+        try:
+            modal.grab_set()
+        except Exception:
+            logger.debug("Loading modal grab failed", exc_info=True)
+        self._loading_message_var.set(message)
+        label = tk.Label(
+            modal,
+            textvariable=self._loading_message_var,
+            fg="white",
+            bg="#202020",
+            wraplength=280,
+            justify=tk.CENTER,
+            font=("Segoe UI", 11),
+        )
+        label.pack(padx=24, pady=(24, 12))
+        if ttk is not None:
+            progress = ttk.Progressbar(modal, mode="indeterminate", length=240)
+            progress.pack(padx=24, pady=(0, 24))
+            try:
+                progress.start(12)
+            except Exception:
+                logger.debug("Loading modal progress bar failed", exc_info=True)
+            self._loading_progress = progress
+        else:
+            self._loading_progress = None
+        self._loading_modal = modal
+        self.root.update_idletasks()
+
+    def _hide_loading_modal(self) -> None:
+        modal = self._loading_modal
+        if modal is None:
+            return
+        try:
+            if self._loading_progress is not None:
+                self._loading_progress.stop()  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("Loading modal progress teardown failed", exc_info=True)
+        try:
+            modal.grab_release()
+        except Exception:
+            logger.debug("Loading modal grab release failed", exc_info=True)
+        try:
+            modal.destroy()
+        except Exception:
+            logger.debug("Destroying loading modal failed", exc_info=True)
+        self._loading_modal = None
+        self._loading_progress = None
+        self._loading_message_var.set("")
+
     def _build_layout(self) -> None:
         control_frame = tk.Frame(self.root, bg="#101010")
         control_frame.pack(fill=tk.X, side=tk.TOP)
@@ -640,6 +826,16 @@ class UmbraDesktopApp:
             control_frame,
             text="⭳ Extract parameters",
             command=self._export_model_parameters,
+        ).pack(side=tk.LEFT, padx=6, pady=6)
+        tk.Button(
+            control_frame,
+            text="💾 Save snapshot",
+            command=self._save_model_snapshot,
+        ).pack(side=tk.LEFT, padx=6, pady=6)
+        tk.Button(
+            control_frame,
+            text="📂 Load model…",
+            command=self._load_model_parameters,
         ).pack(side=tk.LEFT, padx=6, pady=6)
 
         tk.Checkbutton(
@@ -708,15 +904,45 @@ class UmbraDesktopApp:
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
         self._reference_label_widget = tk.Label(left_frame, text="Reference", fg="white", bg="#181818")
         self._reference_label_widget.pack()
-        self._reference_image_widget = tk.Label(left_frame, bg="#101010")
+        self._reference_image_widget = tk.Label(
+            left_frame,
+            bg="#101010",
+            fg="#cccccc",
+            text="No reference selected",
+            justify=tk.CENTER,
+            wraplength=320,
+        )
         self._reference_image_widget.pack(padx=6, pady=6)
+        self._reference_info_label = tk.Label(
+            left_frame,
+            textvariable=self._reference_info_var,
+            fg="#9be9a8",
+            bg="#181818",
+        )
+        self._reference_info_label.pack(pady=(0, 10))
 
         right_frame = tk.Frame(preview_frame, bg="#181818")
         right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
         self._recon_label_widget = tk.Label(right_frame, text="AI reconstruction", fg="white", bg="#181818")
         self._recon_label_widget.pack()
-        self._recon_image_widget = tk.Label(right_frame, bg="#101010")
+        self._recon_image_widget = tk.Label(
+            right_frame,
+            bg="#101010",
+            fg="#cccccc",
+            text="Run evolution to view reconstructions",
+            justify=tk.CENTER,
+            wraplength=320,
+        )
         self._recon_image_widget.pack(padx=6, pady=6)
+        self._recon_info_label = tk.Label(
+            right_frame,
+            textvariable=self._recon_info_var,
+            fg="#8fdc6d",
+            bg="#181818",
+            wraplength=360,
+            justify=tk.CENTER,
+        )
+        self._recon_info_label.pack(pady=(0, 10))
 
         sound_frame = tk.Frame(preview_frame, bg="#181818")
         sound_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -736,6 +962,15 @@ class UmbraDesktopApp:
             justify=tk.CENTER,
         )
         self._sound_image_widget.pack(padx=6, pady=6)
+        self._sound_info_label = tk.Label(
+            sound_frame,
+            textvariable=self._sound_info_var,
+            fg="#58a6ff",
+            bg="#181818",
+            wraplength=360,
+            justify=tk.CENTER,
+        )
+        self._sound_info_label.pack(pady=(0, 10))
 
         graph_frame = tk.Frame(self.root, bg="#101010")
         graph_frame.pack(fill=tk.BOTH, side=tk.BOTTOM)
@@ -785,6 +1020,8 @@ class UmbraDesktopApp:
         self.reference_label = label
         if self._reference_label_widget is not None:
             self._reference_label_widget.config(text=f"Reference · {label}")
+        self._clear_reconstruction_preview("No reconstruction yet.")
+        self._clear_sound_preview("Waiting for sound reconstruction…", info_text="Sound preview pending…")
         self._update_reference_preview()
         if self._running:
             self.stop_evolution()
@@ -816,6 +1053,8 @@ class UmbraDesktopApp:
             return
         if self.manager is None:
             self.manager = self._create_manager()
+        self._show_loading_modal("Preparing evolution…")
+        self._clear_sound_preview("Waiting for sound reconstruction…", info_text="Sound preview pending…")
         self._running = True
         self._status_var.set("Evolution running…")
         self._worker = threading.Thread(target=self._run_loop, daemon=True)
@@ -823,6 +1062,7 @@ class UmbraDesktopApp:
 
     def stop_evolution(self) -> None:
         self._running = False
+        self._hide_loading_modal()
         self._status_var.set("Evolution paused. Press start to resume.")
 
     def _handle_advanced_logging_toggle(self) -> None:
@@ -964,52 +1204,13 @@ class UmbraDesktopApp:
                     _metrics,
                     entry,
                     sound_image,
-                    sound_payload,
+                    _,
                 ) = message
                 self._update_reconstruction(np.asarray(reconstruction, dtype=np.float32))
                 self._update_sound_reconstruction(
                     None if sound_image is None else np.asarray(sound_image, dtype=np.float32)
                 )
-                status_parts = [f"Generation {entry.get('generation', 0):.0f}"]
-                sound_score = entry.get("sound_score")
-                if sound_score is not None:
-                    status_parts.append(
-                        "Sound overlap {ov:.2f}%".format(ov=entry.get("sound_overlap", 0.0))
-                    )
-                    if "sound_psnr" in entry:
-                        status_parts.append(
-                            "Sound PSNR {ps:.2f} dB".format(ps=entry.get("sound_psnr", 0.0))
-                        )
-                    status_parts.append(
-                        "Sound SSIM {ss:.3f}".format(ss=entry.get("sound_ssim", 0.0))
-                    )
-                    status_parts.append(f"Sound score {sound_score:.2f}")
-                else:
-                    status_parts.append("Sound score unavailable")
-                status_parts.append(
-                    "AI overlap {ov:.2f}%".format(ov=entry.get("overlap", 0.0))
-                )
-                status_parts.append("AI PSNR {ps:.2f} dB".format(ps=entry.get("psnr", 0.0)))
-                status_parts.append("AI SSIM {ss:.3f}".format(ss=entry.get("ssim", 0.0)))
-                self._status_var.set(" · ".join(status_parts))
-
-                composite_score = entry.get("composite_score")
-                if "sound_score" in entry and composite_score is not None:
-                    self._primary_score_var.set(f"Sound score: {composite_score:.2f}")
-                else:
-                    self._primary_score_var.set("Sound score: – (waiting for sound)")
-
-                readability_score = entry.get("sound_readability_score")
-                if readability_score is not None and "sound_score" in entry:
-                    self._readability_score_var.set(f"WAV readability score: {readability_score:.2f}")
-                else:
-                    self._readability_score_var.set("WAV readability score: –")
-
-                ai_baseline = entry.get("ai_score")
-                if ai_baseline is not None:
-                    self._baseline_score_var.set(f"AI baseline score: {ai_baseline:.2f}")
-                else:
-                    self._baseline_score_var.set("AI baseline score: –")
+                self._apply_generation_entry(entry)
                 self._draw_graph()
             elif kind == "status":
                 _, text = message
@@ -1025,10 +1226,67 @@ class UmbraDesktopApp:
             self._draw_graph()
         self.root.after(200, self._poll_queue)
 
+    def _collect_model_export_payload(self) -> tuple[dict[str, Any], str]:
+        """Assemble the current model state into a JSON-friendly payload."""
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        history_rows = [_sanitize_history_entry(row) for row in self.state.as_rows()]
+
+        latest_entry: dict[str, Any] | None = None
+        if self._latest_generation_entry is not None:
+            latest_entry = {}
+            for key, value in self._latest_generation_entry.items():
+                if isinstance(value, (np.floating, np.integer)):
+                    latest_entry[key] = float(value)
+                else:
+                    latest_entry[key] = value
+
+        payload_serialised: dict[str, Any] | None = None
+        if self._latest_sound_payload:
+            payload_serialised = _serialize_sound_payload(self._latest_sound_payload)
+
+        wav_base64: str | None = None
+        if (
+            self.reconstruction is not None
+            and payload_serialised is not None
+            and all(
+                key in payload_serialised for key in ("sample_rate", "segments", "marker_duration")
+            )
+        ):
+            try:
+                wav_bytes = encode_image_to_wav_bytes(
+                    self.reconstruction,
+                    sample_rate=int(payload_serialised["sample_rate"]),
+                    segments=int(payload_serialised["segments"]),
+                    marker_duration=float(payload_serialised["marker_duration"]),
+                )
+                wav_base64 = base64.b64encode(wav_bytes).decode("ascii")
+            except Exception as exc:  # pragma: no cover - defensive conversion guard
+                logger.debug("Failed to regenerate WAV for export: %s", exc)
+
+        export_payload = {
+            "saved_at": timestamp,
+            "reference": {
+                "label": self.reference_label,
+                "image_png_base64": _encode_image_to_base64(self.reference_image),
+            },
+            "latest_reconstruction_png": _encode_image_to_base64(self.reconstruction),
+            "latest_sound_reconstruction_png": _encode_image_to_base64(self.sound_reconstruction),
+            "latest_generation_entry": latest_entry or {},
+            "history": history_rows,
+            "composite_scores": [float(value) for value in self.state.composite_scores],
+            "sound_scores": [float(value) for value in self.state.sound_scores],
+            "readability_scores": [float(value) for value in self.state.readability_scores],
+            "latest_sound_payload": payload_serialised,
+            "latest_sound_wav_base64": wav_base64,
+        }
+
+        return export_payload, timestamp
+
     def _export_model_parameters(self) -> None:
         """Persist the current model history, images, and sound payload to JSON."""
 
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        export_payload, timestamp = self._collect_model_export_payload()
         default_name = f"umbra_model_parameters_{timestamp}.json"
 
         if filedialog is not None:
@@ -1046,79 +1304,6 @@ class UmbraDesktopApp:
         else:
             destination = Path.cwd() / default_name
 
-        def _encode_image(image: np.ndarray | None) -> str | None:
-            if image is None:
-                return None
-            try:
-                clamped = _clamp_image(image)
-            except ValueError:
-                return None
-            buffer = BytesIO()
-            png_image = Image.fromarray((clamped * 255.0).astype(np.uint8))
-            png_image.save(buffer, format="PNG")
-            return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-        def _serialize_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-            serialised: dict[str, Any] = {}
-            for key, value in payload.items():
-                if isinstance(value, ReconstructionMetrics):
-                    serialised[key] = value.as_dict()
-                elif isinstance(value, np.ndarray):
-                    serialised[key] = np.asarray(value).tolist()
-                elif isinstance(value, (np.floating, np.integer)):
-                    serialised[key] = float(value)
-                else:
-                    serialised[key] = value
-            return serialised
-
-        history_rows: list[dict[str, float]] = []
-        for row in self.state.as_rows():
-            converted: dict[str, float] = {}
-            for key, value in row.items():
-                if isinstance(value, (np.floating, np.integer)):
-                    converted[key] = float(value)
-                else:
-                    converted[key] = value
-            history_rows.append(converted)
-
-        payload_serialised: dict[str, Any] | None = None
-        if self._latest_sound_payload:
-            payload_serialised = _serialize_payload(self._latest_sound_payload)
-
-        wav_base64: str | None = None
-        if (
-            self.reconstruction is not None
-            and payload_serialised is not None
-            and all(key in payload_serialised for key in ("sample_rate", "segments", "marker_duration"))
-        ):
-            try:
-                wav_bytes = encode_image_to_wav_bytes(
-                    self.reconstruction,
-                    sample_rate=int(payload_serialised["sample_rate"]),
-                    segments=int(payload_serialised["segments"]),
-                    marker_duration=float(payload_serialised["marker_duration"]),
-                )
-                wav_base64 = base64.b64encode(wav_bytes).decode("ascii")
-            except Exception as exc:  # pragma: no cover - defensive conversion guard
-                logger.debug("Failed to regenerate WAV for export: %s", exc)
-
-        export_payload = {
-            "saved_at": timestamp,
-            "reference": {
-                "label": self.reference_label,
-                "image_png_base64": _encode_image(self.reference_image),
-            },
-            "latest_reconstruction_png": _encode_image(self.reconstruction),
-            "latest_sound_reconstruction_png": _encode_image(self.sound_reconstruction),
-            "latest_generation_entry": dict(self._latest_generation_entry or {}),
-            "history": history_rows,
-            "composite_scores": list(self.state.composite_scores),
-            "sound_scores": list(self.state.sound_scores),
-            "readability_scores": list(self.state.readability_scores),
-            "latest_sound_payload": payload_serialised,
-            "latest_sound_wav_base64": wav_base64,
-        }
-
         try:
             destination.write_text(json.dumps(export_payload, indent=2))
         except Exception as exc:  # pragma: no cover - filesystem failure guard
@@ -1134,6 +1319,145 @@ class UmbraDesktopApp:
                 "Export complete",
                 f"Model parameters and artifacts saved to:\n{destination}",
             )
+
+    def _save_model_snapshot(self) -> None:
+        """Persist the current model to a snapshots directory with a unique name."""
+
+        export_payload, _timestamp = self._collect_model_export_payload()
+        generation_entry = export_payload.get("latest_generation_entry")
+        generation_index: float | None = None
+        if isinstance(generation_entry, Mapping) and "generation" in generation_entry:
+            try:
+                generation_index = float(generation_entry["generation"])
+            except (TypeError, ValueError):
+                generation_index = None
+
+        snapshots_dir = Path.home() / ".umbra" / "snapshots"
+        destination = _generate_unique_model_path(snapshots_dir, generation_index)
+
+        try:
+            destination.write_text(json.dumps(export_payload, indent=2))
+        except Exception as exc:
+            logger.exception("Failed to write snapshot")
+            self._status_var.set(f"Snapshot save failed: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Snapshot save failed", f"Could not save snapshot:\n{exc}")
+            return
+
+        self._status_var.set(f"Snapshot saved to {destination}")
+        if messagebox is not None:
+            messagebox.showinfo("Snapshot saved", f"Model snapshot written to:\n{destination}")
+
+    def _load_model_parameters(self) -> None:
+        """Load a previously saved model payload into the UI."""
+
+        if filedialog is None:
+            if messagebox is not None:
+                messagebox.showerror(
+                    "Unavailable",
+                    "File selection dialog is not available in this environment.",
+                )
+            return
+
+        chosen = filedialog.askopenfilename(
+            title="Load model parameters",
+            defaultextension=".json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not chosen:
+            return
+
+        try:
+            payload = json.loads(Path(chosen).read_text())
+        except Exception as exc:
+            logger.exception("Failed to read model payload")
+            self._status_var.set(f"Load failed: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Load failed", f"Could not load model:\n{exc}")
+            return
+
+        self.stop_evolution()
+
+        reference_info = payload.get("reference") if isinstance(payload, Mapping) else None
+        reference_label = ""
+        reference_image = None
+        if isinstance(reference_info, Mapping):
+            reference_label = str(reference_info.get("label", "")).strip()
+            reference_image = _decode_image_from_base64(reference_info.get("image_png_base64"))
+
+        if reference_image is not None:
+            self.reference_image = reference_image
+            self.reference_label = reference_label
+            if self._reference_label_widget is not None:
+                label_text = f"Reference · {reference_label}" if reference_label else "Reference"
+                self._reference_label_widget.config(text=label_text)
+            self._update_reference_preview()
+        else:
+            self._clear_reference_preview("No reference loaded.")
+
+        reconstruction_image = _decode_image_from_base64(payload.get("latest_reconstruction_png"))
+        if reconstruction_image is not None:
+            self._update_reconstruction(reconstruction_image)
+        else:
+            self._clear_reconstruction_preview("No reconstruction yet.")
+
+        sound_image = _decode_image_from_base64(payload.get("latest_sound_reconstruction_png"))
+        if sound_image is not None:
+            self._update_sound_reconstruction(sound_image)
+        else:
+            self._clear_sound_preview("Sound reconstruction unavailable")
+
+        self.state = UmbraAppState()
+        history_rows = payload.get("history") if isinstance(payload, Mapping) else None
+        if isinstance(history_rows, Iterable):
+            for row in history_rows:
+                if isinstance(row, Mapping):
+                    self.state.history.append(_sanitize_history_entry(row))
+
+        for value in payload.get("composite_scores", []) if isinstance(payload, Mapping) else []:
+            try:
+                self.state.composite_scores.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        for value in payload.get("sound_scores", []) if isinstance(payload, Mapping) else []:
+            try:
+                self.state.sound_scores.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        for value in payload.get("readability_scores", []) if isinstance(payload, Mapping) else []:
+            try:
+                self.state.readability_scores.append(float(value))
+            except (TypeError, ValueError):
+                continue
+
+        latest_entry_data = payload.get("latest_generation_entry") if isinstance(payload, Mapping) else None
+        if isinstance(latest_entry_data, Mapping):
+            sanitized_entry = _sanitize_history_entry(latest_entry_data)
+            self._latest_generation_entry = sanitized_entry
+        else:
+            sanitized_entry = {}
+            self._latest_generation_entry = None
+
+        latest_sound_payload = payload.get("latest_sound_payload") if isinstance(payload, Mapping) else None
+        if isinstance(latest_sound_payload, Mapping):
+            self._latest_sound_payload = _deserialize_sound_payload(latest_sound_payload)
+        else:
+            self._latest_sound_payload = None
+
+        if sanitized_entry:
+            self._apply_generation_entry(sanitized_entry)
+        else:
+            self._primary_score_var.set("Sound score: –")
+            self._readability_score_var.set("WAV readability score: –")
+            self._baseline_score_var.set("AI baseline score: –")
+            self._recon_info_var.set("Awaiting AI reconstruction metrics…")
+            self._sound_info_var.set("Sound metrics unavailable.")
+
+        self.manager = None
+        self._draw_graph()
+        self._status_var.set(f"Loaded model from {chosen}")
+        if messagebox is not None:
+            messagebox.showinfo("Model loaded", f"Model restored from:\n{chosen}")
 
     def _build_demo_executable(self) -> None:
         if self.reconstruction is None and self.reference_image is None:
@@ -1190,6 +1514,43 @@ class UmbraDesktopApp:
             return
 
     # ------------------------------------------------------------------ Rendering helpers
+    def _update_reference_info(self) -> None:
+        if self._reference_info_var is None:
+            return
+        if self.reference_image is None:
+            self._reference_info_var.set("No reference loaded.")
+            return
+        height, width = self.reference_image.shape[:2]
+        self._reference_info_var.set(f"{int(width)}×{int(height)} px")
+
+    def _clear_reference_preview(self, message: str = "No reference loaded.") -> None:
+        self.reference_image = None
+        self.reference_label = ""
+        if self._reference_image_widget is not None:
+            self._reference_image_widget.config(image="", text=message)
+        if self._reference_label_widget is not None:
+            self._reference_label_widget.config(text="Reference")
+        self._reference_photo = None
+        self._update_reference_info()
+
+    def _clear_reconstruction_preview(
+        self, message: str = "No reconstruction yet.", *, info_text: str | None = None
+    ) -> None:
+        self.reconstruction = None
+        if self._recon_image_widget is not None:
+            self._recon_image_widget.config(image="", text=message)
+        self._recon_photo = None
+        self._recon_info_var.set(info_text or "Awaiting AI reconstruction metrics…")
+
+    def _clear_sound_preview(
+        self, message: str = "Sound reconstruction unavailable", *, info_text: str | None = None
+    ) -> None:
+        self.sound_reconstruction = None
+        if self._sound_image_widget is not None:
+            self._sound_image_widget.config(image="", text=message)
+        self._sound_photo = None
+        self._sound_info_var.set(info_text or "Sound reconstruction unavailable.")
+
     def _update_reference_preview(self) -> None:
         if self.reference_image is None or self._reference_image_widget is None:
             return
@@ -1199,7 +1560,8 @@ class UmbraDesktopApp:
             logger.warning("Failed to render reference preview: %s", exc)
             return
         self._reference_photo = photo
-        self._reference_image_widget.config(image=self._reference_photo)
+        self._reference_image_widget.config(image=self._reference_photo, text="")
+        self._update_reference_info()
 
     def _update_reconstruction(self, reconstruction: np.ndarray) -> None:
         self.reconstruction = np.clip(reconstruction, 0.0, 1.0)
@@ -1211,35 +1573,137 @@ class UmbraDesktopApp:
             logger.warning("Failed to render reconstruction preview: %s", exc)
             return
         self._recon_photo = photo
-        self._recon_image_widget.config(image=self._recon_photo)
+        self._recon_image_widget.config(image=self._recon_photo, text="")
+        self._recon_info_var.set("Awaiting AI reconstruction metrics…")
 
     def _update_sound_reconstruction(self, sound_image: np.ndarray | None) -> None:
         if self._sound_image_widget is None:
             return
         if sound_image is None:
             logger.debug("Sound reconstruction unavailable for UI display")
-            self.sound_reconstruction = None
-            self._sound_photo = None
-            self._sound_image_widget.config(image="", text="Sound reconstruction unavailable")
+            self._clear_sound_preview("Sound reconstruction unavailable")
             return
         logger.info("Generating WAV reconstruction preview for UI display")
         try:
             prepared = _prepare_sound_preview(sound_image)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to prepare sound reconstruction preview: %s", exc)
-            self.sound_reconstruction = None
-            self._sound_photo = None
-            self._sound_image_widget.config(image="", text="Sound reconstruction unavailable")
+            self._clear_sound_preview("Sound reconstruction unavailable")
             return
         self.sound_reconstruction = prepared
         try:
             photo = _to_photo_image(self.sound_reconstruction)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to render sound reconstruction preview: %s", exc)
-            self._sound_image_widget.config(image="", text="Sound reconstruction unavailable")
+            self._clear_sound_preview("Sound reconstruction unavailable")
             return
         self._sound_photo = photo
         self._sound_image_widget.config(image=self._sound_photo, text="")
+        self._sound_info_var.set("Sound preview ready – awaiting metrics…")
+
+    def _apply_generation_entry(self, entry: Mapping[str, Any]) -> None:
+        """Update status labels and metric summaries for a generation."""
+
+        def _as_float(key: str, default: float = 0.0) -> float:
+            try:
+                return float(entry.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        self._hide_loading_modal()
+        status_parts: list[str] = []
+        if "generation" in entry:
+            status_parts.append(f"Generation {_as_float('generation'):.0f}")
+        sound_score = entry.get("sound_score")
+        if sound_score is not None:
+            status_parts.append(f"Sound overlap {_as_float('sound_overlap'):.2f}%")
+            status_parts.append(f"Sound PSNR {_as_float('sound_psnr', _AI_PSNR_BASELINE):.2f} dB")
+            status_parts.append(f"Sound SSIM {_as_float('sound_ssim'):.3f}")
+            try:
+                status_parts.append(f"Sound score {float(sound_score):.2f}")
+            except (TypeError, ValueError):
+                status_parts.append("Sound score unavailable")
+        else:
+            status_parts.append("Sound score unavailable")
+        status_parts.append(f"AI overlap {_as_float('overlap'):.2f}%")
+        status_parts.append(f"AI PSNR {_as_float('psnr', _AI_PSNR_BASELINE):.2f} dB")
+        status_parts.append(f"AI SSIM {_as_float('ssim'):.3f}")
+        self._status_var.set(" · ".join(status_parts))
+
+        composite_score = entry.get("composite_score")
+        if sound_score is not None and composite_score is not None:
+            try:
+                self._primary_score_var.set(f"Sound score: {float(composite_score):.2f}")
+            except (TypeError, ValueError):
+                self._primary_score_var.set("Sound score: –")
+        else:
+            self._primary_score_var.set("Sound score: – (waiting for sound)")
+
+        readability_score = entry.get("sound_readability_score")
+        if sound_score is not None and readability_score is not None:
+            try:
+                self._readability_score_var.set(
+                    f"WAV readability score: {float(readability_score):.2f}"
+                )
+            except (TypeError, ValueError):
+                self._readability_score_var.set("WAV readability score: –")
+        else:
+            self._readability_score_var.set("WAV readability score: –")
+
+        ai_baseline = entry.get("ai_score")
+        if ai_baseline is not None:
+            try:
+                self._baseline_score_var.set(f"AI baseline score: {float(ai_baseline):.2f}")
+            except (TypeError, ValueError):
+                self._baseline_score_var.set("AI baseline score: –")
+        else:
+            self._baseline_score_var.set("AI baseline score: –")
+
+        self._update_preview_metrics(entry)
+
+    def _update_preview_metrics(self, entry: Mapping[str, Any]) -> None:
+        """Refresh the textual captions below the preview panes."""
+
+        def _as_float(key: str, default: float = 0.0) -> float:
+            try:
+                return float(entry.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        ai_text = (
+            f"Overlap {_as_float('overlap'):.2f}% · "
+            f"PSNR {_as_float('psnr', _AI_PSNR_BASELINE):.2f} dB · "
+            f"SSIM {_as_float('ssim'):.3f}"
+        )
+        ai_score = entry.get("ai_score")
+        if ai_score is not None:
+            try:
+                ai_text += f" · Score {float(ai_score):.2f}"
+            except (TypeError, ValueError):
+                pass
+        self._recon_info_var.set(ai_text)
+
+        if "sound_score" in entry or "sound_overlap" in entry:
+            sound_text = (
+                f"Overlap {_as_float('sound_overlap'):.2f}% · "
+                f"PSNR {_as_float('sound_psnr', _AI_PSNR_BASELINE):.2f} dB · "
+                f"SSIM {_as_float('sound_ssim'):.3f}"
+            )
+            sound_score = entry.get("sound_score")
+            if sound_score is not None:
+                try:
+                    sound_text += f" · Score {float(sound_score):.2f}"
+                except (TypeError, ValueError):
+                    pass
+            readability = entry.get("sound_readability_score")
+            if readability is not None:
+                try:
+                    sound_text += f" · Readability {float(readability):.2f}"
+                except (TypeError, ValueError):
+                    pass
+            self._sound_info_var.set(sound_text)
+        else:
+            self._sound_info_var.set("Sound metrics unavailable.")
 
     def _draw_graph(self) -> None:
         if self._graph_canvas is None:
@@ -1414,6 +1878,7 @@ __all__ = [
     "_compute_composite_score",
     "_compute_readability_score",
     "_normalize_pinterest_url",
+    "_generate_unique_model_path",
     "main",
 ]
 
@@ -1424,6 +1889,7 @@ __all__ = [
     "_compute_composite_score",
     "_compute_readability_score",
     "_normalize_pinterest_url",
+    "_generate_unique_model_path",
     "main",
 ]
 

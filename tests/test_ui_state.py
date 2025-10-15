@@ -1,8 +1,12 @@
+import itertools
+
+import umbra.ui as ui
 from umbra.metrics import ReconstructionMetrics
 from umbra.ui import (
     UmbraAppState,
     _compute_composite_score,
     _compute_readability_score,
+    _generate_unique_model_path,
     _normalize_pinterest_url,
 )
 
@@ -71,3 +75,20 @@ def test_normalize_pinterest_url_strips_tracking() -> None:
     messy = "https://i.pinimg.com/originals/d5/3b/01/d53b014d86a6b6761bf649a0ed813c2b.png?foo=1#fragment"
     clean = _normalize_pinterest_url(messy)
     assert clean == "https://i.pinimg.com/originals/d5/3b/01/d53b014d86a6b6761bf649a0ed813c2b.png"
+
+
+def test_generate_unique_model_path_avoids_collisions(tmp_path, monkeypatch) -> None:
+    sequence = itertools.cycle("abcdefghijklmnopqrstuvwxyz")
+    monkeypatch.setattr(ui.secrets, "choice", lambda _alphabet: next(sequence))
+
+    first_path = _generate_unique_model_path(tmp_path, generation_index=12)
+    first_path.touch()
+    second_path = _generate_unique_model_path(tmp_path, generation_index=12)
+
+    assert first_path != second_path
+    assert first_path.parent == tmp_path
+    assert second_path.parent == tmp_path
+    assert first_path.suffix == ".json"
+    assert second_path.suffix == ".json"
+    assert first_path.name.endswith("_12.json")
+    assert second_path.name.endswith("_12.json")
