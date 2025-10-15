@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from umbra.codec import decode_waveform_to_image, encode_image_to_waveform
+from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, _chaotic_seed_mix
@@ -143,18 +143,19 @@ def test_generation_metrics_track_sound_alignment() -> None:
 
     sample_rate = suggest_sample_rate(reference)
     segments, marker_duration = suggest_transmission_profile(reference)
-    waveform = encode_image_to_waveform(
+    wav_bytes = encode_image_to_wav_bytes(
         reconstruction,
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
     )
-    sound_image = decode_waveform_to_image(
-        waveform,
-        sample_rate=sample_rate,
+    sound_image, metadata = decode_wav_bytes_to_image(
+        wav_bytes,
         resolution=reference.shape[:2],
+        sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
+        return_metadata=True,
     )
     sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
 
@@ -192,10 +193,10 @@ def test_generation_metrics_track_sound_alignment() -> None:
         float(expected_packet_overlap), rel=1e-5, abs=1e-5
     )
 
-    assert candidate.waveform_sample_rate == int(sample_rate)
-    assert candidate.waveform_segments == int(segments)
+    assert candidate.waveform_sample_rate == int(metadata.sample_rate)
+    assert candidate.waveform_segments == int(metadata.segments)
     assert candidate.waveform_marker_duration == pytest.approx(
-        marker_duration, rel=1e-6, abs=1e-6
+        metadata.marker_duration, rel=1e-6, abs=1e-6
     )
     expected_sound_score = composite_score(
         float(expected_reference_overlap),

@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .codec import decode_waveform_to_image, encode_image_to_waveform
+from .codec import (
+    decode_wav_bytes_to_image,
+    encode_image_to_wav_bytes,
+)
 from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .metrics import (
@@ -612,19 +615,23 @@ class EvolutionManager:
             ):
                 logger.info("Generating WAV reconstruction for seed %d", seed)
                 try:
-                    waveform = encode_image_to_waveform(
+                    wav_bytes = encode_image_to_wav_bytes(
                         recon_image,
                         sample_rate=waveform_sample_rate,
                         segments=waveform_segments,
                         marker_duration=waveform_marker_duration,
                     )
-                    waveform_image = decode_waveform_to_image(
-                        waveform,
-                        sample_rate=waveform_sample_rate,
+                    waveform_image, metadata = decode_wav_bytes_to_image(
+                        wav_bytes,
                         resolution=reference_clipped.shape[:2],
+                        sample_rate=waveform_sample_rate,
                         segments=waveform_segments,
                         marker_duration=waveform_marker_duration,
+                        return_metadata=True,
                     )
+                    waveform_sample_rate = metadata.sample_rate or waveform_sample_rate
+                    waveform_segments = metadata.segments or waveform_segments
+                    waveform_marker_duration = metadata.marker_duration or waveform_marker_duration
                     waveform_image = _ensure_three_channel(waveform_image).astype(
                         np.float32
                     )
