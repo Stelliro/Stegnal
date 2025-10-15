@@ -158,7 +158,7 @@ def test_decode_wav_bytes_supports_advanced_logging() -> None:
     assert metadata.sample_rate == sample_rate
 
 
-def test_decode_waveform_to_image_returns_blank_on_failure() -> None:
+def test_decode_waveform_to_image_returns_preview_on_failure() -> None:
     waveform = np.zeros(0, dtype=np.float32)
 
     decoded = decode_waveform_to_image(
@@ -169,7 +169,9 @@ def test_decode_waveform_to_image_returns_blank_on_failure() -> None:
 
     assert decoded.shape == (4, 4, 3)
     assert decoded.dtype == np.float32
-    assert np.all(decoded == 0.0)
+    assert decoded.min() >= 0.0
+    assert decoded.max() <= 1.0
+    assert not np.allclose(decoded, decoded[0, 0, 0])
 
 
 def test_decode_waveform_to_image_attempts_alternative_segments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,7 +213,7 @@ def test_decode_waveform_to_image_attempts_alternative_segments(monkeypatch: pyt
     assert np.allclose(decoded, 0.25)
 
 
-def test_decode_wav_bytes_to_image_returns_blank_on_failure() -> None:
+def test_decode_wav_bytes_to_image_returns_preview_on_failure() -> None:
     bogus = b"not a wav"
 
     decoded, detected_rate = decode_wav_bytes_to_image(
@@ -223,7 +225,9 @@ def test_decode_wav_bytes_to_image_returns_blank_on_failure() -> None:
     assert detected_rate == 22_050
     assert decoded.shape == (4, 4, 3)
     assert decoded.dtype == np.float32
-    assert np.all(decoded == 0.0)
+    assert decoded.min() >= 0.0
+    assert decoded.max() <= 1.0
+    assert not np.allclose(decoded, decoded[0, 0, 0])
 
 
 def test_decode_wav_bytes_to_image_attempts_segment_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -283,7 +287,42 @@ def test_decode_wav_bytes_to_image_metadata_on_failure() -> None:
 
     assert decoded.shape == (2, 2, 3)
     assert decoded.dtype == np.float32
-    assert np.all(decoded == 0.0)
+    assert decoded.min() >= 0.0
+    assert decoded.max() <= 1.0
+    assert not np.allclose(decoded, decoded[0, 0, 0])
     assert metadata.sample_rate == 16_000
     assert metadata.segments == 1
     assert metadata.marker_duration == pytest.approx(marker, rel=1e-6)
+
+
+def test_decode_waveform_to_image_returns_preview_when_reconstruction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waveform = np.arange(16, dtype=np.float32)
+
+    def fake_reconstruct(
+        waveform: np.ndarray,
+        *,
+        resolution: tuple[int, int],
+        sample_rate: int,
+        segments: int | None,
+        marker_duration: float,
+        advanced_logging: bool,
+        return_segments: bool,
+    ) -> tuple[np.ndarray, int]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(codec_module, "_reconstruct_with_strategies", fake_reconstruct)
+
+    preview = decode_waveform_to_image(
+        waveform,
+        sample_rate=8,
+        resolution=(4, 4),
+        advanced_logging=True,
+    )
+
+    assert preview.shape == (4, 4, 3)
+    assert preview.dtype == np.float32
+    assert preview.min() >= 0.0
+    assert preview.max() <= 1.0
+    assert not np.allclose(preview, preview[0, 0, 0])

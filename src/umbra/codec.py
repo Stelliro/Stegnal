@@ -42,6 +42,55 @@ def _ensure_rgb_image(image: np.ndarray | Image.Image) -> np.ndarray:
     return array[..., :3].astype(np.float32)
 
 
+def _generate_placeholder_image(resolution: tuple[int, int]) -> np.ndarray:
+    """Return a deterministic gradient placeholder for ``resolution``."""
+
+    rows, cols = resolution
+    if rows <= 0 or cols <= 0:
+        raise ValueError("resolution must contain positive dimensions")
+
+    y_gradient = np.linspace(0.0, 1.0, rows, dtype=np.float32)[:, None]
+    x_gradient = np.linspace(0.0, 1.0, cols, dtype=np.float32)[None, :]
+    base = (0.55 * x_gradient + 0.45 * y_gradient) % 1.0
+    base = base.astype(np.float32)
+    accent = np.sqrt(np.clip(base, 0.0, 1.0)).astype(np.float32)
+    highlight = np.clip(1.0 - base, 0.0, 1.0).astype(np.float32)
+    return np.stack((base, accent, highlight), axis=2).astype(np.float32)
+
+
+def _waveform_preview_image(waveform: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
+    """Create a visually informative preview derived from ``waveform``."""
+
+    rows, cols = resolution
+    if rows <= 0 or cols <= 0:
+        raise ValueError("resolution must contain positive dimensions")
+
+    wave = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if wave.size == 0:
+        return _generate_placeholder_image(resolution)
+
+    samples = max(rows * cols, 1)
+    spectrum = np.abs(np.fft.fft(wave, n=samples))
+    spectrum = np.nan_to_num(spectrum, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    if spectrum.size < samples:
+        spectrum = np.pad(spectrum, (0, samples - spectrum.size))
+    elif spectrum.size > samples:
+        spectrum = spectrum[:samples]
+
+    preview = spectrum.reshape(rows, cols)
+    max_val = float(np.max(preview, initial=0.0))
+    min_val = float(np.min(preview, initial=0.0))
+    if not np.isfinite(max_val) or not np.isfinite(min_val) or max_val <= min_val:
+        return _generate_placeholder_image(resolution)
+
+    base = ((preview - min_val) / max(max_val - min_val, np.finfo(np.float32).eps)).astype(
+        np.float32
+    )
+    accent = np.sqrt(base).astype(np.float32)
+    highlight = np.clip(1.0 - base, 0.0, 1.0).astype(np.float32)
+    return np.stack((base, accent, highlight), axis=2).astype(np.float32)
+
+
 @dataclass(frozen=True)
 class DecodedWavMetadata:
     """Metadata describing a reconstructed image extracted from WAV bytes."""
@@ -168,7 +217,6 @@ def decode_waveform_to_image(
     rows, cols = int(resolution[0]), int(resolution[1])
     if rows <= 0 or cols <= 0:
         raise ValueError("resolution must contain positive dimensions")
-    fallback = np.zeros((rows, cols, 3), dtype=np.float32)
     if advanced_logging:
         logger.debug(
             "Decoding waveform with advanced logging: samples=%d resolution=%s sample_rate=%d segments=%s marker_duration=%.5f",
@@ -190,10 +238,10 @@ def decode_waveform_to_image(
         return image.astype(np.float32)
     except Exception as exc:  # pragma: no cover - defensive audio fallback
         logger.warning(
-            "Failed to reconstruct image from waveform; returning blank image: %s",
+            "Failed to reconstruct image from waveform; returning preview image: %s",
             exc,
         )
-        return fallback
+        return _waveform_preview_image(waveform, (rows, cols))
 
 
 def decode_wav_bytes_to_image(
@@ -240,7 +288,8 @@ def decode_wav_bytes_to_image(
     if rows <= 0 or cols <= 0:
         raise ValueError("resolution must contain positive dimensions")
 
-    fallback_image = np.zeros((rows, cols, 3), dtype=np.float32)
+    fallback_waveform: np.ndarray | None = None
+    fallback_image = _generate_placeholder_image((rows, cols))
     fallback_segments = 1
     if isinstance(segments, int) and segments > 0:
         fallback_segments = int(segments)
@@ -251,6 +300,7 @@ def decode_wav_bytes_to_image(
 
     try:
         waveform, detected_rate = load_waveform_from_wav(bytes(data))
+        fallback_waveform = waveform
         target_rate = int(sample_rate or detected_rate)
         if advanced_logging:
             logger.debug(
@@ -284,7 +334,7 @@ def decode_wav_bytes_to_image(
         return reconstructed.astype(np.float32), target_rate
     except Exception as exc:  # pragma: no cover - defensive audio fallback
         logger.warning(
-            "Failed to decode WAV bytes into image; returning blank image: %s",
+            "Failed to decode WAV bytes into image; returning preview image: %s",
             exc,
         )
         fallback_rate_candidates = (
@@ -301,6 +351,9 @@ def decode_wav_bytes_to_image(
             if rate > 0:
                 fallback_rate = rate
                 break
+
+        if fallback_waveform is not None:
+            fallback_image = _waveform_preview_image(fallback_waveform, (rows, cols))
 
         if return_metadata:
             metadata = DecodedWavMetadata(
