@@ -572,6 +572,7 @@ class UmbraDesktopApp:
         self._status_var = tk.StringVar(value="Select a reference image to begin.")
         self._run_mode_var = tk.StringVar(value="finite")
         self._score_threshold = tk.DoubleVar(value=88.0)
+        self._advanced_logging_var = tk.BooleanVar(value=False)
         self._primary_score_var = tk.StringVar(value="Sound score: –")
         self._readability_score_var = tk.StringVar(value="WAV readability score: –")
         self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
@@ -673,6 +674,20 @@ class UmbraDesktopApp:
         tk.Button(control_frame, text="Pause", command=self.stop_evolution).pack(
             side=tk.LEFT, padx=6, pady=6
         )
+
+        tk.Checkbutton(
+            control_frame,
+            text="Advanced logging",
+            variable=self._advanced_logging_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._handle_advanced_logging_toggle,
+            fg="white",
+            bg="#101010",
+            selectcolor="#303030",
+            activebackground="#202020",
+            activeforeground="white",
+        ).pack(side=tk.LEFT, padx=10)
 
         tk.Label(control_frame, textvariable=self._primary_score_var, fg="#8fdc6d", bg="#101010").pack(
             side=tk.RIGHT, padx=12
@@ -814,6 +829,15 @@ class UmbraDesktopApp:
         self._running = False
         self._status_var.set("Evolution paused. Press start to resume.")
 
+    def _handle_advanced_logging_toggle(self) -> None:
+        state = self._advanced_logging_var.get()
+        if state:
+            logger.info(
+                "Advanced logging enabled for audio reconstruction diagnostics."
+            )
+        else:
+            logger.info("Advanced logging disabled for audio reconstruction diagnostics.")
+
     def _reset_manager(self) -> None:
         if self.reference_image is None:
             return
@@ -868,6 +892,7 @@ class UmbraDesktopApp:
                     resolution=reconstruction.shape[:2],
                     segments=segments,
                     marker_duration=marker_duration,
+                    advanced_logging=self._advanced_logging_var.get(),
                 )
                 base_reference = (
                     self.reference_image if self.reference_image is not None else reconstruction

@@ -91,3 +91,42 @@ def test_reconstruct_from_waveform_supports_advanced_logging() -> None:
 
     assert recovered.shape == collage.shape
 
+
+def test_generation_round_trip_with_mach_data() -> None:
+    rows, cols = 48, 60
+    gradient_y = np.linspace(0.05, 0.95, rows, dtype=np.float32)
+    gradient_x = np.linspace(0.1, 0.9, cols, dtype=np.float32)
+    mach_base = gradient_y[:, None]
+    horizontal = np.repeat(mach_base, cols, axis=1)
+    vertical = np.repeat(gradient_x[None, :], rows, axis=0)
+    mach_pattern = np.stack(
+        (
+            horizontal,
+            1.0 - horizontal * 0.8,
+            np.clip(vertical ** 0.5, 0.0, 1.0),
+        ),
+        axis=-1,
+    )
+
+    waveform = image_to_waveform(
+        mach_pattern,
+        sample_rate=18_000,
+        segments=3,
+        marker_duration=0.025,
+    )
+
+    recovered, detected = reconstruct_from_waveform(
+        waveform,
+        resolution=mach_pattern.shape[:2],
+        sample_rate=18_000,
+        segments=3,
+        marker_duration=0.025,
+        advanced_logging=True,
+        return_segments=True,
+    )
+
+    assert detected == 3
+    assert recovered.shape == mach_pattern.shape
+    difference = np.mean(np.abs(recovered - mach_pattern))
+    assert difference < 0.26
+
