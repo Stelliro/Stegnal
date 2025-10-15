@@ -200,6 +200,14 @@ class CandidateResult:
     reconstruction: np.ndarray
     metrics: ReconstructionMetrics
     overlap_score: float
+    waveform_reconstruction: np.ndarray | None = None
+    waveform_reference_metrics: ReconstructionMetrics | None = None
+    waveform_reference_overlap: float | None = None
+    waveform_packet_metrics: ReconstructionMetrics | None = None
+    waveform_packet_overlap: float | None = None
+    waveform_sample_rate: int | None = None
+    waveform_segments: int | None = None
+    waveform_marker_duration: float | None = None
     reward: float = 0.0
     predicted_reward: float | None = None
     feature_vector: tuple[float, ...] = field(default_factory=tuple)
@@ -258,6 +266,7 @@ class EvolutionSession:
     plateau_generations: int = 0
     mutation_boost: int = 0
     hyper_profile: dict[str, Any] | None = None
+    enable_waveform: bool = True
 
 
 @dataclass
@@ -296,6 +305,7 @@ class EvolutionManager:
         *,
         run_id: str | None = None,
         next_generation_index: int | None = None,
+        enable_waveform: bool = True,
     ) -> None:
         self.original = np.asarray(original, dtype=np.float32)
         self.encoder = encoder
@@ -320,6 +330,7 @@ class EvolutionManager:
             run_dir, _ = get_run_paths(run_id)
         self.run_id = run_id
         self._run_directory = run_dir
+        self.enable_waveform = bool(enable_waveform)
         if next_generation_index is None:
             self.next_generation_index = 0
         else:
@@ -550,6 +561,102 @@ class EvolutionManager:
         combined ^= mutation
         return combined & 0x7FFFFFFF
 
+    def _evaluate_candidate(
+        self,
+        seed: int,
+        reference_clipped: np.ndarray,
+        *,
+        waveform_payload: dict[str, Any] | None,
+    ) -> CandidateResult:
+        """Run the packet pipeline and optional waveform reconstruction for ``seed``."""
+
+        packet = self.encoder.encode(self.original, int(seed))
+        reconstruction = self.decoder.decode(packet, int(seed))
+        try:
+            recon_image = _ensure_three_channel(reconstruction)
+        except ValueError:
+            logger.debug(
+                "Falling back to reference alignment for seed %d", seed, exc_info=True
+            )
+            recon_image = reference_clipped
+
+        recon_image = np.asarray(recon_image, dtype=np.float32)
+        packet_metrics = compute_metrics(reference_clipped, recon_image)
+        _, packet_overlap = multiplicative_overlap(reference_clipped, recon_image)
+
+        waveform_image: np.ndarray | None = None
+        waveform_reference_metrics: ReconstructionMetrics | None = None
+        waveform_reference_overlap: float | None = None
+        waveform_packet_metrics: ReconstructionMetrics | None = None
+        waveform_packet_overlap: float | None = None
+        waveform_sample_rate: int | None = None
+        waveform_segments: int | None = None
+        waveform_marker_duration: float | None = None
+
+        if self.enable_waveform and waveform_payload is not None:
+            try:
+                logger.info("Generating WAV reconstruction for seed %d", seed)
+                waveform = np.asarray(waveform_payload["waveform"], dtype=np.float32)
+                waveform_sample_rate = int(waveform_payload["sample_rate"])
+                waveform_segments = int(waveform_payload["segments"])
+                waveform_marker_duration = float(waveform_payload["marker_duration"])
+                waveform_image = decode_waveform_to_image(
+                    waveform,
+                    sample_rate=waveform_sample_rate,
+                    resolution=reference_clipped.shape[:2],
+                    segments=waveform_segments,
+                    marker_duration=waveform_marker_duration,
+                )
+                waveform_image = _ensure_three_channel(waveform_image).astype(
+                    np.float32
+                )
+                waveform_reference_metrics = compute_metrics(
+                    reference_clipped, waveform_image
+                )
+                _, waveform_reference_overlap = multiplicative_overlap(
+                    reference_clipped, waveform_image
+                )
+                waveform_packet_metrics = compute_metrics(recon_image, waveform_image)
+                _, waveform_packet_overlap = multiplicative_overlap(
+                    recon_image, waveform_image
+                )
+            except Exception as exc:  # pragma: no cover - diagnostic logging path
+                logger.debug(
+                    "Waveform reconstruction failed for seed %d: %s",
+                    seed,
+                    exc,
+                    exc_info=True,
+                )
+                waveform_image = None
+                waveform_reference_metrics = None
+                waveform_reference_overlap = None
+                waveform_packet_metrics = None
+                waveform_packet_overlap = None
+                waveform_sample_rate = None
+                waveform_segments = None
+                waveform_marker_duration = None
+
+        return CandidateResult(
+            seed=int(seed),
+            reconstruction=recon_image.astype(np.float32, copy=True),
+            metrics=packet_metrics,
+            overlap_score=float(packet_overlap),
+            waveform_reconstruction=None
+            if waveform_image is None
+            else waveform_image.astype(np.float32, copy=True),
+            waveform_reference_metrics=waveform_reference_metrics,
+            waveform_reference_overlap=None
+            if waveform_reference_overlap is None
+            else float(waveform_reference_overlap),
+            waveform_packet_metrics=waveform_packet_metrics,
+            waveform_packet_overlap=None
+            if waveform_packet_overlap is None
+            else float(waveform_packet_overlap),
+            waveform_sample_rate=waveform_sample_rate,
+            waveform_segments=waveform_segments,
+            waveform_marker_duration=waveform_marker_duration,
+        )
+
     def _candidate_features(
         self,
         candidate: CandidateResult,
@@ -725,49 +832,39 @@ class EvolutionManager:
         channel_axis = -1 if self.original.ndim == 3 else None
 
         reference_clipped = _ensure_three_channel(self.original)
+        waveform_payload: dict[str, Any] | None = None
+        if self.enable_waveform:
+            try:
+                sample_rate = suggest_sample_rate(reference_clipped)
+                segments, marker_duration = suggest_transmission_profile(reference_clipped)
+                waveform = encode_image_to_waveform(
+                    reference_clipped,
+                    sample_rate=sample_rate,
+                    segments=segments,
+                    marker_duration=marker_duration,
+                )
+                waveform_payload = {
+                    "waveform": waveform,
+                    "sample_rate": int(sample_rate),
+                    "segments": int(segments),
+                    "marker_duration": float(marker_duration),
+                }
+            except Exception as exc:  # pragma: no cover - diagnostic waveform prep
+                logger.debug(
+                    "Failed to prepare waveform baseline for generation %d: %s",
+                    generation_index,
+                    exc,
+                    exc_info=True,
+                )
+                waveform_payload = None
         start_time = time.perf_counter()
         for seed in seeds:
-            packet = self.encoder.encode(self.original, int(seed))
-            reconstruction = self.decoder.decode(packet, int(seed))
-            try:
-                recon_image = _ensure_three_channel(reconstruction)
-            except ValueError:
-                logger.debug("Falling back to reference alignment for seed %d", seed, exc_info=True)
-                recon_image = reference_clipped
-            comparison_base: np.ndarray | None
-            try:
-                sample_rate = suggest_sample_rate(recon_image)
-                segments, marker_duration = suggest_transmission_profile(recon_image)
-                waveform = encode_image_to_waveform(
-                    recon_image,
-                    sample_rate=sample_rate,
-                    segments=segments,
-                    marker_duration=marker_duration,
-                )
-                sound_image = decode_waveform_to_image(
-                    waveform,
-                    sample_rate=sample_rate,
-                    resolution=recon_image.shape[:2],
-                    segments=segments,
-                    marker_duration=marker_duration,
-                )
-                comparison_base = _ensure_three_channel(sound_image)
-            except Exception:  # pragma: no cover - audio fallback path
-                logger.debug("Sound alignment failed for seed %d", seed, exc_info=True)
-                comparison_base = None
-
-            if comparison_base is None:
-                metrics = compute_metrics(reference_clipped, recon_image)
-                _, overlap_score = multiplicative_overlap(reference_clipped, recon_image)
-            else:
-                metrics = compute_metrics(recon_image, comparison_base)
-                _, overlap_score = multiplicative_overlap(recon_image, comparison_base)
-            candidate = CandidateResult(
-                seed=int(seed),
-                reconstruction=recon_image.astype(np.float32, copy=True),
-                metrics=metrics,
-                overlap_score=float(overlap_score),
+            candidate = self._evaluate_candidate(
+                int(seed),
+                reference_clipped,
+                waveform_payload=waveform_payload,
             )
+            reconstruction = np.asarray(candidate.reconstruction, dtype=np.float32)
             features = self._candidate_features(candidate, generation.index, previous_best_ssim)
             overlap_norm = float(np.clip(candidate.overlap_score / 100.0, 0.0, 1.0))
             msssim_value: float | None = None
@@ -1041,6 +1138,43 @@ class EvolutionManager:
                         ),
                         metrics=candidate.metrics,
                         overlap_score=candidate.overlap_score,
+                        waveform_reconstruction=None
+                        if getattr(candidate, "waveform_reconstruction", None) is None
+                        else np.asarray(
+                            candidate.waveform_reconstruction, dtype=np.float16
+                        ),
+                        waveform_reference_metrics=getattr(
+                            candidate, "waveform_reference_metrics", None
+                        ),
+                        waveform_reference_overlap=(
+                            None
+                            if getattr(candidate, "waveform_reference_overlap", None)
+                            is None
+                            else float(candidate.waveform_reference_overlap)
+                        ),
+                        waveform_packet_metrics=getattr(
+                            candidate, "waveform_packet_metrics", None
+                        ),
+                        waveform_packet_overlap=(
+                            None
+                            if getattr(candidate, "waveform_packet_overlap", None) is None
+                            else float(candidate.waveform_packet_overlap)
+                        ),
+                        waveform_sample_rate=(
+                            None
+                            if getattr(candidate, "waveform_sample_rate", None) is None
+                            else int(candidate.waveform_sample_rate)
+                        ),
+                        waveform_segments=(
+                            None
+                            if getattr(candidate, "waveform_segments", None) is None
+                            else int(candidate.waveform_segments)
+                        ),
+                        waveform_marker_duration=(
+                            None
+                            if getattr(candidate, "waveform_marker_duration", None) is None
+                            else float(candidate.waveform_marker_duration)
+                        ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(
                             None
@@ -1098,6 +1232,7 @@ class EvolutionManager:
             hyper_profile=(
                 self._hyper_profile.as_dict() if self._hyper_profile.enabled else None
             ),
+            enable_waveform=self.enable_waveform,
         )
 
     def save(self, directory: str | Path) -> Path:
@@ -1146,6 +1281,45 @@ class EvolutionManager:
                         ),
                         metrics=candidate.metrics,
                         overlap_score=candidate.overlap_score,
+                        waveform_reconstruction=(
+                            None
+                            if getattr(candidate, "waveform_reconstruction", None) is None
+                            else np.asarray(
+                                candidate.waveform_reconstruction, dtype=np.float32
+                            )
+                        ),
+                        waveform_reference_metrics=getattr(
+                            candidate, "waveform_reference_metrics", None
+                        ),
+                        waveform_reference_overlap=(
+                            None
+                            if getattr(candidate, "waveform_reference_overlap", None)
+                            is None
+                            else float(candidate.waveform_reference_overlap)
+                        ),
+                        waveform_packet_metrics=getattr(
+                            candidate, "waveform_packet_metrics", None
+                        ),
+                        waveform_packet_overlap=(
+                            None
+                            if getattr(candidate, "waveform_packet_overlap", None) is None
+                            else float(candidate.waveform_packet_overlap)
+                        ),
+                        waveform_sample_rate=(
+                            None
+                            if getattr(candidate, "waveform_sample_rate", None) is None
+                            else int(candidate.waveform_sample_rate)
+                        ),
+                        waveform_segments=(
+                            None
+                            if getattr(candidate, "waveform_segments", None) is None
+                            else int(candidate.waveform_segments)
+                        ),
+                        waveform_marker_duration=(
+                            None
+                            if getattr(candidate, "waveform_marker_duration", None) is None
+                            else float(candidate.waveform_marker_duration)
+                        ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(
                             None
@@ -1202,6 +1376,7 @@ class EvolutionManager:
             advisor=advisor,
             run_id=getattr(session, "run_id", None),
             next_generation_index=getattr(session, "next_generation_index", None),
+            enable_waveform=getattr(session, "enable_waveform", True),
         )
         for record in restored_generations:
             manager.append_generation_record(record, persist=False, use_next_index=False)

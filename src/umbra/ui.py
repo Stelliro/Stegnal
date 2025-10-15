@@ -45,17 +45,12 @@ try:  # pragma: no cover - optional dependency for memory accounting
 except Exception:  # pragma: no cover - optional dependency
     psutil = None
 
-from .codec import (
-    decode_waveform_to_image,
-    encode_image_to_wav_bytes,
-    encode_image_to_waveform,
-)
+from .codec import encode_image_to_wav_bytes
 from .decoding import NoiseStreamDecoder
 from .demo_packager import build_demo_executable
 from .encoding import NoiseStreamEncoder
 from .evolution import EvolutionManager
 from .metrics import ReconstructionMetrics, compute_metrics
-from .reconstruction import suggest_sample_rate, suggest_transmission_profile
 from .visualization import multiplicative_overlap
 
 logger = logging.getLogger(__name__)
@@ -878,46 +873,47 @@ class UmbraDesktopApp:
             best = generation.best_candidate
             reconstruction = np.asarray(best.reconstruction, dtype=np.float32)
             sound_payload: dict[str, Any] = {}
-            sound_image: np.ndarray | None = None
-            try:
-                sample_rate = suggest_sample_rate(reconstruction)
-                segments, marker_duration = suggest_transmission_profile(reconstruction)
-                waveform = encode_image_to_waveform(
-                    reconstruction,
-                    sample_rate=sample_rate,
-                    segments=segments,
-                    marker_duration=marker_duration,
+            sound_image: np.ndarray | None
+            if best.waveform_reconstruction is not None:
+                logger.info(
+                    "Generating WAV reconstruction preview for seed %d", best.seed
                 )
-                sound_image = decode_waveform_to_image(
-                    waveform,
-                    sample_rate=sample_rate,
-                    resolution=reconstruction.shape[:2],
-                    segments=segments,
-                    marker_duration=marker_duration,
-                    advanced_logging=self._advanced_logging_enabled,
-                )
+                sound_image = np.asarray(best.waveform_reconstruction, dtype=np.float32)
                 base_reference = (
                     self.reference_image if self.reference_image is not None else reconstruction
                 )
-                ref_image = np.asarray(base_reference, dtype=np.float32)
-                ref_image = np.clip(ref_image, 0.0, 1.0)
+                ref_image = np.clip(np.asarray(base_reference, dtype=np.float32), 0.0, 1.0)
                 recon_clipped = np.clip(reconstruction, 0.0, 1.0)
-                sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
-                sound_vs_ai = compute_metrics(recon_clipped, sound_clipped)
-                _, sound_overlap = multiplicative_overlap(recon_clipped, sound_clipped)
-                sound_vs_reference = compute_metrics(ref_image, sound_clipped)
-                _, sound_reference_overlap = multiplicative_overlap(ref_image, sound_clipped)
+                sound_clipped = np.clip(sound_image, 0.0, 1.0)
+                sound_metrics = best.waveform_packet_metrics
+                sound_overlap = best.waveform_packet_overlap
+                if sound_metrics is None or sound_overlap is None:
+                    sound_metrics = compute_metrics(recon_clipped, sound_clipped)
+                    _, overlap_value = multiplicative_overlap(recon_clipped, sound_clipped)
+                    sound_overlap = float(overlap_value)
+                sound_reference_metrics = best.waveform_reference_metrics
+                sound_reference_overlap = best.waveform_reference_overlap
+                if sound_reference_metrics is None or sound_reference_overlap is None:
+                    sound_reference_metrics = compute_metrics(ref_image, sound_clipped)
+                    _, overlap_value = multiplicative_overlap(ref_image, sound_clipped)
+                    sound_reference_overlap = float(overlap_value)
                 sound_payload = {
-                    "sound_metrics": sound_vs_ai,
-                    "sound_overlap": float(sound_overlap),
-                    "sound_reference_metrics": sound_vs_reference,
-                    "sound_reference_overlap": float(sound_reference_overlap),
-                    "sample_rate": int(sample_rate),
-                    "segments": int(segments),
-                    "marker_duration": float(marker_duration),
+                    "sound_metrics": sound_metrics,
+                    "sound_overlap": sound_overlap,
+                    "sound_reference_metrics": sound_reference_metrics,
+                    "sound_reference_overlap": sound_reference_overlap,
                 }
-            except Exception as exc:  # pragma: no cover - audio pipeline fallback
-                logger.debug("Failed to derive sound reconstruction: %s", exc)
+                if best.waveform_sample_rate is not None:
+                    sound_payload["sample_rate"] = int(best.waveform_sample_rate)
+                if best.waveform_segments is not None:
+                    sound_payload["segments"] = int(best.waveform_segments)
+                if best.waveform_marker_duration is not None:
+                    sound_payload["marker_duration"] = float(best.waveform_marker_duration)
+            else:
+                logger.debug(
+                    "Waveform reconstruction unavailable for seed %d", best.seed
+                )
+                sound_image = None
 
             entry = self.state.record_generation(
                 generation.index,
@@ -1221,10 +1217,12 @@ class UmbraDesktopApp:
         if self._sound_image_widget is None:
             return
         if sound_image is None:
+            logger.debug("Sound reconstruction unavailable for UI display")
             self.sound_reconstruction = None
             self._sound_photo = None
             self._sound_image_widget.config(image="", text="Sound reconstruction unavailable")
             return
+        logger.info("Generating WAV reconstruction preview for UI display")
         try:
             prepared = _prepare_sound_preview(sound_image)
         except Exception as exc:  # pragma: no cover - defensive

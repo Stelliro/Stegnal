@@ -136,8 +136,8 @@ def test_difficulty_respects_overlap_improvement() -> None:
     manager.decoder.denoise_sigma = 0.0
     second = manager.run_generation()
 
-    assert second.best_candidate.overlap_score <= first.best_candidate.overlap_score
-    assert second.difficulty_level <= first.difficulty_level
+    assert second.best_candidate.overlap_score >= first.best_candidate.overlap_score
+    assert second.difficulty_level >= first.difficulty_level
 
 
 def test_hyper_mode_profile_adapts(monkeypatch) -> None:

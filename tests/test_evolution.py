@@ -127,11 +127,25 @@ def test_generation_metrics_track_sound_alignment() -> None:
 
     record = manager.run_generation()
     candidate = record.best_candidate
+    reference = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
     reconstruction = np.clip(np.asarray(candidate.reconstruction, dtype=np.float32), 0.0, 1.0)
-    sample_rate = suggest_sample_rate(reconstruction)
-    segments, marker_duration = suggest_transmission_profile(reconstruction)
+    packet_metrics = compute_metrics(reference, reconstruction)
+    _, packet_overlap = multiplicative_overlap(reference, reconstruction)
+
+    assert candidate.metrics.psnr == pytest.approx(
+        packet_metrics.psnr, rel=1e-5, abs=1e-5
+    )
+    assert candidate.metrics.ssim == pytest.approx(
+        packet_metrics.ssim, rel=1e-5, abs=1e-5
+    )
+    assert candidate.overlap_score == pytest.approx(
+        float(packet_overlap), rel=1e-5, abs=1e-5
+    )
+
+    sample_rate = suggest_sample_rate(reference)
+    segments, marker_duration = suggest_transmission_profile(reference)
     waveform = encode_image_to_waveform(
-        reconstruction,
+        reference,
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
@@ -139,14 +153,48 @@ def test_generation_metrics_track_sound_alignment() -> None:
     sound_image = decode_waveform_to_image(
         waveform,
         sample_rate=sample_rate,
-        resolution=reconstruction.shape[:2],
+        resolution=reference.shape[:2],
         segments=segments,
         marker_duration=marker_duration,
     )
     sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
-    expected_metrics = compute_metrics(reconstruction, sound_clipped)
-    _, expected_overlap = multiplicative_overlap(reconstruction, sound_clipped)
 
-    assert candidate.metrics.psnr == pytest.approx(expected_metrics.psnr, rel=1e-5, abs=1e-5)
-    assert candidate.metrics.ssim == pytest.approx(expected_metrics.ssim, rel=1e-5, abs=1e-5)
-    assert candidate.overlap_score == pytest.approx(float(expected_overlap), rel=1e-5, abs=1e-5)
+    assert candidate.waveform_reconstruction is not None
+    np.testing.assert_allclose(
+        np.clip(np.asarray(candidate.waveform_reconstruction, dtype=np.float32), 0.0, 1.0),
+        sound_clipped,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+    expected_reference_metrics = compute_metrics(reference, sound_clipped)
+    _, expected_reference_overlap = multiplicative_overlap(reference, sound_clipped)
+    assert candidate.waveform_reference_metrics is not None
+    assert candidate.waveform_reference_metrics.psnr == pytest.approx(
+        expected_reference_metrics.psnr, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_reference_metrics.ssim == pytest.approx(
+        expected_reference_metrics.ssim, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_reference_overlap == pytest.approx(
+        float(expected_reference_overlap), rel=1e-5, abs=1e-5
+    )
+
+    expected_packet_metrics = compute_metrics(reconstruction, sound_clipped)
+    _, expected_packet_overlap = multiplicative_overlap(reconstruction, sound_clipped)
+    assert candidate.waveform_packet_metrics is not None
+    assert candidate.waveform_packet_metrics.psnr == pytest.approx(
+        expected_packet_metrics.psnr, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_packet_metrics.ssim == pytest.approx(
+        expected_packet_metrics.ssim, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_packet_overlap == pytest.approx(
+        float(expected_packet_overlap), rel=1e-5, abs=1e-5
+    )
+
+    assert candidate.waveform_sample_rate == int(sample_rate)
+    assert candidate.waveform_segments == int(segments)
+    assert candidate.waveform_marker_duration == pytest.approx(
+        marker_duration, rel=1e-6, abs=1e-6
+    )
