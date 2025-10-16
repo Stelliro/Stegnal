@@ -11,6 +11,7 @@ import umbra.reconstruction as reconstruction
 class _CuPyStub:
     """Minimal CuPy stand-in that delegates operations to NumPy."""
 
+    _umbra_skip_nvrtc_check = True
     float32 = np.float32
     ndarray = np.ndarray
 

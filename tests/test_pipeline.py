@@ -47,3 +47,62 @@ def test_encode_requires_gpu_when_fallback_disabled(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(GPUAccelerationRequiredError):
         encoder.encode(image, seed=7, allow_cpu_fallback=False)
+
+
+def test_simulate_uwb_channel_gpu_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import umbra.encoding as encoding
+
+    class _FailingCuPyStub:
+        _umbra_skip_nvrtc_check = True
+        float32 = np.float32
+
+        @staticmethod
+        def asarray(*args, **kwargs):  # type: ignore[override]
+            raise RuntimeError("nvrtc missing")
+
+    monkeypatch.setattr(encoding, "cp", _FailingCuPyStub, raising=False)
+
+    from umbra.reconstruction import GPUAccelerationRequiredError
+
+    with pytest.raises(GPUAccelerationRequiredError):
+        encoding._simulate_uwb_channel(
+            np.ones(16, dtype=np.float32),
+            np.random.default_rng(0),
+            allow_cpu_fallback=False,
+        )
+
+
+def test_ensure_gpu_available_missing_nvrtc(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    import umbra.encoding as encoding
+
+    stub = types.SimpleNamespace(_umbra_skip_nvrtc_check=False, cuda=types.SimpleNamespace())
+    monkeypatch.setattr(encoding, "cp", stub, raising=False)
+
+    nvrtc_module = types.ModuleType("cupy_backends.cuda.libs.nvrtc")
+
+    def _raise_missing():
+        raise RuntimeError("missing NVRTC runtime")
+
+    nvrtc_module.getVersion = _raise_missing  # type: ignore[attr-defined]
+
+    libs_module = types.ModuleType("cupy_backends.cuda.libs")
+    libs_module.nvrtc = nvrtc_module  # type: ignore[attr-defined]
+
+    cuda_module = types.ModuleType("cupy_backends.cuda")
+    cuda_module.libs = libs_module  # type: ignore[attr-defined]
+
+    backends_module = types.ModuleType("cupy_backends")
+    backends_module.cuda = cuda_module  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "cupy_backends", backends_module)
+    monkeypatch.setitem(sys.modules, "cupy_backends.cuda", cuda_module)
+    monkeypatch.setitem(sys.modules, "cupy_backends.cuda.libs", libs_module)
+    monkeypatch.setitem(sys.modules, "cupy_backends.cuda.libs.nvrtc", nvrtc_module)
+
+    from umbra.reconstruction import GPUAccelerationRequiredError
+
+    with pytest.raises(GPUAccelerationRequiredError):
+        encoding._ensure_gpu_available("validation")

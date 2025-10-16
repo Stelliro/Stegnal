@@ -71,6 +71,7 @@ from .metrics import (
     partial_alignment_fraction,
     readability_score,
 )
+from .reconstruction import GPUAccelerationRequiredError
 from .visualization import multiplicative_overlap
 
 logger = logging.getLogger(__name__)
@@ -2182,6 +2183,16 @@ class UmbraDesktopApp:
                 self._queue.put(("evolution_complete", {"limit": exc.limit}))
                 self._running = False
                 break
+            except GPUAccelerationRequiredError as exc:
+                logger.error("GPU acceleration unavailable: %s", exc)
+                message = (
+                    "GPU acceleration error: "
+                    "install the CUDA runtime (nvrtc) or enable CPU fallback in settings."
+                )
+                self._queue.put(("status", message))
+                self._queue.put(("gpu_error", {"error": str(exc)}))
+                self._running = False
+                break
             except Exception as exc:  # pragma: no cover - defensive logging path
                 logger.exception("Evolution failed", exc_info=exc)
                 self._queue.put(("status", f"Evolution error: {exc}"))
@@ -2335,6 +2346,21 @@ class UmbraDesktopApp:
             elif kind == "status":
                 _, text = message
                 self._status_var.set(str(text))
+            elif kind == "gpu_error":
+                _, payload = message
+                error_text = "GPU acceleration unavailable"
+                if isinstance(payload, Mapping):
+                    details = payload.get("error")
+                    if details:
+                        error_text = str(details)
+                self._hide_loading_modal()
+                guidance = (
+                    "GPU acceleration required. Install the CUDA runtime (nvrtc) or "
+                    "enable CPU fallback in settings."
+                )
+                self._status_var.set(guidance)
+                if messagebox is not None:  # pragma: no cover - UI side effect
+                    messagebox.showerror("GPU acceleration", f"{guidance}\n\nDetails: {error_text}")
             elif kind == "evolution_complete":
                 _, payload = message
                 limit = 0

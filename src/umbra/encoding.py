@@ -90,6 +90,20 @@ def _ensure_gpu_available(operation: str) -> None:
             f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
         )
 
+    if getattr(cp, "_umbra_skip_nvrtc_check", False):  # pragma: no cover - exercised via tests
+        return
+
+    if hasattr(cp, "cuda"):
+        try:  # pragma: no cover - exercised indirectly when CUDA is unavailable
+            from cupy_backends.cuda.libs import nvrtc  # type: ignore
+
+            nvrtc.getVersion()
+        except Exception as exc:  # pragma: no cover - defensive GPU validation
+            raise GPUAccelerationRequiredError(
+                "CuPy is installed but failed to load the CUDA NVRTC runtime. "
+                "Install the matching CUDA toolkit or allow CPU fallback."
+            ) from exc
+
 
 def _simulate_uwb_channel(
     signal: np.ndarray,
@@ -100,40 +114,49 @@ def _simulate_uwb_channel(
     """Apply a simple UWB channel model, preferring GPU buffers when requested."""
 
     backend = np
-    if not allow_cpu_fallback:
+    use_gpu = not allow_cpu_fallback
+    if use_gpu:
         _ensure_gpu_available("UWB channel simulation")
         backend = cp  # type: ignore[assignment]
 
-    signal_backend = (
-        backend.asarray(signal, dtype=backend.float32)
-        if backend is not np
-        else np.asarray(signal, dtype=np.float32)
-    )
+    try:
+        signal_backend = (
+            backend.asarray(signal, dtype=backend.float32)
+            if backend is not np
+            else np.asarray(signal, dtype=np.float32)
+        )
 
-    taps = 6
-    max_delay = max(2, int(signal_backend.size // 8) or 2)
-    delays = rng.integers(1, max_delay, size=taps)
-    gains = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
+        taps = 6
+        max_delay = max(2, int(signal_backend.size // 8) or 2)
+        delays = rng.integers(1, max_delay, size=taps)
+        gains = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
 
-    response = (
-        backend.zeros_like(signal_backend, dtype=backend.float32)
-        if backend is not np
-        else np.zeros_like(signal_backend, dtype=np.float32)
-    )
-    for gain, delay in zip(gains, delays):
-        response[delay:] += gain * signal_backend[:-delay]
+        response = (
+            backend.zeros_like(signal_backend, dtype=backend.float32)
+            if backend is not np
+            else np.zeros_like(signal_backend, dtype=np.float32)
+        )
+        for gain, delay in zip(gains, delays):
+            response[delay:] += gain * signal_backend[:-delay]
 
-    faded = 0.6 * signal_backend + response
-    faded = faded / backend.max(backend.abs(faded) + 1e-6)
+        faded = 0.6 * signal_backend + response
+        faded = faded / backend.max(backend.abs(faded) + 1e-6)
 
-    if backend is np:
-        return faded.astype(np.float32, copy=False), gains.astype(np.float32, copy=False)
+        if backend is np:
+            return faded.astype(np.float32, copy=False), gains.astype(np.float32, copy=False)
 
-    # Convert the GPU buffers back to NumPy for downstream compatibility.
-    return (
-        cp.asnumpy(faded).astype(np.float32, copy=False),
-        cp.asnumpy(backend.asarray(gains, dtype=backend.float32)).astype(np.float32, copy=False),
-    )
+        # Convert the GPU buffers back to NumPy for downstream compatibility.
+        return (
+            cp.asnumpy(faded).astype(np.float32, copy=False),
+            cp.asnumpy(backend.asarray(gains, dtype=backend.float32)).astype(np.float32, copy=False),
+        )
+    except Exception as exc:
+        if use_gpu:
+            raise GPUAccelerationRequiredError(
+                "GPU acceleration failed while simulating the UWB channel. "
+                "Ensure the CUDA runtime (including nvrtc) is installed or enable CPU fallback."
+            ) from exc
+        raise
 
 
 @dataclass
