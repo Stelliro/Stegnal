@@ -4,7 +4,7 @@ import numpy as np
 
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
-from umbra.evolution import EvolutionManager
+from umbra.evolution import EvolutionLimitReached, EvolutionManager
 from umbra.neural import NeuralRewardModel
 
 
@@ -32,6 +32,35 @@ def test_evolution_manager_runs_multiple_generations() -> None:
     assert all(0.0 <= metric.ssim <= 1.0 for metric in best_metrics)
     assert manager.lifetime_reward > 0.0
     assert all(record.reward_summary >= 0.0 for record in manager.generations)
+
+
+def test_generation_limit_enforced() -> None:
+    rng = np.random.default_rng(1234)
+    image = rng.random((16, 16), dtype=np.float32)
+    encoder = NoiseStreamEncoder(sigma=0.2)
+    decoder = NoiseStreamDecoder(denoise_sigma=0.9)
+    manager = EvolutionManager(
+        original=image,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=2,
+        base_seed=9876,
+        autosave_interval=1,
+        enable_waveform=False,
+        max_generations=2,
+    )
+
+    first = manager.run_generation()
+    second = manager.run_generation()
+    assert first.index == 0
+    assert second.index == 1
+    try:
+        manager.run_generation()
+    except EvolutionLimitReached as exc:
+        assert exc.limit == 2
+        assert exc.attempted_generation == 2
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected EvolutionLimitReached to be raised")
 
 
 def test_parent_lineage_retains_elites_and_children() -> None:

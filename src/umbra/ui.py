@@ -61,7 +61,7 @@ from .codec import (
 from .decoding import NoiseStreamDecoder
 from .demo_packager import build_demo_executable
 from .encoding import NoiseStreamEncoder
-from .evolution import EvolutionManager
+from .evolution import EvolutionLimitReached, EvolutionManager
 from .metrics import (
     AI_PSNR_BASELINE,
     ReconstructionMetrics,
@@ -113,6 +113,8 @@ _PINTEREST_JSON_SCRIPT_PATTERN = re.compile(
     r"<script[^>]+type=\"application/json\"[^>]*>(?P<payload>.*?)</script>",
     flags=re.IGNORECASE | re.DOTALL,
 )
+
+_UI_GENERATION_LIMIT = 250
 
 
 class PinterestDownloadError(RuntimeError):
@@ -2122,6 +2124,7 @@ class UmbraDesktopApp:
             population_size=6,
             base_seed=base_seed,
             autosave_interval=6,
+            max_generations=_UI_GENERATION_LIMIT,
         )
 
     def _run_loop(self) -> None:
@@ -2129,6 +2132,17 @@ class UmbraDesktopApp:
         while self._running:
             try:
                 generation = self.manager.run_generation()
+            except EvolutionLimitReached as exc:
+                logger.info("Evolution halted after reaching limit: %s", exc)
+                self._queue.put(
+                    (
+                        "status",
+                        f"Generation limit reached at {exc.limit} generations.",
+                    )
+                )
+                self._queue.put(("evolution_complete", {"limit": exc.limit}))
+                self._running = False
+                break
             except Exception as exc:  # pragma: no cover - defensive logging path
                 logger.exception("Evolution failed", exc_info=exc)
                 self._queue.put(("status", f"Evolution error: {exc}"))
@@ -2262,6 +2276,21 @@ class UmbraDesktopApp:
             elif kind == "status":
                 _, text = message
                 self._status_var.set(str(text))
+            elif kind == "evolution_complete":
+                _, payload = message
+                limit = 0
+                if isinstance(payload, Mapping):
+                    try:
+                        limit = int(payload.get("limit", 0))
+                    except Exception:  # pragma: no cover - defensive conversion
+                        limit = 0
+                self._hide_loading_modal()
+                self._status_var.set(
+                    "Generation limit reached"
+                    if limit <= 0
+                    else f"Generation limit reached at {limit} generations."
+                )
+                self._running = False
             elif kind == "pinterest_status":
                 _, payload = message
                 dataset_id = payload.get("dataset_id", "?")

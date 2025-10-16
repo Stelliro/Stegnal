@@ -41,6 +41,17 @@ if TYPE_CHECKING:  # pragma: no cover - optional neural advisor import
 logger = logging.getLogger(__name__)
 
 
+class EvolutionLimitReached(RuntimeError):
+    """Raised when an evolution run reaches its configured generation limit."""
+
+    def __init__(self, attempted_generation: int, limit: int) -> None:
+        super().__init__(
+            f"generation limit of {limit} reached at index {attempted_generation}"
+        )
+        self.attempted_generation = int(attempted_generation)
+        self.limit = int(limit)
+
+
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
@@ -319,6 +330,7 @@ class EvolutionManager:
         run_id: str | None = None,
         next_generation_index: int | None = None,
         enable_waveform: bool = True,
+        max_generations: int | None = None,
     ) -> None:
         self.original = np.asarray(original, dtype=np.float32)
         self.encoder = encoder
@@ -344,6 +356,11 @@ class EvolutionManager:
         self.run_id = run_id
         self._run_directory = run_dir
         self.enable_waveform = bool(enable_waveform)
+        self.max_generations = (
+            int(max_generations)
+            if max_generations is not None and int(max_generations) > 0
+            else None
+        )
         if next_generation_index is None:
             self.next_generation_index = 0
         else:
@@ -895,6 +912,12 @@ class EvolutionManager:
             Optional iterable of seed values that should persist as parents for
             this generation. When omitted, the full stored lineage is used.
         """
+
+        if (
+            self.max_generations is not None
+            and self.next_generation_index >= self.max_generations
+        ):
+            raise EvolutionLimitReached(self.next_generation_index, self.max_generations)
 
         lineage_seeds = list(self._parent_lineage.keys())
         anchors = list(dict.fromkeys(int(seed) for seed in (parent_selection or lineage_seeds)))
