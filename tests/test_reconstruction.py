@@ -172,3 +172,68 @@ def test_waveform_encoding_falls_back_to_numpy(monkeypatch) -> None:
     assert waveform.shape == (16,)
     assert np.isfinite(waveform).all()
 
+
+def test_fft_magnitude_prefers_gpu(monkeypatch) -> None:
+    class TrackingCp:
+        float32 = np.float32
+        ndarray = np.ndarray
+        used = False
+
+        class fft:
+            @staticmethod
+            def rfft(array: np.ndarray, n: int) -> np.ndarray:
+                TrackingCp.used = True
+                return np.fft.rfft(np.asarray(array, dtype=np.float32), n=n)
+
+        @staticmethod
+        def asarray(array: np.ndarray, dtype: np.dtype | None = None) -> np.ndarray:
+            TrackingCp.used = True
+            return np.asarray(array, dtype=dtype)
+
+        @staticmethod
+        def abs(array: np.ndarray) -> np.ndarray:
+            TrackingCp.used = True
+            return np.abs(array)
+
+        @staticmethod
+        def asnumpy(array: np.ndarray) -> np.ndarray:
+            TrackingCp.used = True
+            return np.asarray(array, dtype=np.float32)
+
+    monkeypatch.setattr(reconstruction, "cp", TrackingCp)
+    monkeypatch.setattr(reconstruction, "_GPU_MIN_FFT_SAMPLES", 1)
+
+    result = reconstruction._fft_magnitude(
+        np.ones(8, dtype=np.float32),
+        8,
+        advanced_logging=False,
+    )
+
+    assert TrackingCp.used is True
+    assert result.shape == (5,)
+
+
+def test_fft_magnitude_falls_back_to_numpy(monkeypatch) -> None:
+    class BrokenCp:
+        float32 = np.float32
+        ndarray = np.ndarray
+
+        @staticmethod
+        def asarray(array: np.ndarray, dtype: np.dtype | None = None) -> np.ndarray:
+            raise RuntimeError("GPU backend unavailable")
+
+        @staticmethod
+        def asnumpy(array: np.ndarray) -> np.ndarray:
+            return np.asarray(array, dtype=np.float32)
+
+    monkeypatch.setattr(reconstruction, "cp", BrokenCp)
+    monkeypatch.setattr(reconstruction, "_GPU_MIN_FFT_SAMPLES", 1)
+
+    result = reconstruction._fft_magnitude(
+        np.ones(8, dtype=np.float32),
+        8,
+        advanced_logging=False,
+    )
+
+    assert result.shape == (5,)
+

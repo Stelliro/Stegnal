@@ -31,6 +31,7 @@ _MARKER_BASE_FREQUENCY = 1_600.0
 _MARKER_STEP_FREQUENCY = 220.0
 _MARKER_RATIO_BAND = 180.0
 _SEGMENT_RATIO_MIN = 0.05
+_GPU_MIN_FFT_SAMPLES = 65_536
 
 
 def suggest_sample_rate(image: np.ndarray) -> int:
@@ -322,6 +323,44 @@ def _to_numpy(array: Any) -> np.ndarray:
     return np.asarray(array, dtype=np.float32)
 
 
+def _fft_magnitude(samples: np.ndarray, n: int, *, advanced_logging: bool) -> np.ndarray:
+    """Return ``|rfft(samples)|`` preferring a GPU backend when available."""
+
+    array = np.asarray(samples, dtype=np.float32)
+    if array.size == 0 or n <= 0:
+        return np.zeros(0, dtype=np.float32)
+
+    prefer_gpu = cp is not None and array.size >= _GPU_MIN_FFT_SAMPLES
+    backends: tuple[Any, ...]
+    if prefer_gpu:  # pragma: no branch - runtime guard
+        backends = (cp, np)
+    else:
+        backends = (np,)
+
+    last_error: Exception | None = None
+    for backend in backends:
+        try:
+            backend_array = backend.asarray(array, dtype=backend.float32)
+            spectrum = backend.fft.rfft(backend_array, n=n)
+            magnitude = backend.abs(spectrum)
+            if backend is cp and advanced_logging:
+                logger.debug(
+                    "Computed FFT magnitude on GPU backend: samples=%d n=%d",
+                    array.size,
+                    n,
+                )
+            return _to_numpy(magnitude).astype(np.float32, copy=False)
+        except Exception as exc:  # pragma: no cover - diagnostic fallback
+            last_error = exc
+            if backend is cp:
+                logger.debug("Falling back to NumPy FFT magnitude: %s", exc)
+                continue
+            raise
+
+    assert last_error is not None  # pragma: no cover - defensive
+    raise last_error
+
+
 def _encode_stripe_waveform(
     stripe: np.ndarray,
     *,
@@ -528,7 +567,7 @@ def _estimate_marker_ratio(
     if samples.size <= 1:
         return float("nan")
 
-    spectrum = np.abs(np.fft.rfft(samples))
+    spectrum = _fft_magnitude(samples, samples.size, advanced_logging=False)
     if spectrum.size <= 1:
         return float("nan")
 
@@ -818,7 +857,7 @@ def reconstruct_from_waveform(
             usable = np.pad(usable, (0, sample_rate - usable.size))
         else:
             usable = usable[:sample_rate]
-        spectrum = np.abs(np.fft.rfft(usable, n=sample_rate))
+        spectrum = _fft_magnitude(usable, sample_rate, advanced_logging=advanced_logging)
         if spectrum.size == 0:
             raise ValueError("Unable to derive spectrum from waveform")
         if advanced_logging:
@@ -848,7 +887,11 @@ def reconstruct_from_waveform(
                 payload = np.pad(payload, (0, payload_samples - payload.size))
             else:
                 payload = payload[:payload_samples]
-            spectrum = np.abs(np.fft.rfft(payload, n=payload_samples))
+            spectrum = _fft_magnitude(
+                payload,
+                payload_samples,
+                advanced_logging=advanced_logging,
+            )
             stripes.append(spectrum.astype(np.float32))
             markers.append(np.asarray(marker, dtype=np.float32))
 
