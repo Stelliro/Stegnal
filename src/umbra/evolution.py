@@ -24,10 +24,12 @@ from .metrics import (
     AI_PSNR_BASELINE,
     ReconstructionMetrics,
     audio_fidelity_score,
+    composite_score,
     compute_metrics,
     compute_ms_ssim,
     dct_band_correlation,
     readability_score,
+    team_cohesion_score,
 )
 from .reconstruction import suggest_sample_rate, suggest_transmission_profile
 from .runs import append_history, get_run_paths, load_history, new_run
@@ -206,6 +208,7 @@ class CandidateResult:
     reconstruction: np.ndarray
     metrics: ReconstructionMetrics
     overlap_score: float
+    ai_score: float | None = None
     waveform_reconstruction: np.ndarray | None = None
     waveform_reference_metrics: ReconstructionMetrics | None = None
     waveform_reference_overlap: float | None = None
@@ -216,6 +219,8 @@ class CandidateResult:
     waveform_marker_duration: float | None = None
     waveform_sound_score: float | None = None
     waveform_readability_score: float | None = None
+    waveform_alignment_score: float | None = None
+    team_score: float | None = None
     reward: float = 0.0
     predicted_reward: float | None = None
     feature_vector: tuple[float, ...] = field(default_factory=tuple)
@@ -591,6 +596,18 @@ class EvolutionManager:
         recon_image = np.asarray(recon_image, dtype=np.float32)
         packet_metrics = compute_metrics(reference_clipped, recon_image)
         _, packet_overlap = multiplicative_overlap(reference_clipped, recon_image)
+        packet_overlap_value = float(packet_overlap)
+        ai_score_value = float(
+            np.clip(
+                composite_score(
+                    packet_overlap_value,
+                    packet_metrics.psnr,
+                    packet_metrics.ssim,
+                ),
+                0.0,
+                100.0,
+            )
+        )
 
         waveform_image: np.ndarray | None = None
         waveform_reference_metrics: ReconstructionMetrics | None = None
@@ -602,6 +619,8 @@ class EvolutionManager:
         waveform_marker_duration: float | None = None
         waveform_sound_score: float | None = None
         waveform_readability_score: float | None = None
+        waveform_alignment_score: float | None = None
+        team_score_value: float | None = None
 
         if self.enable_waveform and waveform_config is not None:
             waveform_sample_rate = int(waveform_config.get("sample_rate", 0)) or None
@@ -653,6 +672,15 @@ class EvolutionManager:
                 _, waveform_packet_overlap = multiplicative_overlap(
                     recon_image, waveform_image
                 )
+                if (
+                    waveform_packet_metrics is not None
+                    and waveform_packet_overlap is not None
+                ):
+                    waveform_alignment_score = audio_fidelity_score(
+                        float(waveform_packet_overlap),
+                        waveform_packet_metrics.psnr,
+                        waveform_packet_metrics.ssim,
+                    )
                 if waveform_packet_metrics is not None and (
                     waveform_packet_metrics.psnr <= AI_PSNR_BASELINE
                     or waveform_packet_metrics.ssim <= 0.05
@@ -682,12 +710,37 @@ class EvolutionManager:
                         waveform_reference_metrics.psnr,
                         waveform_reference_metrics.ssim,
                     )
+                team_score_value = team_cohesion_score(
+                    packet_overlap_value,
+                    packet_metrics.psnr,
+                    packet_metrics.ssim,
+                    sound_reference_overlap=None
+                    if waveform_reference_overlap is None
+                    else float(waveform_reference_overlap),
+                    sound_reference_psnr=None
+                    if waveform_reference_metrics is None
+                    else waveform_reference_metrics.psnr,
+                    sound_reference_ssim=None
+                    if waveform_reference_metrics is None
+                    else waveform_reference_metrics.ssim,
+                    sound_alignment_overlap=None
+                    if waveform_packet_overlap is None
+                    else float(waveform_packet_overlap),
+                    sound_alignment_psnr=None
+                    if waveform_packet_metrics is None
+                    else waveform_packet_metrics.psnr,
+                    sound_alignment_ssim=None
+                    if waveform_packet_metrics is None
+                    else waveform_packet_metrics.ssim,
+                    readability=waveform_readability_score,
+                )
 
         return CandidateResult(
             seed=int(seed),
             reconstruction=recon_image.astype(np.float32, copy=True),
             metrics=packet_metrics,
-            overlap_score=float(packet_overlap),
+            overlap_score=packet_overlap_value,
+            ai_score=ai_score_value,
             waveform_reconstruction=None
             if waveform_image is None
             else waveform_image.astype(np.float32, copy=True),
@@ -708,6 +761,10 @@ class EvolutionManager:
             waveform_readability_score=None
             if waveform_readability_score is None
             else float(waveform_readability_score),
+            waveform_alignment_score=None
+            if waveform_alignment_score is None
+            else float(waveform_alignment_score),
+            team_score=None if team_score_value is None else float(team_score_value),
         )
 
     def _candidate_features(
@@ -956,14 +1013,38 @@ class EvolutionManager:
             raw_reward = base_reward if predicted is None else float(0.65 * base_reward + 0.35 * predicted)
             raw_reward = float(np.clip(raw_reward, 0.0, 6.0))
             reward = raw_reward
-            if candidate.waveform_sound_score is not None:
-                sound_fraction = float(
-                    np.clip(candidate.waveform_sound_score / 100.0, 0.0, 1.0)
+            team_fraction: float | None = None
+            if getattr(candidate, "team_score", None) is not None:
+                team_fraction = float(
+                    np.clip(float(candidate.team_score) / 100.0, 0.0, 1.0)
                 )
-                readability_fraction = 1.0
+            if team_fraction is not None:
+                reward = float(np.clip(raw_reward * team_fraction, 0.0, 6.0))
+                components["team_score"] = float(candidate.team_score)
+                components["team_fraction"] = team_fraction
+                components["waveform_fraction"] = team_fraction
+                if getattr(candidate, "waveform_sound_score", None) is not None:
+                    components["waveform_score"] = float(candidate.waveform_sound_score)
+                if getattr(candidate, "waveform_alignment_score", None) is not None:
+                    components["waveform_alignment"] = float(
+                        candidate.waveform_alignment_score
+                    )
                 readability_value = getattr(
                     candidate, "waveform_readability_score", None
                 )
+                if readability_value is not None:
+                    readability_fraction = float(
+                        np.clip(readability_value / 100.0, 0.0, 1.0)
+                    )
+                    components["waveform_readability"] = readability_fraction
+            elif candidate.waveform_sound_score is not None:
+                sound_fraction = float(
+                    np.clip(candidate.waveform_sound_score / 100.0, 0.0, 1.0)
+                )
+                readability_value = getattr(
+                    candidate, "waveform_readability_score", None
+                )
+                readability_fraction = 1.0
                 if readability_value is not None:
                     readability_fraction = float(
                         np.clip(readability_value / 100.0, 0.0, 1.0)
@@ -1221,6 +1302,11 @@ class EvolutionManager:
                         ),
                         metrics=candidate.metrics,
                         overlap_score=candidate.overlap_score,
+                        ai_score=(
+                            None
+                            if getattr(candidate, "ai_score", None) is None
+                            else float(candidate.ai_score)
+                        ),
                         waveform_reconstruction=None
                         if getattr(candidate, "waveform_reconstruction", None) is None
                         else np.asarray(
@@ -1267,6 +1353,16 @@ class EvolutionManager:
                             None
                             if getattr(candidate, "waveform_readability_score", None) is None
                             else float(candidate.waveform_readability_score)
+                        ),
+                        waveform_alignment_score=(
+                            None
+                            if getattr(candidate, "waveform_alignment_score", None) is None
+                            else float(candidate.waveform_alignment_score)
+                        ),
+                        team_score=(
+                            None
+                            if getattr(candidate, "team_score", None) is None
+                            else float(candidate.team_score)
                         ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(
@@ -1374,6 +1470,11 @@ class EvolutionManager:
                         ),
                         metrics=candidate.metrics,
                         overlap_score=candidate.overlap_score,
+                        ai_score=(
+                            None
+                            if getattr(candidate, "ai_score", None) is None
+                            else float(candidate.ai_score)
+                        ),
                         waveform_reconstruction=(
                             None
                             if getattr(candidate, "waveform_reconstruction", None) is None
@@ -1422,6 +1523,16 @@ class EvolutionManager:
                             None
                             if getattr(candidate, "waveform_readability_score", None) is None
                             else float(candidate.waveform_readability_score)
+                        ),
+                        waveform_alignment_score=(
+                            None
+                            if getattr(candidate, "waveform_alignment_score", None) is None
+                            else float(candidate.waveform_alignment_score)
+                        ),
+                        team_score=(
+                            None
+                            if getattr(candidate, "team_score", None) is None
+                            else float(candidate.team_score)
                         ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(

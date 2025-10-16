@@ -111,6 +111,108 @@ def audio_fidelity_score(overlap_pct: float, psnr: float, ssim: float) -> float:
     return float(np.clip(combined, 0.0, 1.0)) * 100.0
 
 
+def team_cohesion_score(
+    ai_overlap_pct: float,
+    ai_psnr: float,
+    ai_ssim: float,
+    *,
+    sound_reference_overlap: float | None,
+    sound_reference_psnr: float | None,
+    sound_reference_ssim: float | None,
+    sound_alignment_overlap: float | None,
+    sound_alignment_psnr: float | None,
+    sound_alignment_ssim: float | None,
+    readability: float | None = None,
+) -> float:
+    """Combine AI and audio metrics into a single cooperative score."""
+
+    ai_component = float(
+        np.clip(composite_score(ai_overlap_pct, ai_psnr, ai_ssim), 0.0, 100.0)
+    )
+
+    sound_component: float | None = None
+    if (
+        sound_reference_overlap is not None
+        and sound_reference_psnr is not None
+        and sound_reference_ssim is not None
+    ):
+        sound_component = float(
+            np.clip(
+                audio_fidelity_score(
+                    float(sound_reference_overlap),
+                    float(sound_reference_psnr),
+                    float(sound_reference_ssim),
+                ),
+                0.0,
+                100.0,
+            )
+        )
+
+    alignment_component: float | None = None
+    if (
+        sound_alignment_overlap is not None
+        and sound_alignment_psnr is not None
+        and sound_alignment_ssim is not None
+    ):
+        alignment_component = float(
+            np.clip(
+                audio_fidelity_score(
+                    float(sound_alignment_overlap),
+                    float(sound_alignment_psnr),
+                    float(sound_alignment_ssim),
+                ),
+                0.0,
+                100.0,
+            )
+        )
+
+    readability_component: float | None = None
+    if readability is not None:
+        try:
+            readability_component = float(np.clip(readability, 0.0, 100.0))
+        except (TypeError, ValueError):
+            readability_component = None
+    if (
+        readability_component is None
+        and sound_reference_overlap is not None
+        and sound_reference_psnr is not None
+        and sound_reference_ssim is not None
+    ):
+        readability_component = float(
+            np.clip(
+                readability_score(
+                    float(sound_reference_overlap),
+                    float(sound_reference_psnr),
+                    float(sound_reference_ssim),
+                ),
+                0.0,
+                100.0,
+            )
+        )
+
+    components = [ai_component]
+    if sound_component is not None:
+        components.append(sound_component)
+    if alignment_component is not None:
+        components.append(alignment_component)
+    elif sound_component is not None:
+        components.append(sound_component)
+
+    if not components:
+        return 0.0
+
+    base_fraction = float(min(components) / 100.0)
+    base_fraction = float(np.clip(base_fraction, 0.0, 1.0))
+
+    readability_fraction = 1.0
+    if readability_component is not None:
+        readability_fraction = float(
+            np.clip((readability_component / 100.0) ** 2.0, 0.0, 1.0)
+        )
+
+    return float(np.clip(base_fraction * readability_fraction, 0.0, 1.0)) * 100.0
+
+
 def readability_score(overlap_pct: float, psnr: float, ssim: float) -> float:
     """Derive a readability score emphasising consistency between reconstructions."""
 

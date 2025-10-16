@@ -8,6 +8,7 @@ from umbra.metrics import (
     audio_fidelity_score,
     composite_score,
     readability_score,
+    team_cohesion_score,
 )
 from umbra.ui import UmbraAppState, _generate_unique_model_path, _normalize_pinterest_url
 
@@ -41,6 +42,19 @@ def test_app_state_records_generations() -> None:
     sound_metrics = ReconstructionMetrics(psnr=28.0, ssim=0.66)
     sound_score = audio_fidelity_score(70.0, metrics.psnr, metrics.ssim)
     sound_readability = readability_score(70.0, metrics.psnr, metrics.ssim)
+    alignment_score = audio_fidelity_score(64.0, sound_metrics.psnr, sound_metrics.ssim)
+    team_value = team_cohesion_score(
+        76.0,
+        metrics.psnr,
+        metrics.ssim,
+        sound_reference_overlap=70.0,
+        sound_reference_psnr=metrics.psnr,
+        sound_reference_ssim=metrics.ssim,
+        sound_alignment_overlap=64.0,
+        sound_alignment_psnr=sound_metrics.psnr,
+        sound_alignment_ssim=sound_metrics.ssim,
+        readability=sound_readability,
+    )
     entry = state.record_generation(
         5,
         metrics,
@@ -51,6 +65,9 @@ def test_app_state_records_generations() -> None:
         sound_reference_overlap=70.0,
         sound_score=sound_score,
         sound_readability_score=sound_readability,
+        sound_alignment_score=alignment_score,
+        team_score=team_value,
+        ai_score_value=composite_score(76.0, metrics.psnr, metrics.ssim),
     )
     assert entry["generation"] == 5
     assert entry["overlap"] == 76.0
@@ -62,9 +79,9 @@ def test_app_state_records_generations() -> None:
     assert entry["sound_overlap"] == pytest.approx(70.0)
     assert entry["sound_score"] == pytest.approx(sound_score)
     assert entry["sound_readability_score"] == pytest.approx(sound_readability)
-    ai_score = entry["ai_score"]
-    expected_overall = (ai_score * sound_score / 100.0) * (sound_readability / 100.0)
-    assert entry["composite_score"] == pytest.approx(expected_overall)
+    assert entry["sound_alignment_score"] == pytest.approx(alignment_score)
+    assert entry["team_score"] == pytest.approx(team_value)
+    assert entry["composite_score"] == pytest.approx(team_value)
     assert state.sound_scores[-1] == entry["sound_score"]
     assert state.readability_scores[-1] == entry["sound_readability_score"]
 

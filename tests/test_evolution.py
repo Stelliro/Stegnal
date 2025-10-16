@@ -8,7 +8,13 @@ from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, _chaotic_seed_mix
-from umbra.metrics import audio_fidelity_score, compute_metrics, readability_score
+from umbra.metrics import (
+    audio_fidelity_score,
+    composite_score,
+    compute_metrics,
+    readability_score,
+    team_cohesion_score,
+)
 from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
 from umbra.visualization import multiplicative_overlap
 
@@ -213,4 +219,33 @@ def test_generation_metrics_track_sound_alignment() -> None:
     )
     assert candidate.waveform_readability_score == pytest.approx(
         expected_readability, rel=1e-5, abs=1e-5
+    )
+    expected_alignment_score = audio_fidelity_score(
+        float(expected_packet_overlap),
+        expected_packet_metrics.psnr,
+        expected_packet_metrics.ssim,
+    )
+    assert candidate.waveform_alignment_score == pytest.approx(
+        expected_alignment_score, rel=1e-5, abs=1e-5
+    )
+    expected_team_score = team_cohesion_score(
+        float(packet_overlap),
+        packet_metrics.psnr,
+        packet_metrics.ssim,
+        sound_reference_overlap=float(expected_reference_overlap),
+        sound_reference_psnr=expected_reference_metrics.psnr,
+        sound_reference_ssim=expected_reference_metrics.ssim,
+        sound_alignment_overlap=float(expected_packet_overlap),
+        sound_alignment_psnr=expected_packet_metrics.psnr,
+        sound_alignment_ssim=expected_packet_metrics.ssim,
+        readability=expected_readability,
+    )
+    assert candidate.team_score == pytest.approx(
+        expected_team_score, rel=1e-5, abs=1e-5
+    )
+    expected_ai_score = composite_score(
+        float(packet_overlap), packet_metrics.psnr, packet_metrics.ssim
+    )
+    assert candidate.ai_score == pytest.approx(
+        expected_ai_score, rel=1e-5, abs=1e-5
     )

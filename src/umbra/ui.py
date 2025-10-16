@@ -882,6 +882,9 @@ class UmbraAppState:
         sound_reference_overlap: float | None = None,
         sound_score: float | None = None,
         sound_readability_score: float | None = None,
+        sound_alignment_score: float | None = None,
+        team_score: float | None = None,
+        ai_score_value: float | None = None,
     ) -> dict[str, float]:
         """Store metrics for a completed generation and return the entry."""
 
@@ -890,6 +893,11 @@ class UmbraAppState:
         ssim_value = _nan_guard(metrics.ssim, 0.0)
 
         ai_score = composite_score(overlap_value, psnr_value, ssim_value)
+        if ai_score_value is not None:
+            try:
+                ai_score = float(np.clip(ai_score_value, 0.0, 100.0))
+            except (TypeError, ValueError):
+                ai_score = composite_score(overlap_value, psnr_value, ssim_value)
         composite_value = 0.0
         entry: dict[str, float] = {
             "generation": float(generation_index),
@@ -971,25 +979,51 @@ class UmbraAppState:
             entry["sound_score"] = sound_score_value
             if math.isfinite(sound_score_value):
                 self.sound_scores.append(sound_score_value)
+        alignment_value: float | None = None
+        if sound_alignment_score is not None:
+            try:
+                alignment_value = float(np.clip(sound_alignment_score, 0.0, 100.0))
+            except (TypeError, ValueError):
+                alignment_value = None
+        if alignment_value is not None:
+            entry["sound_alignment_score"] = alignment_value
         if readability_value is not None:
             readability_value = float(np.clip(readability_value, 0.0, 100.0))
             entry["sound_readability_score"] = readability_value
             if math.isfinite(readability_value):
                 self.readability_scores.append(readability_value)
 
-        if sound_score_value is not None:
+        team_value: float | None = None
+        if team_score is not None:
+            try:
+                team_value = float(np.clip(team_score, 0.0, 100.0))
+            except (TypeError, ValueError):
+                team_value = None
+        if team_value is not None:
+            entry["team_score"] = team_value
+            composite_value = team_value
+        elif sound_score_value is not None:
             readability_fraction = 1.0
             if readability_value is not None and math.isfinite(readability_value):
                 readability_fraction = float(
                     np.clip(readability_value / 100.0, 0.0, 1.0)
                 )
+            alignment_fraction = 1.0
+            if alignment_value is not None and math.isfinite(alignment_value):
+                alignment_fraction = float(
+                    np.clip(alignment_value / 100.0, 0.0, 1.0)
+                )
             composite_value = float(
                 np.clip(
-                    (ai_score * sound_score_value / 100.0) * readability_fraction,
+                    (ai_score * sound_score_value / 100.0)
+                    * readability_fraction
+                    * alignment_fraction,
                     0.0,
                     100.0,
                 )
             )
+        else:
+            composite_value = float(np.clip(ai_score, 0.0, 100.0))
 
         entry["composite_score"] = composite_value
         self.history.append(entry)
@@ -2151,6 +2185,12 @@ class UmbraDesktopApp:
                     sound_payload["sound_readability_score"] = float(
                         best.waveform_readability_score
                     )
+                if getattr(best, "waveform_alignment_score", None) is not None:
+                    sound_payload["sound_alignment_score"] = float(
+                        best.waveform_alignment_score
+                    )
+                if getattr(best, "team_score", None) is not None:
+                    sound_payload["team_score"] = float(best.team_score)
             else:
                 logger.debug(
                     "Waveform reconstruction unavailable for seed %d", best.seed
@@ -2167,6 +2207,9 @@ class UmbraDesktopApp:
                 sound_reference_overlap=sound_payload.get("sound_reference_overlap"),
                 sound_score=sound_payload.get("sound_score"),
                 sound_readability_score=sound_payload.get("sound_readability_score"),
+                sound_alignment_score=sound_payload.get("sound_alignment_score"),
+                team_score=sound_payload.get("team_score"),
+                ai_score_value=getattr(best, "ai_score", None),
             )
             self._latest_sound_payload = dict(sound_payload) if sound_payload else None
             self._latest_generation_entry = dict(entry)
@@ -2663,6 +2706,14 @@ class UmbraDesktopApp:
                 status_parts.append(f"Sound score {float(sound_score):.2f}")
             except (TypeError, ValueError):
                 status_parts.append("Sound score unavailable")
+            alignment_value = entry.get("sound_alignment_score")
+            if alignment_value is not None:
+                try:
+                    status_parts.append(
+                        f"Sound alignment {float(alignment_value):.2f}"
+                    )
+                except (TypeError, ValueError):
+                    status_parts.append("Sound alignment unavailable")
             readability_value = entry.get("sound_readability_score")
             if readability_value is not None:
                 try:
@@ -2676,6 +2727,12 @@ class UmbraDesktopApp:
         composite_score = entry.get("composite_score")
         if composite_score is not None:
             status_parts.append(f"Overall score {float(composite_score):.2f}")
+        team_value = entry.get("team_score")
+        if team_value is not None:
+            try:
+                status_parts.append(f"Team score {float(team_value):.2f}")
+            except (TypeError, ValueError):
+                status_parts.append("Team score unavailable")
         status_parts.append(f"AI overlap {_as_float('overlap'):.2f}%")
         status_parts.append(f"AI PSNR {_as_float('psnr', AI_PSNR_BASELINE):.2f} dB")
         status_parts.append(f"AI SSIM {_as_float('ssim'):.3f}")
@@ -2730,6 +2787,12 @@ class UmbraDesktopApp:
                 ai_text += f" · Score {float(ai_score):.2f}"
             except (TypeError, ValueError):
                 pass
+        team_value = entry.get("team_score")
+        if team_value is not None:
+            try:
+                ai_text += f" · Team {float(team_value):.2f}"
+            except (TypeError, ValueError):
+                pass
         self._recon_info_var.set(ai_text)
 
         sound_score = entry.get("sound_score")
@@ -2748,6 +2811,12 @@ class UmbraDesktopApp:
                 sound_text += f" · Score {float(sound_score):.2f}"
             except (TypeError, ValueError):
                 pass
+            alignment_value = entry.get("sound_alignment_score")
+            if alignment_value is not None:
+                try:
+                    sound_text += f" · Alignment {float(alignment_value):.2f}"
+                except (TypeError, ValueError):
+                    pass
             readability = entry.get("sound_readability_score")
             if readability is not None:
                 try:
