@@ -1,0 +1,64 @@
+"""Test fixtures for Project Umbra."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+import umbra.reconstruction as reconstruction
+
+
+class _CuPyStub:
+    """Minimal CuPy stand-in that delegates operations to NumPy."""
+
+    float32 = np.float32
+    ndarray = np.ndarray
+
+    class fft:
+        @staticmethod
+        def rfft(array: np.ndarray, n: int) -> np.ndarray:
+            return np.fft.rfft(np.asarray(array, dtype=np.float32), n=n)
+
+        @staticmethod
+        def irfft(array: np.ndarray, n: int) -> np.ndarray:
+            return np.fft.irfft(np.asarray(array, dtype=np.float32), n=n)
+
+    @staticmethod
+    def asarray(array: np.ndarray, dtype: np.dtype | None = None) -> np.ndarray:
+        return np.asarray(array, dtype=dtype)
+
+    @staticmethod
+    def asnumpy(array: np.ndarray) -> np.ndarray:
+        return np.asarray(array, dtype=np.float32)
+
+    @staticmethod
+    def abs(array: np.ndarray) -> np.ndarray:
+        return np.abs(array)
+
+    @staticmethod
+    def max(array: np.ndarray) -> float:
+        return float(np.max(array))
+
+    @staticmethod
+    def pad(array: np.ndarray, pad_width, mode: str = "constant") -> np.ndarray:  # type: ignore[override]
+        return np.pad(array, pad_width, mode=mode)
+
+    @staticmethod
+    def linspace(start, stop, num, dtype=np.float32):  # type: ignore[override]
+        return np.linspace(start, stop, num, dtype=dtype)
+
+    @staticmethod
+    def arange(start, stop=None, step=1, dtype=np.float32):  # type: ignore[override]
+        return np.arange(start, stop, step, dtype=dtype)
+
+    @staticmethod
+    def interp(x, xp, fp):  # type: ignore[override]
+        return np.interp(x, xp, fp)
+
+
+@pytest.fixture(autouse=True)
+def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure GPU-requiring code paths see a CuPy-compatible backend during tests."""
+
+    if reconstruction.cp is None:
+        monkeypatch.setattr(reconstruction, "cp", _CuPyStub, raising=False)

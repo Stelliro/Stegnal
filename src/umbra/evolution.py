@@ -32,7 +32,11 @@ from .metrics import (
     readability_score,
     team_cohesion_score,
 )
-from .reconstruction import suggest_sample_rate, suggest_transmission_profile
+from .reconstruction import (
+    GPUAccelerationRequiredError,
+    suggest_sample_rate,
+    suggest_transmission_profile,
+)
 from .runs import append_history, get_run_paths, load_history, new_run
 from .visualization import multiplicative_overlap
 
@@ -662,6 +666,7 @@ class EvolutionManager:
                         sample_rate=waveform_sample_rate,
                         segments=waveform_segments,
                         marker_duration=waveform_marker_duration,
+                        allow_cpu_fallback=False,
                     )
                     waveform_image, metadata = decode_wav_bytes_to_image(
                         wav_bytes,
@@ -670,6 +675,7 @@ class EvolutionManager:
                         segments=waveform_segments,
                         marker_duration=waveform_marker_duration,
                         return_metadata=True,
+                        allow_cpu_fallback=False,
                     )
                     waveform_sample_rate = metadata.sample_rate or waveform_sample_rate
                     waveform_segments = metadata.segments or waveform_segments
@@ -677,6 +683,8 @@ class EvolutionManager:
                     waveform_image = _ensure_three_channel(waveform_image).astype(
                         np.float32
                     )
+                except GPUAccelerationRequiredError:
+                    raise
                 except Exception as exc:  # pragma: no cover - diagnostic logging path
                     logger.debug(
                         "Waveform reconstruction failed for seed %d: %s",

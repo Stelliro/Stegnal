@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import umbra.reconstruction as reconstruction
 from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
@@ -16,7 +17,11 @@ from umbra.metrics import (
     readability_score,
     team_cohesion_score,
 )
-from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
+from umbra.reconstruction import (
+    GPUAccelerationRequiredError,
+    suggest_sample_rate,
+    suggest_transmission_profile,
+)
 from umbra.visualization import multiplicative_overlap
 
 
@@ -75,7 +80,7 @@ def test_chaotic_seed_mix_varies_with_noise() -> None:
 
 
 def test_spawn_child_seed_uses_chaotic_mix(monkeypatch) -> None:
-    image = np.zeros((4, 4), dtype=np.float32)
+    image = np.zeros((8, 8), dtype=np.float32)
     manager = EvolutionManager(
         original=image,
         encoder=NoiseStreamEncoder(sigma=0.1),
@@ -262,3 +267,20 @@ def test_generation_metrics_track_sound_alignment() -> None:
     assert candidate.ai_score == pytest.approx(
         expected_ai_score, rel=1e-5, abs=1e-5
     )
+
+
+def test_evolution_requires_gpu_when_waveform_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(reconstruction, "cp", None, raising=False)
+
+    image = np.zeros((8, 8), dtype=np.float32)
+    manager = EvolutionManager(
+        original=image,
+        encoder=NoiseStreamEncoder(sigma=0.1),
+        decoder=NoiseStreamDecoder(denoise_sigma=None),
+        population_size=1,
+        base_seed=1,
+        autosave_interval=1,
+    )
+
+    with pytest.raises(GPUAccelerationRequiredError):
+        manager.run_generation()

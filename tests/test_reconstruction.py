@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from umbra import reconstruction
 from umbra.reconstruction import (
@@ -165,7 +166,11 @@ def test_waveform_encoding_falls_back_to_numpy(monkeypatch) -> None:
 
     monkeypatch.setattr(reconstruction, "cp", BrokenCp)
     try:
-        waveform = reconstruction._encode_stripe_waveform(stripe, sample_count=16)
+        waveform = reconstruction._encode_stripe_waveform(
+            stripe,
+            sample_count=16,
+            allow_cpu_fallback=True,
+        )
     finally:
         monkeypatch.setattr(reconstruction, "cp", original_cp)
 
@@ -207,6 +212,7 @@ def test_fft_magnitude_prefers_gpu(monkeypatch) -> None:
         np.ones(8, dtype=np.float32),
         8,
         advanced_logging=False,
+        allow_cpu_fallback=True,
     )
 
     assert TrackingCp.used is True
@@ -233,7 +239,32 @@ def test_fft_magnitude_falls_back_to_numpy(monkeypatch) -> None:
         np.ones(8, dtype=np.float32),
         8,
         advanced_logging=False,
+        allow_cpu_fallback=True,
     )
 
     assert result.shape == (5,)
+
+
+def test_fft_magnitude_requires_gpu_when_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(reconstruction, "cp", None)
+    monkeypatch.setattr(reconstruction, "_GPU_MIN_FFT_SAMPLES", 1)
+
+    with pytest.raises(reconstruction.GPUAccelerationRequiredError):
+        reconstruction._fft_magnitude(
+            np.ones(4, dtype=np.float32),
+            4,
+            advanced_logging=False,
+            allow_cpu_fallback=False,
+        )
+
+
+def test_waveform_encoding_requires_gpu_when_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(reconstruction, "cp", None)
+
+    with pytest.raises(reconstruction.GPUAccelerationRequiredError):
+        reconstruction._encode_stripe_waveform(
+            np.ones((2, 2, 3), dtype=np.float32),
+            sample_count=4,
+            allow_cpu_fallback=False,
+        )
 

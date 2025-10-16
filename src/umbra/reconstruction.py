@@ -34,6 +34,19 @@ _SEGMENT_RATIO_MIN = 0.05
 _GPU_MIN_FFT_SAMPLES = 65_536
 
 
+class GPUAccelerationRequiredError(RuntimeError):
+    """Raised when GPU execution is required but no accelerator is available."""
+
+
+def _ensure_gpu_available(operation: str) -> None:
+    """Raise :class:`GPUAccelerationRequiredError` when CuPy cannot be used."""
+
+    if cp is None:
+        raise GPUAccelerationRequiredError(
+            f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
+        )
+
+
 def suggest_sample_rate(image: np.ndarray) -> int:
     """Return a stable audio sample rate for ``image`` based on its size."""
 
@@ -323,19 +336,30 @@ def _to_numpy(array: Any) -> np.ndarray:
     return np.asarray(array, dtype=np.float32)
 
 
-def _fft_magnitude(samples: np.ndarray, n: int, *, advanced_logging: bool) -> np.ndarray:
+def _fft_magnitude(
+    samples: np.ndarray,
+    n: int,
+    *,
+    advanced_logging: bool,
+    allow_cpu_fallback: bool,
+) -> np.ndarray:
     """Return ``|rfft(samples)|`` preferring a GPU backend when available."""
 
     array = np.asarray(samples, dtype=np.float32)
     if array.size == 0 or n <= 0:
         return np.zeros(0, dtype=np.float32)
 
-    prefer_gpu = cp is not None and array.size >= _GPU_MIN_FFT_SAMPLES
     backends: tuple[Any, ...]
-    if prefer_gpu:  # pragma: no branch - runtime guard
-        backends = (cp, np)
+    if cp is None:
+        if allow_cpu_fallback:
+            backends = (np,)
+        else:
+            _ensure_gpu_available("FFT magnitude computation")
     else:
-        backends = (np,)
+        if not allow_cpu_fallback or array.size >= _GPU_MIN_FFT_SAMPLES:
+            backends = (cp,) if not allow_cpu_fallback else (cp, np)
+        else:
+            backends = (np,)
 
     last_error: Exception | None = None
     for backend in backends:
@@ -365,6 +389,7 @@ def _encode_stripe_waveform(
     stripe: np.ndarray,
     *,
     sample_count: int,
+    allow_cpu_fallback: bool,
 ) -> np.ndarray:
     """Encode an image stripe into ``sample_count`` audio samples."""
 
@@ -372,10 +397,13 @@ def _encode_stripe_waveform(
         return np.zeros(0, dtype=np.float32)
 
     backends: tuple[Any, ...]
-    if cp is not None:  # pragma: no branch - runtime guard
-        backends = (cp, np)
+    if cp is None:
+        if allow_cpu_fallback:
+            backends = (np,)
+        else:
+            _ensure_gpu_available("waveform stripe encoding")
     else:
-        backends = (np,)
+        backends = (cp,) if not allow_cpu_fallback else (cp, np)
 
     last_error: Exception | None = None
     for xp in backends:
@@ -559,7 +587,11 @@ def _marker_tone(
 
 
 def _estimate_marker_ratio(
-    marker: np.ndarray, *, index: int, sample_rate: int
+    marker: np.ndarray,
+    *,
+    index: int,
+    sample_rate: int,
+    allow_cpu_fallback: bool,
 ) -> float:
     """Return the encoded segment ratio from ``marker`` if present."""
 
@@ -567,7 +599,12 @@ def _estimate_marker_ratio(
     if samples.size <= 1:
         return float("nan")
 
-    spectrum = _fft_magnitude(samples, samples.size, advanced_logging=False)
+    spectrum = _fft_magnitude(
+        samples,
+        samples.size,
+        advanced_logging=False,
+        allow_cpu_fallback=allow_cpu_fallback,
+    )
     if spectrum.size <= 1:
         return float("nan")
 
@@ -644,6 +681,7 @@ def _decode_stripe_heights(
     sample_rate: int,
     marker_samples: int,
     segments: int,
+    allow_cpu_fallback: bool,
 ) -> list[int]:
     """Infer stripe heights from encoded ``markers``."""
 
@@ -652,7 +690,12 @@ def _decode_stripe_heights(
         return [base for _ in range(max(segments, 1))]
 
     ratios = [
-        _estimate_marker_ratio(marker[:marker_samples], index=idx, sample_rate=sample_rate)
+        _estimate_marker_ratio(
+            marker[:marker_samples],
+            index=idx,
+            sample_rate=sample_rate,
+            allow_cpu_fallback=allow_cpu_fallback,
+        )
         for idx, marker in enumerate(markers)
     ]
 
@@ -665,6 +708,7 @@ def image_to_waveform(
     sample_rate: int = 48_000,
     segments: int = 1,
     marker_duration: float = 0.05,
+    allow_cpu_fallback: bool = True,
 ) -> np.ndarray:
     """Encode ``image`` into a mono waveform using spectral weighting.
 
@@ -700,7 +744,11 @@ def image_to_waveform(
             safe_segments = max_segments
 
     if safe_segments == 1:
-        waveform = _encode_stripe_waveform(array, sample_count=sample_rate)
+        waveform = _encode_stripe_waveform(
+            array,
+            sample_count=sample_rate,
+            allow_cpu_fallback=allow_cpu_fallback,
+        )
         if waveform.size == 0:
             raise ValueError("Image contains no pixels")
         logger.debug("Encoded image to waveform with %d samples", waveform.size)
@@ -723,7 +771,11 @@ def image_to_waveform(
             stripe = array[-1:]
         else:
             stripe = array[start_row:end_row]
-        stripe_wave = _encode_stripe_waveform(stripe, sample_count=max(payload_samples, 1))
+        stripe_wave = _encode_stripe_waveform(
+            stripe,
+            sample_count=max(payload_samples, 1),
+            allow_cpu_fallback=allow_cpu_fallback,
+        )
         marker = _marker_tone(
             sample_rate=sample_rate,
             marker_samples=marker_samples,
@@ -802,6 +854,7 @@ def reconstruct_from_waveform(
     marker_duration: float = 0.05,
     advanced_logging: bool = False,
     return_segments: bool = False,
+    allow_cpu_fallback: bool = True,
 ) -> np.ndarray | tuple[np.ndarray, int]:
     """Approximate an RGB image from a mono waveform.
 
@@ -857,7 +910,12 @@ def reconstruct_from_waveform(
             usable = np.pad(usable, (0, sample_rate - usable.size))
         else:
             usable = usable[:sample_rate]
-        spectrum = _fft_magnitude(usable, sample_rate, advanced_logging=advanced_logging)
+        spectrum = _fft_magnitude(
+            usable,
+            sample_rate,
+            advanced_logging=advanced_logging,
+            allow_cpu_fallback=allow_cpu_fallback,
+        )
         if spectrum.size == 0:
             raise ValueError("Unable to derive spectrum from waveform")
         if advanced_logging:
@@ -891,6 +949,7 @@ def reconstruct_from_waveform(
                 payload,
                 payload_samples,
                 advanced_logging=advanced_logging,
+                allow_cpu_fallback=allow_cpu_fallback,
             )
             stripes.append(spectrum.astype(np.float32))
             markers.append(np.asarray(marker, dtype=np.float32))
@@ -913,6 +972,7 @@ def reconstruct_from_waveform(
             sample_rate=sample_rate,
             marker_samples=marker_samples,
             segments=available_segments,
+            allow_cpu_fallback=allow_cpu_fallback,
         )
         if advanced_logging:
             logger.debug("Decoded adaptive stripe heights (rows): %s", stripe_heights)

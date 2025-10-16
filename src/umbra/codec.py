@@ -150,6 +150,7 @@ def encode_image_to_waveform(
     sample_rate: int,
     segments: int = 1,
     marker_duration: float = 0.05,
+    allow_cpu_fallback: bool = True,
 ) -> np.ndarray:
     """Return a mono waveform encoding of ``image`` at ``sample_rate`` samples."""
 
@@ -159,6 +160,7 @@ def encode_image_to_waveform(
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
+        allow_cpu_fallback=allow_cpu_fallback,
     )
     logger.debug(
         "Encoded image to waveform with resolution %s at %d Hz",
@@ -174,6 +176,7 @@ def encode_image_to_wav_bytes(
     sample_rate: int,
     segments: int = 1,
     marker_duration: float = 0.05,
+    allow_cpu_fallback: bool = True,
 ) -> bytes:
     """Encode ``image`` into deterministic WAV bytes."""
 
@@ -182,6 +185,7 @@ def encode_image_to_wav_bytes(
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
+        allow_cpu_fallback=allow_cpu_fallback,
     )
     return waveform_to_wav_bytes(waveform, sample_rate)
 
@@ -194,6 +198,7 @@ def _reconstruct_with_strategies(
     marker_duration: float,
     segments: int | None,
     advanced_logging: bool,
+    allow_cpu_fallback: bool,
 ) -> tuple[np.ndarray, int]:
     """Attempt waveform reconstruction using multiple segment strategies."""
 
@@ -226,6 +231,7 @@ def _reconstruct_with_strategies(
                 marker_duration=marker_duration,
                 advanced_logging=advanced_logging,
                 return_segments=True,
+                allow_cpu_fallback=allow_cpu_fallback,
             )
         except Exception as exc:  # pragma: no cover - diagnostic path
             message = f"{label} ({key}) failed: {exc}"
@@ -255,6 +261,7 @@ def decode_waveform_to_image(
     segments: int | None = 1,
     marker_duration: float = 0.05,
     advanced_logging: bool = False,
+    allow_cpu_fallback: bool = True,
 ) -> np.ndarray:
     """Decode ``waveform`` back into an RGB image."""
 
@@ -278,6 +285,7 @@ def decode_waveform_to_image(
             segments=segments,
             marker_duration=float(marker_duration),
             advanced_logging=advanced_logging,
+            allow_cpu_fallback=allow_cpu_fallback,
         )
         return image.astype(np.float32)
     except Exception as exc:  # pragma: no cover - defensive audio fallback
@@ -297,6 +305,7 @@ def decode_wav_bytes_to_image(
     marker_duration: float = 0.05,
     return_metadata: bool = False,
     advanced_logging: bool = False,
+    allow_cpu_fallback: bool = True,
 ) -> tuple[np.ndarray, int] | tuple[np.ndarray, DecodedWavMetadata]:
     """Decode WAV ``data`` into an image.
 
@@ -362,6 +371,7 @@ def decode_wav_bytes_to_image(
             segments=segments,
             marker_duration=float(marker_duration),
             advanced_logging=advanced_logging,
+            allow_cpu_fallback=allow_cpu_fallback,
         )
         logger.debug(
             "Decoded WAV bytes to image at %d Hz with resolution %s",
