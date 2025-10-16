@@ -40,6 +40,10 @@ class _CuPyStub:
         return float(np.max(array))
 
     @staticmethod
+    def zeros_like(array: np.ndarray, dtype=np.float32):  # type: ignore[override]
+        return np.zeros_like(array, dtype=dtype)
+
+    @staticmethod
     def pad(array: np.ndarray, pad_width, mode: str = "constant") -> np.ndarray:  # type: ignore[override]
         return np.pad(array, pad_width, mode=mode)
 
@@ -62,3 +66,8 @@ def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
 
     if reconstruction.cp is None:
         monkeypatch.setattr(reconstruction, "cp", _CuPyStub, raising=False)
+
+    import umbra.encoding as encoding
+
+    if getattr(encoding, "cp", None) is None:
+        monkeypatch.setattr(encoding, "cp", _CuPyStub, raising=False)

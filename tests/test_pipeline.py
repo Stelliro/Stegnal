@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
@@ -32,3 +33,17 @@ def test_encode_decode_round_trip(tmp_path):
 
     assert metrics.psnr > 18
     assert metrics.ssim > 0.55
+
+
+def test_encode_requires_gpu_when_fallback_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = np.zeros((8, 8), dtype=np.float32)
+    encoder = NoiseStreamEncoder(sigma=0.1)
+
+    import umbra.encoding as encoding
+
+    monkeypatch.setattr(encoding, "cp", None, raising=False)
+
+    from umbra.reconstruction import GPUAccelerationRequiredError
+
+    with pytest.raises(GPUAccelerationRequiredError):
+        encoder.encode(image, seed=7, allow_cpu_fallback=False)

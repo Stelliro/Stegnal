@@ -607,7 +607,11 @@ class EvolutionManager:
     ) -> CandidateResult:
         """Run the packet pipeline and optional waveform reconstruction for ``seed``."""
 
-        packet = self.encoder.encode(self.original, int(seed))
+        packet = self.encoder.encode(
+            self.original,
+            int(seed),
+            allow_cpu_fallback=False,
+        )
         reconstruction = self.decoder.decode(packet, int(seed))
         try:
             recon_image = _ensure_three_channel(reconstruction)

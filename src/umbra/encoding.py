@@ -10,6 +10,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+try:  # pragma: no cover - optional GPU dependency
+    import cupy as cp  # type: ignore
+except Exception:  # pragma: no cover - runtime optional dependency
+    cp = None
+
+from .reconstruction import GPUAccelerationRequiredError
 from .sound import MessyKeyArtifact, derive_messy_latent
 
 logger = logging.getLogger(__name__)
@@ -76,16 +82,58 @@ def register_waveform_plugin(factory: Callable[[], WaveformPlugin]) -> None:
     _PLUGIN_REGISTRY[plugin.name] = plugin
 
 
-def _simulate_uwb_channel(signal: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+def _ensure_gpu_available(operation: str) -> None:
+    """Raise :class:`GPUAccelerationRequiredError` when no accelerator is present."""
+
+    if cp is None:
+        raise GPUAccelerationRequiredError(
+            f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
+        )
+
+
+def _simulate_uwb_channel(
+    signal: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    allow_cpu_fallback: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a simple UWB channel model, preferring GPU buffers when requested."""
+
+    backend = np
+    if not allow_cpu_fallback:
+        _ensure_gpu_available("UWB channel simulation")
+        backend = cp  # type: ignore[assignment]
+
+    signal_backend = (
+        backend.asarray(signal, dtype=backend.float32)
+        if backend is not np
+        else np.asarray(signal, dtype=np.float32)
+    )
+
     taps = 6
-    delays = rng.integers(1, max(2, signal.size // 8), size=taps)
+    max_delay = max(2, int(signal_backend.size // 8) or 2)
+    delays = rng.integers(1, max_delay, size=taps)
     gains = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
-    response = np.zeros_like(signal, dtype=np.float32)
+
+    response = (
+        backend.zeros_like(signal_backend, dtype=backend.float32)
+        if backend is not np
+        else np.zeros_like(signal_backend, dtype=np.float32)
+    )
     for gain, delay in zip(gains, delays):
-        response[delay:] += gain * signal[:-delay]
-    faded = 0.6 * signal + response
-    faded = faded / np.max(np.abs(faded) + 1e-6)
-    return faded.astype(np.float32), gains.astype(np.float32)
+        response[delay:] += gain * signal_backend[:-delay]
+
+    faded = 0.6 * signal_backend + response
+    faded = faded / backend.max(backend.abs(faded) + 1e-6)
+
+    if backend is np:
+        return faded.astype(np.float32, copy=False), gains.astype(np.float32, copy=False)
+
+    # Convert the GPU buffers back to NumPy for downstream compatibility.
+    return (
+        cp.asnumpy(faded).astype(np.float32, copy=False),
+        cp.asnumpy(backend.asarray(gains, dtype=backend.float32)).astype(np.float32, copy=False),
+    )
 
 
 @dataclass
@@ -167,7 +215,13 @@ class NoiseStreamEncoder:
         arr = np.asarray(image, dtype=np.float32) / 255.0
         return arr
 
-    def encode(self, image: np.ndarray, seed: int) -> NoisePacket:
+    def encode(
+        self,
+        image: np.ndarray,
+        seed: int,
+        *,
+        allow_cpu_fallback: bool = True,
+    ) -> NoisePacket:
         """Encode the image using a permutation driven by ``seed``."""
         if image.ndim not in (2, 3):
             raise ValueError("Expected image array with shape (H, W) or (H, W, C)")
@@ -183,7 +237,11 @@ class NoiseStreamEncoder:
         plugin = _PLUGIN_REGISTRY[self.waveform]
         plugin_rng = np.random.default_rng(seed ^ 0x5F5A1)
         waveform, messy_artifact = plugin.generate(flat, plugin_rng)
-        uwb_waveform, channel = _simulate_uwb_channel(waveform, plugin_rng)
+        uwb_waveform, channel = _simulate_uwb_channel(
+            waveform,
+            plugin_rng,
+            allow_cpu_fallback=allow_cpu_fallback,
+        )
         permutation = rng.permutation(flat.size)
         permuted = flat[permutation]
         noise = rng.normal(0.0, self.sigma, size=permuted.shape)
@@ -203,9 +261,15 @@ class NoiseStreamEncoder:
             waveform_plugin=plugin.name,
         )
 
-    def encode_from_path(self, path: str | Path, seed: int) -> NoisePacket:
+    def encode_from_path(
+        self,
+        path: str | Path,
+        seed: int,
+        *,
+        allow_cpu_fallback: bool = True,
+    ) -> NoisePacket:
         image = self.load_image(path)
-        return self.encode(image, seed)
+        return self.encode(image, seed, allow_cpu_fallback=allow_cpu_fallback)
 
 
 __all__ = [
