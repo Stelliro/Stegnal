@@ -40,9 +40,15 @@ def test_app_state_records_generations() -> None:
     metrics = ReconstructionMetrics(psnr=42.0, ssim=0.92)
 
     sound_metrics = ReconstructionMetrics(psnr=28.0, ssim=0.66)
-    sound_score = audio_fidelity_score(70.0, metrics.psnr, metrics.ssim)
+    reference_partial = 0.42
+    alignment_partial = 0.35
+    sound_score = audio_fidelity_score(
+        70.0, metrics.psnr, metrics.ssim, partial_credit=reference_partial
+    )
     sound_readability = readability_score(70.0, metrics.psnr, metrics.ssim)
-    alignment_score = audio_fidelity_score(64.0, sound_metrics.psnr, sound_metrics.ssim)
+    alignment_score = audio_fidelity_score(
+        64.0, sound_metrics.psnr, sound_metrics.ssim, partial_credit=alignment_partial
+    )
     team_value = team_cohesion_score(
         76.0,
         metrics.psnr,
@@ -53,6 +59,8 @@ def test_app_state_records_generations() -> None:
         sound_alignment_overlap=64.0,
         sound_alignment_psnr=sound_metrics.psnr,
         sound_alignment_ssim=sound_metrics.ssim,
+        sound_reference_partial=reference_partial,
+        sound_alignment_partial=alignment_partial,
         readability=sound_readability,
     )
     entry = state.record_generation(
@@ -63,6 +71,8 @@ def test_app_state_records_generations() -> None:
         sound_overlap=64.0,
         sound_reference_metrics=metrics,
         sound_reference_overlap=70.0,
+        sound_reference_partial=reference_partial,
+        sound_alignment_partial=alignment_partial,
         sound_score=sound_score,
         sound_readability_score=sound_readability,
         sound_alignment_score=alignment_score,
@@ -80,6 +90,8 @@ def test_app_state_records_generations() -> None:
     assert entry["sound_score"] == pytest.approx(sound_score)
     assert entry["sound_readability_score"] == pytest.approx(sound_readability)
     assert entry["sound_alignment_score"] == pytest.approx(alignment_score)
+    assert entry["sound_reference_partial"] == pytest.approx(reference_partial * 100.0)
+    assert entry["sound_alignment_partial"] == pytest.approx(alignment_partial * 100.0)
     assert entry["team_score"] == pytest.approx(team_value)
     assert entry["composite_score"] == pytest.approx(team_value)
     assert state.sound_scores[-1] == entry["sound_score"]

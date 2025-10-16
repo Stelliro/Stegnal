@@ -28,6 +28,7 @@ from .metrics import (
     compute_metrics,
     compute_ms_ssim,
     dct_band_correlation,
+    partial_alignment_fraction,
     readability_score,
     team_cohesion_score,
 )
@@ -225,6 +226,8 @@ class CandidateResult:
     waveform_reference_overlap: float | None = None
     waveform_packet_metrics: ReconstructionMetrics | None = None
     waveform_packet_overlap: float | None = None
+    waveform_reference_partial: float | None = None
+    waveform_alignment_partial: float | None = None
     waveform_sample_rate: int | None = None
     waveform_segments: int | None = None
     waveform_marker_duration: float | None = None
@@ -631,6 +634,8 @@ class EvolutionManager:
         waveform_reference_overlap: float | None = None
         waveform_packet_metrics: ReconstructionMetrics | None = None
         waveform_packet_overlap: float | None = None
+        waveform_reference_partial: float | None = None
+        waveform_alignment_partial: float | None = None
         waveform_sample_rate: int | None = None
         waveform_segments: int | None = None
         waveform_marker_duration: float | None = None
@@ -689,6 +694,18 @@ class EvolutionManager:
                 _, waveform_packet_overlap = multiplicative_overlap(
                     recon_image, waveform_image
                 )
+                try:
+                    waveform_reference_partial = partial_alignment_fraction(
+                        reference_clipped, waveform_image
+                    )
+                except ValueError:
+                    waveform_reference_partial = None
+                try:
+                    waveform_alignment_partial = partial_alignment_fraction(
+                        recon_image, waveform_image
+                    )
+                except ValueError:
+                    waveform_alignment_partial = None
                 if (
                     waveform_packet_metrics is not None
                     and waveform_packet_overlap is not None
@@ -697,6 +714,7 @@ class EvolutionManager:
                         float(waveform_packet_overlap),
                         waveform_packet_metrics.psnr,
                         waveform_packet_metrics.ssim,
+                        partial_credit=waveform_alignment_partial,
                     )
                 if waveform_packet_metrics is not None and (
                     waveform_packet_metrics.psnr <= AI_PSNR_BASELINE
@@ -721,6 +739,7 @@ class EvolutionManager:
                         float(waveform_reference_overlap),
                         waveform_reference_metrics.psnr,
                         waveform_reference_metrics.ssim,
+                        partial_credit=waveform_reference_partial,
                     )
                     waveform_readability_score = readability_score(
                         float(waveform_reference_overlap),
@@ -749,6 +768,8 @@ class EvolutionManager:
                     sound_alignment_ssim=None
                     if waveform_packet_metrics is None
                     else waveform_packet_metrics.ssim,
+                    sound_reference_partial=waveform_reference_partial,
+                    sound_alignment_partial=waveform_alignment_partial,
                     readability=waveform_readability_score,
                 )
 
@@ -769,6 +790,12 @@ class EvolutionManager:
             waveform_packet_overlap=None
             if waveform_packet_overlap is None
             else float(waveform_packet_overlap),
+            waveform_reference_partial=None
+            if waveform_reference_partial is None
+            else float(waveform_reference_partial),
+            waveform_alignment_partial=None
+            if waveform_alignment_partial is None
+            else float(waveform_alignment_partial),
             waveform_sample_rate=waveform_sample_rate,
             waveform_segments=waveform_segments,
             waveform_marker_duration=waveform_marker_duration,
@@ -1352,6 +1379,16 @@ class EvolutionManager:
                             if getattr(candidate, "waveform_packet_overlap", None) is None
                             else float(candidate.waveform_packet_overlap)
                         ),
+                        waveform_reference_partial=(
+                            None
+                            if getattr(candidate, "waveform_reference_partial", None) is None
+                            else float(candidate.waveform_reference_partial)
+                        ),
+                        waveform_alignment_partial=(
+                            None
+                            if getattr(candidate, "waveform_alignment_partial", None) is None
+                            else float(candidate.waveform_alignment_partial)
+                        ),
                         waveform_sample_rate=(
                             None
                             if getattr(candidate, "waveform_sample_rate", None) is None
@@ -1521,6 +1558,16 @@ class EvolutionManager:
                             None
                             if getattr(candidate, "waveform_packet_overlap", None) is None
                             else float(candidate.waveform_packet_overlap)
+                        ),
+                        waveform_reference_partial=(
+                            None
+                            if getattr(candidate, "waveform_reference_partial", None) is None
+                            else float(candidate.waveform_reference_partial)
+                        ),
+                        waveform_alignment_partial=(
+                            None
+                            if getattr(candidate, "waveform_alignment_partial", None) is None
+                            else float(candidate.waveform_alignment_partial)
                         ),
                         waveform_sample_rate=(
                             None

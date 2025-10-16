@@ -12,6 +12,7 @@ from umbra.metrics import (
     audio_fidelity_score,
     composite_score,
     compute_metrics,
+    partial_alignment_fraction,
     readability_score,
     team_cohesion_score,
 )
@@ -204,10 +205,13 @@ def test_generation_metrics_track_sound_alignment() -> None:
     assert candidate.waveform_marker_duration == pytest.approx(
         metadata.marker_duration, rel=1e-6, abs=1e-6
     )
+    expected_reference_partial = partial_alignment_fraction(reference, sound_clipped)
+    expected_packet_partial = partial_alignment_fraction(reconstruction, sound_clipped)
     expected_sound_score = audio_fidelity_score(
         float(expected_reference_overlap),
         expected_reference_metrics.psnr,
         expected_reference_metrics.ssim,
+        partial_credit=expected_reference_partial,
     )
     assert candidate.waveform_sound_score == pytest.approx(
         expected_sound_score, rel=1e-5, abs=1e-5
@@ -224,9 +228,16 @@ def test_generation_metrics_track_sound_alignment() -> None:
         float(expected_packet_overlap),
         expected_packet_metrics.psnr,
         expected_packet_metrics.ssim,
+        partial_credit=expected_packet_partial,
     )
     assert candidate.waveform_alignment_score == pytest.approx(
         expected_alignment_score, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_reference_partial == pytest.approx(
+        expected_reference_partial, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_alignment_partial == pytest.approx(
+        expected_packet_partial, rel=1e-5, abs=1e-5
     )
     expected_team_score = team_cohesion_score(
         float(packet_overlap),
@@ -238,6 +249,8 @@ def test_generation_metrics_track_sound_alignment() -> None:
         sound_alignment_overlap=float(expected_packet_overlap),
         sound_alignment_psnr=expected_packet_metrics.psnr,
         sound_alignment_ssim=expected_packet_metrics.ssim,
+        sound_reference_partial=expected_reference_partial,
+        sound_alignment_partial=expected_packet_partial,
         readability=expected_readability,
     )
     assert candidate.team_score == pytest.approx(

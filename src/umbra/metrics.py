@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from skimage.transform import resize
+from skimage.util import img_as_float32
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,63 @@ def composite_score(overlap_pct: float, psnr: float, ssim: float) -> float:
     return composite * 100.0
 
 
-def audio_fidelity_score(overlap_pct: float, psnr: float, ssim: float) -> float:
+def _as_grayscale(array: np.ndarray) -> np.ndarray:
+    image = img_as_float32(np.asarray(array, dtype=np.float32))
+    if image.ndim == 2:
+        return image
+    if image.ndim == 3 and image.shape[-1] >= 3:
+        weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        return np.tensordot(image[..., :3], weights, axes=([-1], [0])).astype(np.float32)
+    raise ValueError("Input must be a 2D array or an RGB/RGBA image")
+
+
+def _max_normalized_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a_centered = np.asarray(a, dtype=np.float32) - float(np.mean(a))
+    b_centered = np.asarray(b, dtype=np.float32) - float(np.mean(b))
+    denom = float(np.linalg.norm(a_centered) * np.linalg.norm(b_centered))
+    if denom <= 1e-12:
+        return 0.0
+    correlation = np.correlate(a_centered, b_centered, mode="full")
+    if correlation.size == 0:
+        return 0.0
+    peak = float(np.max(np.abs(correlation))) / denom
+    return float(np.clip(peak, 0.0, 1.0))
+
+
+def partial_alignment_fraction(reference: np.ndarray, candidate: np.ndarray) -> float:
+    """Estimate how much of the reference content appears somewhere in ``candidate``."""
+
+    reference_gray = _as_grayscale(reference)
+    candidate_gray = _as_grayscale(candidate)
+    _validate_shapes(reference_gray, candidate_gray)
+
+    energy = float(np.mean(candidate_gray ** 2))
+    if not np.isfinite(energy) or energy <= 1e-9:
+        return 0.0
+
+    vertical_ref = np.mean(reference_gray, axis=1)
+    vertical_cand = np.mean(candidate_gray, axis=1)
+    horizontal_ref = np.mean(reference_gray, axis=0)
+    horizontal_cand = np.mean(candidate_gray, axis=0)
+
+    vertical_corr = _max_normalized_correlation(vertical_ref, vertical_cand)
+    horizontal_corr = _max_normalized_correlation(horizontal_ref, horizontal_cand)
+
+    occupancy = float(np.mean(candidate_gray > 0.02))
+    occupancy = float(np.clip(occupancy, 0.0, 1.0))
+    occupancy = float(np.clip(occupancy ** 0.5, 0.0, 1.0))
+
+    combined = max(vertical_corr, horizontal_corr)
+    return float(np.clip(combined * occupancy, 0.0, 1.0))
+
+
+def audio_fidelity_score(
+    overlap_pct: float,
+    psnr: float,
+    ssim: float,
+    *,
+    partial_credit: float | None = None,
+) -> float:
     """Return a conservative 0–100 score for sound-only reconstructions."""
 
     overlap_value = float(np.nan_to_num(overlap_pct, nan=0.0, posinf=0.0, neginf=0.0))
@@ -99,16 +156,21 @@ def audio_fidelity_score(overlap_pct: float, psnr: float, ssim: float) -> float:
     )
     ssim_value = float(np.nan_to_num(ssim, nan=0.0, posinf=0.0, neginf=0.0))
 
-    if psnr_value <= AI_PSNR_BASELINE or ssim_value <= 0.05:
-        return 0.0
+    base_score = 0.0
+    if psnr_value > AI_PSNR_BASELINE and ssim_value > 0.05:
+        overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
+        psnr_span = max(AI_PSNR_TARGET - AI_PSNR_BASELINE, 1e-6)
+        psnr_norm = float(np.clip((psnr_value - AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
+        ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
+        combined = overlap_norm * (psnr_norm ** 1.25) * (ssim_norm ** 0.75)
+        base_score = float(np.clip(combined, 0.0, 1.0)) * 100.0
 
-    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
-    psnr_span = max(AI_PSNR_TARGET - AI_PSNR_BASELINE, 1e-6)
-    psnr_norm = float(np.clip((psnr_value - AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
-    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
+    partial_score = 0.0
+    if partial_credit is not None:
+        partial_value = float(np.clip(partial_credit, 0.0, 1.0))
+        partial_score = float(np.clip((partial_value ** 1.5) * 60.0, 0.0, 100.0))
 
-    combined = overlap_norm * (psnr_norm ** 1.25) * (ssim_norm ** 0.75)
-    return float(np.clip(combined, 0.0, 1.0)) * 100.0
+    return float(max(base_score, partial_score))
 
 
 def team_cohesion_score(
@@ -122,6 +184,8 @@ def team_cohesion_score(
     sound_alignment_overlap: float | None,
     sound_alignment_psnr: float | None,
     sound_alignment_ssim: float | None,
+    sound_reference_partial: float | None = None,
+    sound_alignment_partial: float | None = None,
     readability: float | None = None,
 ) -> float:
     """Combine AI and audio metrics into a single cooperative score."""
@@ -142,6 +206,7 @@ def team_cohesion_score(
                     float(sound_reference_overlap),
                     float(sound_reference_psnr),
                     float(sound_reference_ssim),
+                    partial_credit=sound_reference_partial,
                 ),
                 0.0,
                 100.0,
@@ -160,6 +225,7 @@ def team_cohesion_score(
                     float(sound_alignment_overlap),
                     float(sound_alignment_psnr),
                     float(sound_alignment_ssim),
+                    partial_credit=sound_alignment_partial,
                 ),
                 0.0,
                 100.0,

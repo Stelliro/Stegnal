@@ -68,6 +68,7 @@ from .metrics import (
     audio_fidelity_score,
     composite_score,
     compute_metrics,
+    partial_alignment_fraction,
     readability_score,
 )
 from .visualization import multiplicative_overlap
@@ -882,6 +883,8 @@ class UmbraAppState:
         sound_overlap: float | None = None,
         sound_reference_metrics: ReconstructionMetrics | None = None,
         sound_reference_overlap: float | None = None,
+        sound_reference_partial: float | None = None,
+        sound_alignment_partial: float | None = None,
         sound_score: float | None = None,
         sound_readability_score: float | None = None,
         sound_alignment_score: float | None = None,
@@ -916,6 +919,20 @@ class UmbraAppState:
         sound_ssim_value: float | None = None
         sound_overlap_value: float | None = None
 
+        reference_partial_value: float | None = None
+        if sound_reference_partial is not None:
+            try:
+                reference_partial_value = float(np.clip(sound_reference_partial, 0.0, 1.0))
+            except (TypeError, ValueError):
+                reference_partial_value = None
+
+        alignment_partial_value: float | None = None
+        if sound_alignment_partial is not None:
+            try:
+                alignment_partial_value = float(np.clip(sound_alignment_partial, 0.0, 1.0))
+            except (TypeError, ValueError):
+                alignment_partial_value = None
+
         if sound_reference_metrics is not None and sound_reference_overlap is not None:
             ref_overlap_value = _nan_guard(sound_reference_overlap, 0.0)
             ref_psnr_value = _nan_guard(sound_reference_metrics.psnr, AI_PSNR_BASELINE)
@@ -930,6 +947,8 @@ class UmbraAppState:
             sound_overlap_value = ref_overlap_value
             sound_psnr_value = ref_psnr_value
             sound_ssim_value = ref_ssim_value
+            if reference_partial_value is not None:
+                entry["sound_reference_partial"] = reference_partial_value * 100.0
 
         if sound_psnr_value is None and sound_metrics is not None and sound_overlap is not None:
             sound_overlap_value = _nan_guard(sound_overlap, 0.0)
@@ -950,7 +969,10 @@ class UmbraAppState:
                 }
             )
             computed_sound_score = audio_fidelity_score(
-                sound_overlap_value, sound_psnr_value, sound_ssim_value
+                sound_overlap_value,
+                sound_psnr_value,
+                sound_ssim_value,
+                partial_credit=reference_partial_value,
             )
 
         sound_score_value: float | None = None
@@ -987,6 +1009,23 @@ class UmbraAppState:
                 alignment_value = float(np.clip(sound_alignment_score, 0.0, 100.0))
             except (TypeError, ValueError):
                 alignment_value = None
+        elif (
+            alignment_partial_value is not None
+            and sound_metrics is not None
+            and sound_overlap is not None
+        ):
+            alignment_overlap = _nan_guard(sound_overlap, 0.0)
+            alignment_psnr = _nan_guard(sound_metrics.psnr, AI_PSNR_BASELINE)
+            alignment_ssim = _nan_guard(sound_metrics.ssim, 0.0)
+            computed_alignment = audio_fidelity_score(
+                alignment_overlap,
+                alignment_psnr,
+                alignment_ssim,
+                partial_credit=alignment_partial_value,
+            )
+            alignment_value = float(np.clip(computed_alignment, 0.0, 100.0))
+        if alignment_partial_value is not None:
+            entry["sound_alignment_partial"] = alignment_partial_value * 100.0
         if alignment_value is not None:
             entry["sound_alignment_score"] = alignment_value
         if readability_value is not None:
@@ -2181,12 +2220,30 @@ class UmbraDesktopApp:
                     sound_reference_metrics = compute_metrics(ref_image, sound_clipped)
                     _, overlap_value = multiplicative_overlap(ref_image, sound_clipped)
                     sound_reference_overlap = float(overlap_value)
+                reference_partial = getattr(best, "waveform_reference_partial", None)
+                if reference_partial is None:
+                    try:
+                        reference_partial = partial_alignment_fraction(ref_image, sound_clipped)
+                    except ValueError:
+                        reference_partial = None
+                alignment_partial = getattr(best, "waveform_alignment_partial", None)
+                if alignment_partial is None:
+                    try:
+                        alignment_partial = partial_alignment_fraction(
+                            recon_clipped, sound_clipped
+                        )
+                    except ValueError:
+                        alignment_partial = None
                 sound_payload = {
                     "sound_metrics": sound_metrics,
                     "sound_overlap": sound_overlap,
                     "sound_reference_metrics": sound_reference_metrics,
                     "sound_reference_overlap": sound_reference_overlap,
                 }
+                if reference_partial is not None:
+                    sound_payload["sound_reference_partial"] = float(reference_partial)
+                if alignment_partial is not None:
+                    sound_payload["sound_alignment_partial"] = float(alignment_partial)
                 if best.waveform_sample_rate is not None:
                     sound_payload["sample_rate"] = int(best.waveform_sample_rate)
                 if best.waveform_segments is not None:
@@ -2219,6 +2276,8 @@ class UmbraDesktopApp:
                 sound_overlap=sound_payload.get("sound_overlap"),
                 sound_reference_metrics=sound_payload.get("sound_reference_metrics"),
                 sound_reference_overlap=sound_payload.get("sound_reference_overlap"),
+                sound_reference_partial=sound_payload.get("sound_reference_partial"),
+                sound_alignment_partial=sound_payload.get("sound_alignment_partial"),
                 sound_score=sound_payload.get("sound_score"),
                 sound_readability_score=sound_payload.get("sound_readability_score"),
                 sound_alignment_score=sound_payload.get("sound_alignment_score"),
