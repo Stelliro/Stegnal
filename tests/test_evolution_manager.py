@@ -20,6 +20,7 @@ def test_evolution_manager_runs_multiple_generations() -> None:
         population_size=3,
         base_seed=123,
         autosave_interval=2,
+        enable_waveform=False,
     )
 
     for _ in range(3):
@@ -45,6 +46,7 @@ def test_parent_lineage_retains_elites_and_children() -> None:
         population_size=4,
         base_seed=321,
         autosave_interval=2,
+        enable_waveform=False,
     )
 
     first_generation = manager.run_generation()
@@ -86,6 +88,7 @@ def test_plateau_ramp_reduces_sigma_and_improves_overlap() -> None:
         population_size=2,
         base_seed=777,
         autosave_interval=2,
+        enable_waveform=False,
     )
 
     initial_sigma = float(manager.encoder.sigma)
@@ -110,6 +113,7 @@ def test_perfect_overlap_is_reachable_with_zero_noise() -> None:
         population_size=1,
         base_seed=2024,
         autosave_interval=1,
+        enable_waveform=False,
     )
 
     generation = manager.run_generation()

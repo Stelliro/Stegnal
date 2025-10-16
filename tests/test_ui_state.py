@@ -3,7 +3,12 @@ import itertools
 import pytest
 
 import umbra.ui as ui
-from umbra.metrics import ReconstructionMetrics, composite_score, readability_score
+from umbra.metrics import (
+    ReconstructionMetrics,
+    audio_fidelity_score,
+    composite_score,
+    readability_score,
+)
 from umbra.ui import UmbraAppState, _generate_unique_model_path, _normalize_pinterest_url
 
 
@@ -34,7 +39,7 @@ def test_app_state_records_generations() -> None:
     metrics = ReconstructionMetrics(psnr=42.0, ssim=0.92)
 
     sound_metrics = ReconstructionMetrics(psnr=28.0, ssim=0.66)
-    sound_score = composite_score(70.0, metrics.psnr, metrics.ssim)
+    sound_score = audio_fidelity_score(70.0, metrics.psnr, metrics.ssim)
     sound_readability = readability_score(70.0, metrics.psnr, metrics.ssim)
     entry = state.record_generation(
         5,

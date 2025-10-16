@@ -8,7 +8,7 @@ from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, _chaotic_seed_mix
-from umbra.metrics import composite_score, compute_metrics, readability_score
+from umbra.metrics import audio_fidelity_score, compute_metrics, readability_score
 from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
 from umbra.visualization import multiplicative_overlap
 
@@ -198,7 +198,7 @@ def test_generation_metrics_track_sound_alignment() -> None:
     assert candidate.waveform_marker_duration == pytest.approx(
         metadata.marker_duration, rel=1e-6, abs=1e-6
     )
-    expected_sound_score = composite_score(
+    expected_sound_score = audio_fidelity_score(
         float(expected_reference_overlap),
         expected_reference_metrics.psnr,
         expected_reference_metrics.ssim,

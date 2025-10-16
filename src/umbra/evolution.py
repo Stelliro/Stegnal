@@ -21,8 +21,9 @@ from .codec import (
 from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
 from .metrics import (
+    AI_PSNR_BASELINE,
     ReconstructionMetrics,
-    composite_score,
+    audio_fidelity_score,
     compute_metrics,
     compute_ms_ssim,
     dct_band_correlation,
@@ -652,11 +653,26 @@ class EvolutionManager:
                 _, waveform_packet_overlap = multiplicative_overlap(
                     recon_image, waveform_image
                 )
+                if waveform_packet_metrics is not None and (
+                    waveform_packet_metrics.psnr <= AI_PSNR_BASELINE
+                    or waveform_packet_metrics.ssim <= 0.05
+                ):
+                    logger.debug(
+                        "WAV reconstruction diverged for seed %d: PSNR %.2f SSIM %.3f overlap %.2f",
+                        seed,
+                        waveform_packet_metrics.psnr,
+                        waveform_packet_metrics.ssim,
+                        float(
+                            waveform_packet_overlap
+                            if waveform_packet_overlap is not None
+                            else 0.0
+                        ),
+                    )
                 if (
                     waveform_reference_metrics is not None
                     and waveform_reference_overlap is not None
                 ):
-                    waveform_sound_score = composite_score(
+                    waveform_sound_score = audio_fidelity_score(
                         float(waveform_reference_overlap),
                         waveform_reference_metrics.psnr,
                         waveform_reference_metrics.ssim,

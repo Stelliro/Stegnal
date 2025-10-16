@@ -90,6 +90,27 @@ def composite_score(overlap_pct: float, psnr: float, ssim: float) -> float:
     return composite * 100.0
 
 
+def audio_fidelity_score(overlap_pct: float, psnr: float, ssim: float) -> float:
+    """Return a conservative 0–100 score for sound-only reconstructions."""
+
+    overlap_value = float(np.nan_to_num(overlap_pct, nan=0.0, posinf=0.0, neginf=0.0))
+    psnr_value = float(
+        np.nan_to_num(psnr, nan=AI_PSNR_BASELINE, posinf=AI_PSNR_BASELINE, neginf=AI_PSNR_BASELINE)
+    )
+    ssim_value = float(np.nan_to_num(ssim, nan=0.0, posinf=0.0, neginf=0.0))
+
+    if psnr_value <= AI_PSNR_BASELINE or ssim_value <= 0.05:
+        return 0.0
+
+    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
+    psnr_span = max(AI_PSNR_TARGET - AI_PSNR_BASELINE, 1e-6)
+    psnr_norm = float(np.clip((psnr_value - AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
+    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
+
+    combined = overlap_norm * (psnr_norm ** 1.25) * (ssim_norm ** 0.75)
+    return float(np.clip(combined, 0.0, 1.0)) * 100.0
+
+
 def readability_score(overlap_pct: float, psnr: float, ssim: float) -> float:
     """Derive a readability score emphasising consistency between reconstructions."""
 

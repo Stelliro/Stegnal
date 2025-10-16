@@ -65,6 +65,7 @@ from .evolution import EvolutionManager
 from .metrics import (
     AI_PSNR_BASELINE,
     ReconstructionMetrics,
+    audio_fidelity_score,
     composite_score,
     compute_metrics,
     readability_score,
@@ -938,7 +939,7 @@ class UmbraAppState:
                     "sound_overlap": sound_overlap_value,
                 }
             )
-            computed_sound_score = composite_score(
+            computed_sound_score = audio_fidelity_score(
                 sound_overlap_value, sound_psnr_value, sound_ssim_value
             )
 
