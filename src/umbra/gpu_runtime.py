@@ -8,6 +8,11 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
+try:  # pragma: no cover - Python 3.10+ ships with importlib.metadata
+    import importlib.metadata as importlib_metadata
+except Exception:  # pragma: no cover - fallback for very old interpreters
+    import importlib_metadata  # type: ignore
+
 try:  # pragma: no cover - optional dependency that may be absent at runtime
     import cupy as cp  # type: ignore
 except Exception:  # pragma: no cover - when CuPy itself is unavailable
@@ -19,6 +24,47 @@ _NVRTC_CHECKED = False
 _NVRTC_AVAILABLE = False
 _NVRTC_ERROR: Exception | None = None
 _NVRTC_PATH_CACHED = False
+
+
+def _detect_cupy_distribution_name() -> str | None:
+    """Return the installed distribution name that provides :mod:`cupy`."""
+
+    if cp is None:
+        return None
+
+    try:
+        packages = importlib_metadata.packages_distributions()
+    except Exception:  # pragma: no cover - importlib metadata may be missing
+        packages = {}
+
+    for package_name in (getattr(cp, "__name__", "cupy"), "cupy"):
+        distributions = packages.get(package_name)
+        if distributions:
+            return distributions[0]
+
+    try:
+        distribution = importlib_metadata.distribution("cupy")
+        return distribution.metadata.get("Name")
+    except Exception:  # pragma: no cover - distribution metadata may be absent
+        return None
+
+
+def recommend_cupy_install_command() -> str | None:
+    """Return a pip command that installs the detected CuPy wheel."""
+
+    if cp is None:
+        # Without CuPy we cannot infer the wheel; suggest the CUDA 12 build.
+        return 'pip install -U "cupy-cuda12x"'
+
+    distribution_name = _detect_cupy_distribution_name()
+    if not distribution_name:
+        return 'pip install -U "cupy-cuda12x"'
+
+    normalized = distribution_name.lower()
+    if normalized.startswith("cupy"):
+        return f'pip install -U "{distribution_name}"'
+
+    return 'pip install -U "cupy-cuda12x"'
 
 
 def _iter_candidate_directories() -> Iterable[Path]:

@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .gpu_runtime import cp, describe_last_error, ensure_nvrtc_configured
+from .gpu_runtime import (
+    cp,
+    describe_last_error,
+    ensure_nvrtc_configured,
+    recommend_cupy_install_command,
+)
 
 if TYPE_CHECKING:
     from .decoding import NoiseStreamDecoder
@@ -54,6 +59,9 @@ def _ensure_gpu_available(operation: str) -> None:
         "CuPy is installed but failed to load the CUDA NVRTC runtime. Install the matching "
         "CUDA toolkit or allow CPU fallback."
     )
+    install_hint = recommend_cupy_install_command()
+    if install_hint:
+        hint = f"{hint} Try reinstalling CuPy with `{install_hint}`."
     if detail:
         hint = f"{hint} (Detail: {detail})"
     raise GPUAccelerationRequiredError(hint)

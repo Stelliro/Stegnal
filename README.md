@@ -30,6 +30,25 @@ py -m venv .venv
 pip install -e .
 ```
 
+### Optional GPU acceleration
+
+The waveform reconstruction pipeline can leverage NVIDIA GPUs via CuPy. Install the
+CUDA-enabled dependencies with:
+
+```bash
+pip install -e .[gpu]
+```
+
+or, on PowerShell:
+
+```powershell
+pip install -e .[gpu]
+```
+
+If you already have CuPy installed, ensure it matches your CUDA toolkit version. The
+runtime surfaces a recommendation such as `pip install -U "cupy-cuda12x"` whenever the
+NVRTC runtime is missing.
+
 ## Usage
 
 Encode an image:

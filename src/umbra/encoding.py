@@ -10,7 +10,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .gpu_runtime import cp, describe_last_error, ensure_nvrtc_configured
+from .gpu_runtime import (
+    cp,
+    describe_last_error,
+    ensure_nvrtc_configured,
+    recommend_cupy_install_command,
+)
 from .reconstruction import GPUAccelerationRequiredError
 from .sound import MessyKeyArtifact, derive_messy_latent
 
@@ -97,6 +102,9 @@ def _ensure_gpu_available(operation: str) -> None:
         "CuPy is installed but failed to load the CUDA NVRTC runtime. Install the matching "
         "CUDA toolkit or allow CPU fallback."
     )
+    install_hint = recommend_cupy_install_command()
+    if install_hint:
+        hint = f"{hint} Try reinstalling CuPy with `{install_hint}`."
     if detail:
         hint = f"{hint} (Detail: {detail})"
     raise GPUAccelerationRequiredError(hint)
