@@ -81,6 +81,14 @@ def test_ensure_gpu_available_missing_nvrtc(monkeypatch: pytest.MonkeyPatch) -> 
     stub = types.SimpleNamespace(_umbra_skip_nvrtc_check=False, cuda=types.SimpleNamespace())
     monkeypatch.setattr(encoding, "cp", stub, raising=False)
 
+    import umbra.gpu_runtime as gpu_runtime
+
+    monkeypatch.setattr(gpu_runtime, "cp", stub, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_CHECKED", False, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_AVAILABLE", False, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_ERROR", None, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_PATH_CACHED", False, raising=False)
+
     nvrtc_module = types.ModuleType("cupy_backends.cuda.libs.nvrtc")
 
     def _raise_missing():

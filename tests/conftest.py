@@ -65,10 +65,16 @@ class _CuPyStub:
 def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure GPU-requiring code paths see a CuPy-compatible backend during tests."""
 
-    if reconstruction.cp is None:
-        monkeypatch.setattr(reconstruction, "cp", _CuPyStub, raising=False)
+    import umbra.gpu_runtime as gpu_runtime
+
+    monkeypatch.setattr(gpu_runtime, "cp", _CuPyStub, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_CHECKED", True, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_ERROR", None, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_PATH_CACHED", True, raising=False)
+
+    monkeypatch.setattr(reconstruction, "cp", _CuPyStub, raising=False)
 
     import umbra.encoding as encoding
 
-    if getattr(encoding, "cp", None) is None:
-        monkeypatch.setattr(encoding, "cp", _CuPyStub, raising=False)
+    monkeypatch.setattr(encoding, "cp", _CuPyStub, raising=False)

@@ -10,11 +10,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-try:  # pragma: no cover - optional GPU dependency
-    import cupy as cp  # type: ignore
-except Exception:  # pragma: no cover - runtime optional dependency
-    cp = None
-
+from .gpu_runtime import cp, describe_last_error, ensure_nvrtc_configured
 from .reconstruction import GPUAccelerationRequiredError
 from .sound import MessyKeyArtifact, derive_messy_latent
 
@@ -93,16 +89,17 @@ def _ensure_gpu_available(operation: str) -> None:
     if getattr(cp, "_umbra_skip_nvrtc_check", False):  # pragma: no cover - exercised via tests
         return
 
-    if hasattr(cp, "cuda"):
-        try:  # pragma: no cover - exercised indirectly when CUDA is unavailable
-            from cupy_backends.cuda.libs import nvrtc  # type: ignore
+    if ensure_nvrtc_configured():
+        return
 
-            nvrtc.getVersion()
-        except Exception as exc:  # pragma: no cover - defensive GPU validation
-            raise GPUAccelerationRequiredError(
-                "CuPy is installed but failed to load the CUDA NVRTC runtime. "
-                "Install the matching CUDA toolkit or allow CPU fallback."
-            ) from exc
+    detail = describe_last_error()
+    hint = (
+        "CuPy is installed but failed to load the CUDA NVRTC runtime. Install the matching "
+        "CUDA toolkit or allow CPU fallback."
+    )
+    if detail:
+        hint = f"{hint} (Detail: {detail})"
+    raise GPUAccelerationRequiredError(hint)
 
 
 def _simulate_uwb_channel(

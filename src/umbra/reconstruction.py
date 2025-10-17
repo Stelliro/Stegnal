@@ -10,10 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-try:  # pragma: no cover - optional GPU acceleration
-    import cupy as cp  # type: ignore
-except Exception:  # pragma: no cover - GPU optional dependency
-    cp = None
+from .gpu_runtime import cp, describe_last_error, ensure_nvrtc_configured
 
 if TYPE_CHECKING:
     from .decoding import NoiseStreamDecoder
@@ -45,6 +42,21 @@ def _ensure_gpu_available(operation: str) -> None:
         raise GPUAccelerationRequiredError(
             f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
         )
+
+    if getattr(cp, "_umbra_skip_nvrtc_check", False):  # pragma: no cover - exercised via tests
+        return
+
+    if ensure_nvrtc_configured():
+        return
+
+    detail = describe_last_error()
+    hint = (
+        "CuPy is installed but failed to load the CUDA NVRTC runtime. Install the matching "
+        "CUDA toolkit or allow CPU fallback."
+    )
+    if detail:
+        hint = f"{hint} (Detail: {detail})"
+    raise GPUAccelerationRequiredError(hint)
 
 
 def suggest_sample_rate(image: np.ndarray) -> int:
