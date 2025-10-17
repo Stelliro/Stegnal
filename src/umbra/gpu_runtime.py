@@ -26,6 +26,9 @@ _NVRTC_AVAILABLE = False
 _NVRTC_ERROR: Exception | None = None
 _NVRTC_PATH_CACHED = False
 _NVRTC_REQUIRED_VERSION: tuple[int, int | None] | None = None
+_NVRTC_DETECTED_VERSION: tuple[int, int | None] | None = None
+_NVRTC_DETECTED_LIBRARY: Path | None = None
+_NVRTC_VERSION_MATCHED = False
 
 
 def _detect_cupy_distribution_name() -> str | None:
@@ -145,7 +148,34 @@ def _matches_required_version(candidate: Path, required: tuple[int, int | None])
             return False
         if minor is None:
             return f".{major}" in name
-        return f".{major}.{minor}" in name
+    return f".{major}.{minor}" in name
+
+
+def _parse_nvrtc_version(path: Path) -> tuple[int, int | None] | None:
+    """Best-effort extraction of the CUDA version from an NVRTC library name."""
+
+    name = path.name.lower()
+
+    if sys.platform == "win32":
+        match = re.search(r"nvrtc64_(\d+)", name)
+        if not match:
+            return None
+        digits = int(match.group(1))
+        major = digits // 10
+        minor_val = digits % 10
+        minor = minor_val if minor_val != 0 else None
+        return major, minor
+
+    match = re.search(r"libnvrtc(?:\.so|\.dylib)\.(\d+)(?:\.(\d+))?", name)
+    if not match:
+        return None
+
+    major = int(match.group(1))
+    minor = match.group(2)
+    minor_version: int | None = int(minor) if minor is not None else None
+    if minor_version == 0:
+        minor_version = None
+    return major, minor_version
 
     # Linux / other POSIX platforms
     if "libnvrtc" not in name:
@@ -157,6 +187,12 @@ def _matches_required_version(candidate: Path, required: tuple[int, int | None])
 
 def _find_nvrtc_library(required: tuple[int, int | None] | None = None) -> Path | None:
     """Locate the NVRTC shared library across common installation paths."""
+
+    global _NVRTC_DETECTED_LIBRARY, _NVRTC_DETECTED_VERSION, _NVRTC_VERSION_MATCHED
+
+    _NVRTC_DETECTED_LIBRARY = None
+    _NVRTC_DETECTED_VERSION = None
+    _NVRTC_VERSION_MATCHED = False
 
     if sys.platform == "win32":
         pattern = "nvrtc64*.dll"
@@ -171,22 +207,31 @@ def _find_nvrtc_library(required: tuple[int, int | None] | None = None) -> Path 
         except Exception:  # pragma: no cover - permission issues
             continue
 
-        preferred: list[Path] = []
-        fallback: list[Path] = []
+        preferred: list[tuple[Path, tuple[int, int | None] | None]] = []
+        fallback: list[tuple[Path, tuple[int, int | None] | None]] = []
 
         for candidate in matches:
             if not candidate.is_file():
                 continue
 
+            version = _parse_nvrtc_version(candidate)
             if required is not None and _matches_required_version(candidate, required):
-                preferred.append(candidate)
+                preferred.append((candidate, version))
             else:
-                fallback.append(candidate)
+                fallback.append((candidate, version))
 
         if preferred:
-            return preferred[0]
+            library, version = preferred[0]
+            _NVRTC_DETECTED_LIBRARY = library
+            _NVRTC_DETECTED_VERSION = version
+            _NVRTC_VERSION_MATCHED = True
+            return library
         if fallback:
-            return fallback[0]
+            library, version = fallback[0]
+            _NVRTC_DETECTED_LIBRARY = library
+            _NVRTC_DETECTED_VERSION = version
+            _NVRTC_VERSION_MATCHED = required is None
+            return library
     return None
 
 
@@ -337,4 +382,36 @@ def describe_required_cuda_runtime() -> str | None:
         return f"CUDA Toolkit {major}.{minor} (NVRTC {filename})"
 
     return f"CUDA Toolkit {major}.x (NVRTC {filename})"
+
+
+def describe_detected_cuda_runtime() -> str | None:
+    """Return a description of the NVRTC runtime discovered on the system."""
+
+    library = _NVRTC_DETECTED_LIBRARY
+    version = _NVRTC_DETECTED_VERSION
+
+    if library is None and version is None:
+        return None
+
+    filename = library.name if library is not None else "NVRTC"
+
+    if version is None:
+        return f"NVRTC library {filename}"
+
+    major, minor = version
+    if minor is not None:
+        version_text = f"CUDA Toolkit {major}.{minor}"
+    else:
+        version_text = f"CUDA Toolkit {major}.x"
+
+    return f"{version_text} (NVRTC {filename})"
+
+
+def nvrtc_version_matches_requirement() -> bool | None:
+    """Return ``True`` if the detected NVRTC version matches CuPy's needs."""
+
+    if _NVRTC_REQUIRED_VERSION is None or _NVRTC_DETECTED_VERSION is None:
+        return None
+
+    return _NVRTC_VERSION_MATCHED
 

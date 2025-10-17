@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 
 import umbra.gpu_runtime as gpu_runtime
 
@@ -71,3 +72,37 @@ def test_describe_required_runtime_falls_back_to_distribution(monkeypatch):
         expected = "CUDA Toolkit 11.x (NVRTC nvrtc64_11*_0.dll)"
 
     assert gpu_runtime.describe_required_cuda_runtime() == expected
+
+
+def test_detected_runtime_reports_mismatch(monkeypatch, tmp_path):
+    """Detected NVRTC versions should be exposed for debugging mismatches."""
+
+    fake_dir = Path(tmp_path)
+    if sys.platform == "win32":
+        library = fake_dir / "nvrtc64_130_0.dll"
+    elif sys.platform == "darwin":  # pragma: no cover - macOS not in CI
+        library = fake_dir / "libnvrtc.13.0.dylib"
+    else:
+        library = fake_dir / "libnvrtc.so.13.0"
+
+    library.write_bytes(b"")
+
+    monkeypatch.setattr(
+        gpu_runtime,
+        "_iter_candidate_directories",
+        lambda: iter([fake_dir]),
+        raising=False,
+    )
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_REQUIRED_VERSION", (11, 8), raising=False)
+
+    located = gpu_runtime._find_nvrtc_library((11, 8))
+    assert located == library
+
+    description = gpu_runtime.describe_detected_cuda_runtime()
+    if sys.platform == "win32":  # pragma: no cover - platform-specific expectation
+        expected = "CUDA Toolkit 13.x (NVRTC nvrtc64_130_0.dll)"
+    else:
+        expected = "CUDA Toolkit 13.x (NVRTC libnvrtc.so.13.0)"
+    assert description == expected
+
+    assert gpu_runtime.nvrtc_version_matches_requirement() is False

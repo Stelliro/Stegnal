@@ -72,6 +72,9 @@ def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_runtime, "_NVRTC_AVAILABLE", True, raising=False)
     monkeypatch.setattr(gpu_runtime, "_NVRTC_ERROR", None, raising=False)
     monkeypatch.setattr(gpu_runtime, "_NVRTC_PATH_CACHED", True, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_DETECTED_VERSION", None, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_DETECTED_LIBRARY", None, raising=False)
+    monkeypatch.setattr(gpu_runtime, "_NVRTC_VERSION_MATCHED", False, raising=False)
 
     monkeypatch.setattr(reconstruction, "cp", _CuPyStub, raising=False)
 

@@ -12,9 +12,11 @@ import numpy as np
 
 from .gpu_runtime import (
     cp,
+    describe_detected_cuda_runtime,
     describe_last_error,
     describe_required_cuda_runtime,
     ensure_nvrtc_configured,
+    nvrtc_version_matches_requirement,
     recommend_cupy_install_command,
 )
 
@@ -57,9 +59,16 @@ def _ensure_gpu_available(operation: str) -> None:
 
     detail = describe_last_error()
     requirement = describe_required_cuda_runtime()
+    detected = describe_detected_cuda_runtime()
+    matches_requirement = nvrtc_version_matches_requirement()
     hint = "CuPy is installed but failed to load the CUDA NVRTC runtime."
     if requirement:
         hint = f"{hint} The installed wheel expects {requirement}."
+    if detected:
+        if matches_requirement is False:
+            hint = f"{hint} Detected {detected}, which does not satisfy the requirement."
+        else:
+            hint = f"{hint} Detected {detected}."
     hint = f"{hint} Install the matching CUDA toolkit or allow CPU fallback."
     install_hint = recommend_cupy_install_command()
     if install_hint:
