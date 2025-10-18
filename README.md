@@ -49,6 +49,11 @@ If you already have CuPy installed, ensure it matches your CUDA toolkit version.
 runtime surfaces a recommendation such as `pip install -U "cupy-cuda12x"` whenever the
 NVRTC runtime is missing.
 
+When NVRTC ships with another application (for example, a bundled PyTorch runtime),
+set the `UMBRA_NVRTC_PATH_HINTS` environment variable to point at the directory or DLL
+path (multiple entries are separated with the platform path separator). The helper will
+automatically wire the hint into `CUPY_NVRTC_PATH` before CuPy initializes.
+
 ## Usage
 
 Encode an image:

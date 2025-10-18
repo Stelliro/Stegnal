@@ -77,6 +77,16 @@ def _iter_candidate_directories() -> Iterable[Path]:
 
     search_roots: list[Path] = []
 
+    hints = os.environ.get("UMBRA_NVRTC_PATH_HINTS")
+    if hints:
+        for raw_hint in hints.split(os.pathsep):
+            if not raw_hint:
+                continue
+            hint_path = Path(raw_hint)
+            if hint_path.suffix:
+                hint_path = hint_path.parent
+            search_roots.append(hint_path)
+
     for env_var in ("CUPY_CUDA_PATH", "CUDA_PATH", "CUDA_HOME"):
         candidate = os.environ.get(env_var)
         if candidate:
@@ -108,6 +118,19 @@ def _iter_candidate_directories() -> Iterable[Path]:
         search_roots.extend(
             Path(path)
             for path in ("/usr/local/cuda", "/usr/local/cuda/lib64", "/usr/local/cuda/lib")
+        )
+
+    try:
+        import importlib.util
+
+        torch_spec = importlib.util.find_spec("torch")
+    except Exception:  # pragma: no cover - torch may not be importable
+        torch_spec = None
+
+    if torch_spec and torch_spec.origin:
+        torch_root = Path(torch_spec.origin).resolve().parent
+        search_roots.extend(
+            path for path in (torch_root, torch_root / "lib") if path not in search_roots
         )
 
     for entry in os.environ.get("PATH", "").split(os.pathsep):

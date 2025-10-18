@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util as importlib_util
 import sys
 import types
 from pathlib import Path
@@ -106,3 +107,18 @@ def test_detected_runtime_reports_mismatch(monkeypatch, tmp_path):
     assert description == expected
 
     assert gpu_runtime.nvrtc_version_matches_requirement() is False
+
+
+def test_iter_candidate_directories_respects_hint(monkeypatch, tmp_path):
+    """Custom hint environment variables should be considered during discovery."""
+
+    hint_file = tmp_path / "nvrtc64_118_0.dll"
+    hint_file.write_bytes(b"")
+
+    monkeypatch.setenv("UMBRA_NVRTC_PATH_HINTS", str(hint_file))
+    for env_var in ("CUPY_CUDA_PATH", "CUDA_PATH", "CUDA_HOME", "PATH"):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setattr(importlib_util, "find_spec", lambda name: None, raising=False)
+
+    directories = list(gpu_runtime._iter_candidate_directories())
+    assert hint_file.parent in directories
