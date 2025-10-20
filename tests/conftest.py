@@ -75,6 +75,13 @@ class _CuPyStub:
                 ):
                     return np.asarray(rng.normal(loc, scale, size), dtype=dtype)
 
+                def standard_normal(
+                    self,
+                    size=None,
+                    dtype=np.float32,
+                ):
+                    return np.asarray(rng.standard_normal(size), dtype=dtype)
+
                 def permutation(self, n: int):
                     return np.asarray(rng.permutation(n))
 

@@ -292,11 +292,11 @@ class NoiseStreamEncoder:
             permutation_gpu = xp.asarray(permutation)
             gpu_state = xp.random.default_rng(seed)
             permuted_gpu = flat_gpu[permutation_gpu]
-            noise_gpu = gpu_state.normal(
-                0.0,
-                self.sigma,
+            noise_gpu = gpu_state.standard_normal(
                 size=permuted_gpu.shape,
-            ).astype(xp.float32, copy=False)
+                dtype=xp.float32,
+            )
+            noise_gpu = (noise_gpu * self.sigma).astype(xp.float32, copy=False)
             uwb_gpu = xp.asarray(uwb_waveform[: permuted_gpu.size], dtype=xp.float32)
             if self.sigma >= 0.3:
                 encoded_gpu = permuted_gpu + noise_gpu + 0.01 * uwb_gpu
