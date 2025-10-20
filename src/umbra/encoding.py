@@ -272,23 +272,47 @@ class NoiseStreamEncoder:
             seed,
         )
         rng = np.random.default_rng(seed)
-        flat = np.asarray(image, dtype=np.float32).reshape(-1)
         plugin = _PLUGIN_REGISTRY[self.waveform]
         plugin_rng = np.random.default_rng(seed ^ 0x5F5A1)
+        flat = np.asarray(image, dtype=np.float32).reshape(-1)
         waveform, messy_artifact = plugin.generate(flat, plugin_rng)
         uwb_waveform, channel = _simulate_uwb_channel(
             waveform,
             plugin_rng,
             allow_cpu_fallback=allow_cpu_fallback,
         )
-        permutation = rng.permutation(flat.size)
-        permuted = flat[permutation]
-        noise = rng.normal(0.0, self.sigma, size=permuted.shape)
-        uwb_waveform = uwb_waveform[: permuted.size]
-        if self.sigma >= 0.3:
-            encoded = permuted + noise + 0.01 * uwb_waveform
+
+        use_gpu = not allow_cpu_fallback and cp is not None
+        if use_gpu:
+            _ensure_gpu_available("noise stream encoding")
+            xp = cp  # type: ignore[assignment]
+            gpu_rng = xp.random.default_rng(seed)
+            flat_gpu = xp.asarray(flat, dtype=xp.float32)
+            permutation_gpu = gpu_rng.permutation(flat_gpu.size)
+            permuted_gpu = flat_gpu[permutation_gpu]
+            noise_gpu = gpu_rng.normal(
+                0.0,
+                self.sigma,
+                size=permuted_gpu.shape,
+                dtype=xp.float32,
+            )
+            uwb_gpu = xp.asarray(uwb_waveform[: permuted_gpu.size], dtype=xp.float32)
+            if self.sigma >= 0.3:
+                encoded_gpu = permuted_gpu + noise_gpu + 0.01 * uwb_gpu
+            else:
+                encoded_gpu = permuted_gpu + noise_gpu
+            encoded = cp.asnumpy(encoded_gpu).astype(np.float32, copy=False)
         else:
-            encoded = permuted + noise
+            permutation = rng.permutation(flat.size)
+            permuted = flat[permutation]
+            noise = rng.normal(0.0, self.sigma, size=permuted.shape).astype(np.float32)
+            clipped_waveform = uwb_waveform[: permuted.size]
+            if self.sigma >= 0.3:
+                encoded = permuted + noise + 0.01 * clipped_waveform
+            else:
+                encoded = permuted + noise
+            encoded = np.asarray(encoded, dtype=np.float32)
+
         latent = derive_messy_latent(messy_artifact, encoded.shape)
         return NoisePacket(
             encoded=encoded,

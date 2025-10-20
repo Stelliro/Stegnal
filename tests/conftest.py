@@ -60,6 +60,26 @@ class _CuPyStub:
     def interp(x, xp, fp):  # type: ignore[override]
         return np.interp(x, xp, fp)
 
+    class random:
+        @staticmethod
+        def default_rng(seed: int | None = None):
+            rng = np.random.default_rng(seed)
+
+            class _Generator:
+                def normal(
+                    self,
+                    loc: float = 0.0,
+                    scale: float = 1.0,
+                    size=None,
+                    dtype=np.float32,
+                ):
+                    return np.asarray(rng.normal(loc, scale, size), dtype=dtype)
+
+                def permutation(self, n: int):
+                    return np.asarray(rng.permutation(n))
+
+            return _Generator()
+
 
 @pytest.fixture(autouse=True)
 def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
