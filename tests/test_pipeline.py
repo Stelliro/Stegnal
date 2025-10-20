@@ -69,6 +69,7 @@ def test_simulate_uwb_channel_gpu_failure(monkeypatch: pytest.MonkeyPatch) -> No
             np.ones(16, dtype=np.float32),
             np.random.default_rng(0),
             allow_cpu_fallback=False,
+            prefer_gpu=True,
         )
 
 

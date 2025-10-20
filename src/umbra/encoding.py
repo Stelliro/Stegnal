@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -126,53 +127,92 @@ def _simulate_uwb_channel(
     rng: np.random.Generator,
     *,
     allow_cpu_fallback: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Apply a simple UWB channel model, preferring GPU buffers when requested."""
+    prefer_gpu: bool = False,
+    return_backend: bool = False,
+) -> tuple[Any, Any]:
+    """Apply a simple UWB channel model, optionally returning GPU buffers.
 
-    backend = np
-    use_gpu = not allow_cpu_fallback
-    if use_gpu:
-        _ensure_gpu_available("UWB channel simulation")
-        backend = cp  # type: ignore[assignment]
+    When ``prefer_gpu`` is ``True`` and CuPy is available, the channel simulation
+    is executed on the GPU. If ``return_backend`` is also ``True`` the resulting
+    waveform and channel response are returned as CuPy arrays so callers can keep
+    subsequent work on the accelerator. Otherwise the results are converted back
+    to NumPy to avoid unexpected device transfers.
+    """
 
-    try:
+    def _simulate_with_backend(
+        backend: Any,
+        *,
+        keep_backend: bool,
+    ) -> tuple[Any, Any]:
+        xp = backend
         signal_backend = (
-            backend.asarray(signal, dtype=backend.float32)
-            if backend is not np
+            xp.asarray(signal, dtype=xp.float32)
+            if xp is not np
             else np.asarray(signal, dtype=np.float32)
         )
 
         taps = 6
         max_delay = max(2, int(signal_backend.size // 8) or 2)
         delays = rng.integers(1, max_delay, size=taps)
-        gains = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
+        gains_cpu = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
+        gains_backend = (
+            xp.asarray(gains_cpu, dtype=xp.float32) if xp is not np else gains_cpu
+        )
 
         response = (
-            backend.zeros_like(signal_backend, dtype=backend.float32)
-            if backend is not np
+            xp.zeros_like(signal_backend, dtype=xp.float32)
+            if xp is not np
             else np.zeros_like(signal_backend, dtype=np.float32)
         )
-        for gain, delay in zip(gains, delays):
+        for gain, delay in zip(gains_backend, delays):
             response[delay:] += gain * signal_backend[:-delay]
 
         faded = 0.6 * signal_backend + response
-        faded = faded / backend.max(backend.abs(faded) + 1e-6)
+        faded = faded / xp.max(xp.abs(faded) + 1e-6)
 
-        if backend is np:
-            return faded.astype(np.float32, copy=False), gains.astype(np.float32, copy=False)
+        if xp is np or not keep_backend:
+            faded_np = (
+                faded.astype(np.float32, copy=False)
+                if xp is np
+                else cp.asnumpy(faded).astype(np.float32, copy=False)
+            )
+            gains_np = (
+                gains_backend.astype(np.float32, copy=False)
+                if xp is np
+                else cp.asnumpy(gains_backend).astype(np.float32, copy=False)
+            )
+            return faded_np, gains_np
 
-        # Convert the GPU buffers back to NumPy for downstream compatibility.
         return (
-            cp.asnumpy(faded).astype(np.float32, copy=False),
-            cp.asnumpy(backend.asarray(gains, dtype=backend.float32)).astype(np.float32, copy=False),
+            faded.astype(xp.float32, copy=False),
+            gains_backend.astype(xp.float32, copy=False),
         )
-    except Exception as exc:
-        if use_gpu:
-            raise GPUAccelerationRequiredError(
-                "GPU acceleration failed while simulating the UWB channel. "
-                "Ensure the CUDA runtime (including nvrtc) is installed or enable CPU fallback."
-            ) from exc
-        raise
+
+    if not allow_cpu_fallback and cp is None:
+        raise GPUAccelerationRequiredError(
+            "GPU acceleration via CuPy is required for UWB channel simulation; CPU fallback is disabled."
+        )
+
+    prefer_gpu = (prefer_gpu or not allow_cpu_fallback) and cp is not None
+
+    if prefer_gpu:
+        try:
+            _ensure_gpu_available("UWB channel simulation")
+        except GPUAccelerationRequiredError:
+            if not allow_cpu_fallback:
+                raise
+        else:
+            try:
+                return _simulate_with_backend(cp, keep_backend=return_backend)  # type: ignore[arg-type]
+            except Exception as exc:  # pragma: no cover - exercised via integration tests
+                if not allow_cpu_fallback:
+                    raise GPUAccelerationRequiredError(
+                        "GPU acceleration failed while simulating the UWB channel. "
+                        "Ensure the CUDA runtime (including nvrtc) is installed or enable CPU fallback."
+                    ) from exc
+
+    # CPU fallback or preferred execution.
+    return _simulate_with_backend(np, keep_backend=False)
 
 
 @dataclass
@@ -276,37 +316,62 @@ class NoiseStreamEncoder:
         plugin_rng = np.random.default_rng(seed ^ 0x5F5A1)
         flat = np.asarray(image, dtype=np.float32).reshape(-1)
         waveform, messy_artifact = plugin.generate(flat, plugin_rng)
-        uwb_waveform, channel = _simulate_uwb_channel(
+        prefer_gpu = cp is not None
+        uwb_waveform_backend, channel_backend = _simulate_uwb_channel(
             waveform,
             plugin_rng,
             allow_cpu_fallback=allow_cpu_fallback,
+            prefer_gpu=prefer_gpu,
+            return_backend=True,
         )
 
         permutation = rng.permutation(flat.size)
 
-        use_gpu = not allow_cpu_fallback and cp is not None
+        use_gpu = cp is not None and isinstance(uwb_waveform_backend, cp.ndarray)
+        encoded: np.ndarray
+        channel: np.ndarray
         if use_gpu:
-            _ensure_gpu_available("noise stream encoding")
-            xp = cp  # type: ignore[assignment]
-            flat_gpu = xp.asarray(flat, dtype=xp.float32)
-            permutation_gpu = xp.asarray(permutation)
-            gpu_state = xp.random.default_rng(seed)
-            permuted_gpu = flat_gpu[permutation_gpu]
-            noise_gpu = gpu_state.standard_normal(
-                size=permuted_gpu.shape,
-                dtype=xp.float32,
-            )
-            noise_gpu = (noise_gpu * self.sigma).astype(xp.float32, copy=False)
-            uwb_gpu = xp.asarray(uwb_waveform[: permuted_gpu.size], dtype=xp.float32)
-            if self.sigma >= 0.3:
-                encoded_gpu = permuted_gpu + noise_gpu + 0.01 * uwb_gpu
+            try:
+                _ensure_gpu_available("noise stream encoding")
+            except GPUAccelerationRequiredError:
+                if not allow_cpu_fallback:
+                    raise
+                use_gpu = False
             else:
-                encoded_gpu = permuted_gpu + noise_gpu
-            encoded = cp.asnumpy(encoded_gpu).astype(np.float32, copy=False)
-        else:
+                xp = cp  # type: ignore[assignment]
+                flat_gpu = xp.asarray(flat, dtype=xp.float32)
+                permutation_gpu = xp.asarray(permutation)
+                permuted_gpu = flat_gpu[permutation_gpu]
+                gpu_state = xp.random.default_rng(seed)
+                noise_gpu = gpu_state.standard_normal(
+                    size=permuted_gpu.shape,
+                    dtype=xp.float32,
+                )
+                noise_gpu = (noise_gpu * self.sigma).astype(xp.float32, copy=False)
+                uwb_gpu = uwb_waveform_backend[: permuted_gpu.size].astype(xp.float32, copy=False)
+                if self.sigma >= 0.3:
+                    encoded_gpu = permuted_gpu + noise_gpu + 0.01 * uwb_gpu
+                else:
+                    encoded_gpu = permuted_gpu + noise_gpu
+                encoded = cp.asnumpy(encoded_gpu).astype(np.float32, copy=False)
+                channel = cp.asnumpy(channel_backend).astype(np.float32, copy=False)
+
+        if not use_gpu:
+            # ``uwb_waveform_backend`` may already be a NumPy array if the GPU path
+            # was unavailable or failed; convert explicitly to guarantee dtype.
+            uwb_waveform_np = (
+                np.asarray(cp.asnumpy(uwb_waveform_backend), dtype=np.float32)
+                if cp is not None and isinstance(uwb_waveform_backend, cp.ndarray)
+                else np.asarray(uwb_waveform_backend, dtype=np.float32)
+            )
+            channel = (
+                np.asarray(cp.asnumpy(channel_backend), dtype=np.float32)
+                if cp is not None and isinstance(channel_backend, cp.ndarray)
+                else np.asarray(channel_backend, dtype=np.float32)
+            )
             permuted = flat[permutation]
             noise = rng.normal(0.0, self.sigma, size=permuted.shape).astype(np.float32)
-            clipped_waveform = uwb_waveform[: permuted.size]
+            clipped_waveform = uwb_waveform_np[: permuted.size]
             if self.sigma >= 0.3:
                 encoded = permuted + noise + 0.01 * clipped_waveform
             else:
