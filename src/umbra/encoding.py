@@ -282,20 +282,21 @@ class NoiseStreamEncoder:
             allow_cpu_fallback=allow_cpu_fallback,
         )
 
+        permutation = rng.permutation(flat.size)
+
         use_gpu = not allow_cpu_fallback and cp is not None
         if use_gpu:
             _ensure_gpu_available("noise stream encoding")
             xp = cp  # type: ignore[assignment]
-            gpu_rng = xp.random.default_rng(seed)
             flat_gpu = xp.asarray(flat, dtype=xp.float32)
-            permutation_gpu = gpu_rng.permutation(flat_gpu.size)
+            permutation_gpu = xp.asarray(permutation)
+            gpu_state = xp.random.default_rng(seed)
             permuted_gpu = flat_gpu[permutation_gpu]
-            noise_gpu = gpu_rng.normal(
+            noise_gpu = gpu_state.normal(
                 0.0,
                 self.sigma,
                 size=permuted_gpu.shape,
-                dtype=xp.float32,
-            )
+            ).astype(xp.float32, copy=False)
             uwb_gpu = xp.asarray(uwb_waveform[: permuted_gpu.size], dtype=xp.float32)
             if self.sigma >= 0.3:
                 encoded_gpu = permuted_gpu + noise_gpu + 0.01 * uwb_gpu
@@ -303,7 +304,6 @@ class NoiseStreamEncoder:
                 encoded_gpu = permuted_gpu + noise_gpu
             encoded = cp.asnumpy(encoded_gpu).astype(np.float32, copy=False)
         else:
-            permutation = rng.permutation(flat.size)
             permuted = flat[permutation]
             noise = rng.normal(0.0, self.sigma, size=permuted.shape).astype(np.float32)
             clipped_waveform = uwb_waveform[: permuted.size]
