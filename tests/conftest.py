@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import numpy as np
 import pytest
+from skimage import filters
 
 import umbra.reconstruction as reconstruction
 
@@ -60,6 +64,10 @@ class _CuPyStub:
     def interp(x, xp, fp):  # type: ignore[override]
         return np.interp(x, xp, fp)
 
+    @staticmethod
+    def stack(arrays, axis=0):  # type: ignore[override]
+        return np.stack(arrays, axis=axis)
+
     class random:
         @staticmethod
         def default_rng(seed: int | None = None):
@@ -108,3 +116,25 @@ def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     import umbra.encoding as encoding
 
     monkeypatch.setattr(encoding, "cp", _CuPyStub, raising=False)
+
+    cupyx_module = types.ModuleType("cupyx")
+    scipy_module = types.ModuleType("cupyx.scipy")
+    ndimage_module = types.ModuleType("cupyx.scipy.ndimage")
+
+    def _gaussian_filter_stub(array, sigma, mode="reflect"):
+        channel_axis = -1 if array.ndim == 3 and array.shape[2] in (1, 3, 4) else None
+        filtered = filters.gaussian(
+            np.asarray(array, dtype=np.float32),
+            sigma=sigma,
+            preserve_range=True,
+            channel_axis=channel_axis,
+        )
+        return np.asarray(filtered, dtype=np.float32)
+
+    ndimage_module.gaussian_filter = _gaussian_filter_stub  # type: ignore[attr-defined]
+    cupyx_module.scipy = types.SimpleNamespace(ndimage=ndimage_module)
+    scipy_module.ndimage = ndimage_module
+
+    monkeypatch.setitem(sys.modules, "cupyx", cupyx_module)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy", scipy_module)
+    monkeypatch.setitem(sys.modules, "cupyx.scipy.ndimage", ndimage_module)

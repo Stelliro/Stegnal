@@ -4,6 +4,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import umbra.decoding as decoding
+import umbra.encoding as encoding
+import umbra.gpu_runtime as gpu_runtime
 import umbra.reconstruction as reconstruction
 from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from umbra.decoding import NoiseStreamDecoder
@@ -270,7 +273,10 @@ def test_generation_metrics_track_sound_alignment() -> None:
 
 
 def test_evolution_requires_gpu_when_waveform_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(gpu_runtime, "cp", None, raising=False)
     monkeypatch.setattr(reconstruction, "cp", None, raising=False)
+    monkeypatch.setattr(encoding, "cp", None, raising=False)
+    monkeypatch.setattr(decoding, "cp", None, raising=False)
 
     image = np.zeros((8, 8), dtype=np.float32)
     manager = EvolutionManager(

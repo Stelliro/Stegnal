@@ -11,17 +11,11 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .gpu_runtime import (
-    cp,
-    describe_detected_cuda_runtime,
-    describe_last_error,
-    describe_required_cuda_runtime,
-    ensure_nvrtc_configured,
-    nvrtc_version_matches_requirement,
-    recommend_cupy_install_command,
-)
-from .reconstruction import GPUAccelerationRequiredError
+from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
 from .sound import MessyKeyArtifact, derive_messy_latent
+
+# Backwards compatibility for code paths that relied on the legacy helper name.
+_ensure_gpu_available = require_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -87,39 +81,6 @@ def register_waveform_plugin(factory: Callable[[], WaveformPlugin]) -> None:
     _PLUGIN_REGISTRY[plugin.name] = plugin
 
 
-def _ensure_gpu_available(operation: str) -> None:
-    """Raise :class:`GPUAccelerationRequiredError` when no accelerator is present."""
-
-    if cp is None:
-        raise GPUAccelerationRequiredError(
-            f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
-        )
-
-    if getattr(cp, "_umbra_skip_nvrtc_check", False):  # pragma: no cover - exercised via tests
-        return
-
-    if ensure_nvrtc_configured():
-        return
-
-    detail = describe_last_error()
-    requirement = describe_required_cuda_runtime()
-    detected = describe_detected_cuda_runtime()
-    matches_requirement = nvrtc_version_matches_requirement()
-    hint = "CuPy is installed but failed to load the CUDA NVRTC runtime."
-    if requirement:
-        hint = f"{hint} The installed wheel expects {requirement}."
-    if detected:
-        if matches_requirement is False:
-            hint = f"{hint} Detected {detected}, which does not satisfy the requirement."
-        else:
-            hint = f"{hint} Detected {detected}."
-    hint = f"{hint} Install the matching CUDA toolkit or allow CPU fallback."
-    install_hint = recommend_cupy_install_command()
-    if install_hint:
-        hint = f"{hint} Try reinstalling CuPy with `{install_hint}`."
-    if detail:
-        hint = f"{hint} (Detail: {detail})"
-    raise GPUAccelerationRequiredError(hint)
 
 
 def _simulate_uwb_channel(
@@ -197,7 +158,7 @@ def _simulate_uwb_channel(
 
     if prefer_gpu:
         try:
-            _ensure_gpu_available("UWB channel simulation")
+            require_gpu("UWB channel simulation")
         except GPUAccelerationRequiredError:
             if not allow_cpu_fallback:
                 raise
@@ -226,6 +187,7 @@ class NoisePacket:
     messy_latent: np.ndarray | None = None
     channel_response: np.ndarray | None = None
     waveform_plugin: str | None = None
+    encoded_backend: Any | None = None
 
     def to_file(self, path: str | Path) -> None:
         """Serialize the packet to disk using NumPy."""
@@ -267,6 +229,7 @@ class NoisePacket:
                 channel_response.astype(np.float32) if channel_response is not None else None
             ),
             waveform_plugin=plugin_name,
+            encoded_backend=None,
         )
 
 
@@ -330,9 +293,10 @@ class NoiseStreamEncoder:
         use_gpu = cp is not None and isinstance(uwb_waveform_backend, cp.ndarray)
         encoded: np.ndarray
         channel: np.ndarray
+        encoded_backend: Any | None = None
         if use_gpu:
             try:
-                _ensure_gpu_available("noise stream encoding")
+                require_gpu("noise stream encoding")
             except GPUAccelerationRequiredError:
                 if not allow_cpu_fallback:
                     raise
@@ -355,6 +319,7 @@ class NoiseStreamEncoder:
                     encoded_gpu = permuted_gpu + noise_gpu
                 encoded = cp.asnumpy(encoded_gpu).astype(np.float32, copy=False)
                 channel = cp.asnumpy(channel_backend).astype(np.float32, copy=False)
+                encoded_backend = encoded_gpu
 
         if not use_gpu:
             # ``uwb_waveform_backend`` may already be a NumPy array if the GPU path
@@ -387,6 +352,7 @@ class NoiseStreamEncoder:
             messy_latent=latent,
             channel_response=channel,
             waveform_plugin=plugin.name,
+            encoded_backend=encoded_backend,
         )
 
     def encode_from_path(

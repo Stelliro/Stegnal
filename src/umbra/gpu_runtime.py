@@ -19,6 +19,10 @@ try:  # pragma: no cover - optional dependency that may be absent at runtime
 except Exception:  # pragma: no cover - when CuPy itself is unavailable
     cp = None  # type: ignore
 
+
+class GPUAccelerationRequiredError(RuntimeError):
+    """Raised when GPU execution is required but no accelerator is available."""
+
 logger = logging.getLogger(__name__)
 
 _NVRTC_CHECKED = False
@@ -437,4 +441,52 @@ def nvrtc_version_matches_requirement() -> bool | None:
         return None
 
     return _NVRTC_VERSION_MATCHED
+
+
+def require_gpu(operation: str) -> None:
+    """Ensure a GPU backend is available for *operation* or raise an error."""
+
+    if cp is None:
+        raise GPUAccelerationRequiredError(
+            f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
+        )
+
+    if getattr(cp, "_umbra_skip_nvrtc_check", False):  # pragma: no cover - exercised in tests
+        return
+
+    if ensure_nvrtc_configured():
+        return
+
+    detail = describe_last_error()
+    requirement = describe_required_cuda_runtime()
+    detected = describe_detected_cuda_runtime()
+    matches_requirement = nvrtc_version_matches_requirement()
+    hint = "CuPy is installed but failed to load the CUDA NVRTC runtime."
+    if requirement:
+        hint = f"{hint} The installed wheel expects {requirement}."
+    if detected:
+        if matches_requirement is False:
+            hint = f"{hint} Detected {detected}, which does not satisfy the requirement."
+        else:
+            hint = f"{hint} Detected {detected}."
+    hint = f"{hint} Install the matching CUDA toolkit or allow CPU fallback."
+    install_hint = recommend_cupy_install_command()
+    if install_hint:
+        hint = f"{hint} Try reinstalling CuPy with `{install_hint}`."
+    if detail:
+        hint = f"{hint} (Detail: {detail})"
+    raise GPUAccelerationRequiredError(hint)
+
+
+__all__ = [
+    "cp",
+    "GPUAccelerationRequiredError",
+    "require_gpu",
+    "ensure_nvrtc_configured",
+    "recommend_cupy_install_command",
+    "describe_last_error",
+    "describe_required_cuda_runtime",
+    "describe_detected_cuda_runtime",
+    "nvrtc_version_matches_requirement",
+]
 

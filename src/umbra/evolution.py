@@ -612,7 +612,11 @@ class EvolutionManager:
             int(seed),
             allow_cpu_fallback=False,
         )
-        reconstruction = self.decoder.decode(packet, int(seed))
+        reconstruction = self.decoder.decode(
+            packet,
+            int(seed),
+            allow_cpu_fallback=False,
+        )
         try:
             recon_image = _ensure_three_channel(reconstruction)
         except ValueError:

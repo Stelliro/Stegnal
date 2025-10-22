@@ -10,15 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .gpu_runtime import (
-    cp,
-    describe_detected_cuda_runtime,
-    describe_last_error,
-    describe_required_cuda_runtime,
-    ensure_nvrtc_configured,
-    nvrtc_version_matches_requirement,
-    recommend_cupy_install_command,
-)
+from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
 
 if TYPE_CHECKING:
     from .decoding import NoiseStreamDecoder
@@ -39,43 +31,6 @@ _SEGMENT_RATIO_MIN = 0.05
 _GPU_MIN_FFT_SAMPLES = 65_536
 
 
-class GPUAccelerationRequiredError(RuntimeError):
-    """Raised when GPU execution is required but no accelerator is available."""
-
-
-def _ensure_gpu_available(operation: str) -> None:
-    """Raise :class:`GPUAccelerationRequiredError` when CuPy cannot be used."""
-
-    if cp is None:
-        raise GPUAccelerationRequiredError(
-            f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
-        )
-
-    if getattr(cp, "_umbra_skip_nvrtc_check", False):  # pragma: no cover - exercised via tests
-        return
-
-    if ensure_nvrtc_configured():
-        return
-
-    detail = describe_last_error()
-    requirement = describe_required_cuda_runtime()
-    detected = describe_detected_cuda_runtime()
-    matches_requirement = nvrtc_version_matches_requirement()
-    hint = "CuPy is installed but failed to load the CUDA NVRTC runtime."
-    if requirement:
-        hint = f"{hint} The installed wheel expects {requirement}."
-    if detected:
-        if matches_requirement is False:
-            hint = f"{hint} Detected {detected}, which does not satisfy the requirement."
-        else:
-            hint = f"{hint} Detected {detected}."
-    hint = f"{hint} Install the matching CUDA toolkit or allow CPU fallback."
-    install_hint = recommend_cupy_install_command()
-    if install_hint:
-        hint = f"{hint} Try reinstalling CuPy with `{install_hint}`."
-    if detail:
-        hint = f"{hint} (Detail: {detail})"
-    raise GPUAccelerationRequiredError(hint)
 
 
 def suggest_sample_rate(image: np.ndarray) -> int:
@@ -385,10 +340,19 @@ def _fft_magnitude(
         if allow_cpu_fallback:
             backends = (np,)
         else:
-            _ensure_gpu_available("FFT magnitude computation")
+            raise GPUAccelerationRequiredError(
+                "GPU acceleration via CuPy is required for FFT magnitude computation; CPU fallback is disabled."
+            )
     else:
         if not allow_cpu_fallback or array.size >= _GPU_MIN_FFT_SAMPLES:
-            backends = (cp,) if not allow_cpu_fallback else (cp, np)
+            try:
+                require_gpu("FFT magnitude computation")
+            except GPUAccelerationRequiredError:
+                if not allow_cpu_fallback:
+                    raise
+                backends = (np,)
+            else:
+                backends = (cp,) if not allow_cpu_fallback else (cp, np)
         else:
             backends = (np,)
 
@@ -432,9 +396,20 @@ def _encode_stripe_waveform(
         if allow_cpu_fallback:
             backends = (np,)
         else:
-            _ensure_gpu_available("waveform stripe encoding")
+            raise GPUAccelerationRequiredError(
+                "GPU acceleration via CuPy is required for waveform stripe encoding; CPU fallback is disabled."
+            )
     else:
-        backends = (cp,) if not allow_cpu_fallback else (cp, np)
+        if not allow_cpu_fallback:
+            require_gpu("waveform stripe encoding")
+            backends = (cp,)
+        else:
+            try:
+                require_gpu("waveform stripe encoding")
+            except GPUAccelerationRequiredError:
+                backends = (np,)
+            else:
+                backends = (cp, np)
 
     last_error: Exception | None = None
     for xp in backends:

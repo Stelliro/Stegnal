@@ -10,6 +10,7 @@ from PIL import Image
 from skimage import filters
 
 from .encoding import NoisePacket
+from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
 
 
 class DiffusionInpainter:
@@ -80,6 +81,34 @@ class DiffusionInpainter:
 logger = logging.getLogger(__name__)
 
 
+def _gpu_gaussian_filter(array, sigma: float, *, allow_cpu_fallback: bool):
+    """Apply a Gaussian blur on the GPU when available."""
+
+    if cp is None:
+        return array
+
+    try:  # pragma: no cover - exercised in integration tests
+        import cupyx.scipy.ndimage as ndimage  # type: ignore
+    except Exception as exc:
+        if not allow_cpu_fallback:
+            raise GPUAccelerationRequiredError(
+                "CuPy Gaussian filtering is unavailable; install cupyx.scipy or enable CPU fallback."
+            ) from exc
+        return array
+
+    blurred = array
+    if array.ndim == 3 and array.shape[2] in (1, 3, 4):
+        channels = []
+        for idx in range(array.shape[2]):
+            channel = ndimage.gaussian_filter(array[..., idx], sigma=sigma, mode="reflect")
+            channels.append(channel.astype(array.dtype, copy=False))
+        blurred = cp.stack(channels, axis=-1)
+    else:
+        blurred = ndimage.gaussian_filter(array, sigma=sigma, mode="reflect")
+
+    return blurred.astype(array.dtype, copy=False)
+
+
 class NoiseStreamDecoder:
     """Recover images from :class:`~umbra.encoding.NoisePacket` objects."""
 
@@ -112,7 +141,14 @@ class NoiseStreamDecoder:
         inpainter = DiffusionInpainter(**inpainter_cfg) if isinstance(inpainter_cfg, dict) else None
         return cls(denoise_sigma=config.get("denoise_sigma"), inpainter=inpainter)
 
-    def decode(self, packet: NoisePacket, seed: int, *, messy_latent: np.ndarray | None = None) -> np.ndarray:
+    def decode(
+        self,
+        packet: NoisePacket,
+        seed: int,
+        *,
+        messy_latent: np.ndarray | None = None,
+        allow_cpu_fallback: bool = True,
+    ) -> np.ndarray:
         """Decode the provided packet using the shared seed."""
         if seed != packet.permutation_seed:
             raise ValueError("Seed mismatch: cannot decode without the original seed")
@@ -126,20 +162,52 @@ class NoiseStreamDecoder:
         inverse = np.empty_like(permutation)
         inverse[permutation] = np.arange(flat_size)
 
-        permuted = packet.encoded
-        recovered = permuted[inverse]
-        recovered = recovered.reshape(packet.image_shape)
+        recovered: np.ndarray
+        use_gpu = cp is not None
+        encoded_backend = None
+        if cp is not None and hasattr(packet, "encoded_backend"):
+            backend_value = packet.encoded_backend
+            if backend_value is not None and isinstance(backend_value, cp.ndarray):
+                encoded_backend = backend_value
 
-        if self.denoise_sigma and self.denoise_sigma > 0:
-            logger.debug(
-                "Applying Gaussian denoise with sigma %.3f", float(self.denoise_sigma)
-            )
-            recovered = filters.gaussian(
-                recovered,
-                sigma=self.denoise_sigma,
-                preserve_range=True,
-                channel_axis=-1 if recovered.ndim == 3 else None,
-            )
+        if use_gpu:
+            try:
+                require_gpu("noise stream decoding")
+            except GPUAccelerationRequiredError:
+                if not allow_cpu_fallback:
+                    raise
+                use_gpu = False
+            else:
+                xp = cp  # type: ignore[assignment]
+                if encoded_backend is not None:
+                    permuted_gpu = encoded_backend.astype(xp.float32, copy=False)
+                else:
+                    permuted_gpu = xp.asarray(packet.encoded, dtype=xp.float32)
+                inverse_gpu = xp.asarray(inverse)
+                recovered_gpu = permuted_gpu[inverse_gpu]
+                recovered_gpu = recovered_gpu.reshape(packet.image_shape)
+                if self.denoise_sigma and self.denoise_sigma > 0:
+                    recovered_gpu = _gpu_gaussian_filter(
+                        recovered_gpu, float(self.denoise_sigma), allow_cpu_fallback=allow_cpu_fallback
+                    )
+                recovered_gpu = xp.clip(recovered_gpu, 0.0, 1.0)
+                recovered = cp.asnumpy(recovered_gpu).astype(np.float32, copy=False)
+
+        if not use_gpu:
+            permuted = packet.encoded
+            recovered = permuted[inverse]
+            recovered = recovered.reshape(packet.image_shape)
+
+            if self.denoise_sigma and self.denoise_sigma > 0:
+                logger.debug(
+                    "Applying Gaussian denoise with sigma %.3f", float(self.denoise_sigma)
+                )
+                recovered = filters.gaussian(
+                    recovered,
+                    sigma=self.denoise_sigma,
+                    preserve_range=True,
+                    channel_axis=-1 if recovered.ndim == 3 else None,
+                )
 
         latent = messy_latent
         if latent is None:
