@@ -1,6 +1,8 @@
 """Tests for the evolutionary search helpers."""
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -20,11 +22,7 @@ from umbra.metrics import (
     readability_score,
     team_cohesion_score,
 )
-from umbra.reconstruction import (
-    GPUAccelerationRequiredError,
-    suggest_sample_rate,
-    suggest_transmission_profile,
-)
+from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
 from umbra.visualization import multiplicative_overlap
 
 
@@ -272,7 +270,7 @@ def test_generation_metrics_track_sound_alignment() -> None:
     )
 
 
-def test_evolution_requires_gpu_when_waveform_enabled(monkeypatch) -> None:
+def test_evolution_falls_back_to_cpu_when_gpu_unavailable(monkeypatch, caplog) -> None:
     monkeypatch.setattr(gpu_runtime, "cp", None, raising=False)
     monkeypatch.setattr(reconstruction, "cp", None, raising=False)
     monkeypatch.setattr(encoding, "cp", None, raising=False)
@@ -288,5 +286,8 @@ def test_evolution_requires_gpu_when_waveform_enabled(monkeypatch) -> None:
         autosave_interval=1,
     )
 
-    with pytest.raises(GPUAccelerationRequiredError):
-        manager.run_generation()
+    with caplog.at_level(logging.WARNING):
+        record = manager.run_generation()
+
+    assert manager._gpu_warning_emitted is True
+    assert record.candidates, "CPU fallback should still evaluate candidates"

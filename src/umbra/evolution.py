@@ -20,6 +20,7 @@ from .codec import (
 )
 from .decoding import NoiseStreamDecoder
 from .encoding import NoiseStreamEncoder
+from .gpu_runtime import cp, ensure_nvrtc_configured
 from .metrics import (
     AI_PSNR_BASELINE,
     ReconstructionMetrics,
@@ -368,6 +369,7 @@ class EvolutionManager:
             if max_generations is not None and int(max_generations) > 0
             else None
         )
+        self._gpu_warning_emitted = False
         if next_generation_index is None:
             self.next_generation_index = 0
         else:
@@ -607,15 +609,23 @@ class EvolutionManager:
     ) -> CandidateResult:
         """Run the packet pipeline and optional waveform reconstruction for ``seed``."""
 
+        gpu_available = bool(cp is not None and ensure_nvrtc_configured())
+        allow_cpu_fallback = not gpu_available
+        if allow_cpu_fallback and not self._gpu_warning_emitted:
+            logger.warning(
+                "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
+            )
+            self._gpu_warning_emitted = True
+
         packet = self.encoder.encode(
             self.original,
             int(seed),
-            allow_cpu_fallback=False,
+            allow_cpu_fallback=allow_cpu_fallback,
         )
         reconstruction = self.decoder.decode(
             packet,
             int(seed),
-            allow_cpu_fallback=False,
+            allow_cpu_fallback=allow_cpu_fallback,
         )
         try:
             recon_image = _ensure_three_channel(reconstruction)
@@ -674,7 +684,7 @@ class EvolutionManager:
                         sample_rate=waveform_sample_rate,
                         segments=waveform_segments,
                         marker_duration=waveform_marker_duration,
-                        allow_cpu_fallback=False,
+                        allow_cpu_fallback=allow_cpu_fallback,
                     )
                     waveform_image, metadata = decode_wav_bytes_to_image(
                         wav_bytes,
@@ -683,7 +693,7 @@ class EvolutionManager:
                         segments=waveform_segments,
                         marker_duration=waveform_marker_duration,
                         return_metadata=True,
-                        allow_cpu_fallback=False,
+                        allow_cpu_fallback=allow_cpu_fallback,
                     )
                     waveform_sample_rate = metadata.sample_rate or waveform_sample_rate
                     waveform_segments = metadata.segments or waveform_segments
