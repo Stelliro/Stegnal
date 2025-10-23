@@ -6,9 +6,26 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
+
+try:  # pragma: no cover - exercised indirectly in GPU environments
+    import cupy as cp  # type: ignore
+    from cupy.cuda import memory as _cupy_memory  # type: ignore
+except Exception:  # pragma: no cover - handled during testing without CuPy
+    cp = None  # type: ignore[assignment]
+    CuPyOutOfMemoryError = ()  # type: ignore[misc, assignment]
+
+    def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+        return False
+
+else:  # pragma: no cover - GPU specific
+    CuPyOutOfMemoryError = _cupy_memory.OutOfMemoryError
+
+    def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+        return isinstance(exc, _cupy_memory.OutOfMemoryError)
 
 from .sound import MessyKeyArtifact, derive_messy_latent
 
@@ -167,7 +184,14 @@ class NoiseStreamEncoder:
         arr = np.asarray(image, dtype=np.float32) / 255.0
         return arr
 
-    def encode(self, image: np.ndarray, seed: int) -> NoisePacket:
+    def encode(
+        self,
+        image: np.ndarray,
+        seed: int,
+        *,
+        allow_cpu_fallback: bool = True,
+        use_gpu: bool | None = None,
+    ) -> NoisePacket:
         """Encode the image using a permutation driven by ``seed``."""
         if image.ndim not in (2, 3):
             raise ValueError("Expected image array with shape (H, W) or (H, W, C)")
@@ -188,10 +212,48 @@ class NoiseStreamEncoder:
         permuted = flat[permutation]
         noise = rng.normal(0.0, self.sigma, size=permuted.shape)
         uwb_waveform = uwb_waveform[: permuted.size]
-        if self.sigma >= 0.3:
-            encoded = permuted + noise + 0.01 * uwb_waveform
+        use_gpu = cp is not None if use_gpu is None else bool(use_gpu and cp is not None)
+        flat_gpu = permutation_gpu = noise_gpu = uwb_gpu = None
+        if use_gpu:
+            try:
+                flat_gpu = cp.asarray(flat)
+                permutation_gpu = cp.asarray(permutation)
+                noise_gpu = cp.asarray(noise)
+                uwb_gpu = cp.asarray(uwb_waveform)
+            except CuPyOutOfMemoryError:  # type: ignore[misc]
+                if allow_cpu_fallback:
+                    logger.debug(
+                        "CuPy ran out of memory while allocating GPU buffers; falling back to CPU.",
+                        exc_info=True,
+                    )
+                    use_gpu = False
+                else:
+                    raise
+            except Exception as exc:
+                if allow_cpu_fallback and is_cupy_out_of_memory_error(exc):
+                    logger.debug(
+                        "CuPy ran out of memory while allocating GPU buffers; falling back to CPU.",
+                        exc_info=True,
+                    )
+                    use_gpu = False
+                else:
+                    raise
+        if (
+            use_gpu
+            and flat_gpu is not None
+            and permutation_gpu is not None
+            and noise_gpu is not None
+            and uwb_gpu is not None
+        ):
+            permuted_gpu = flat_gpu[permutation_gpu]
+            encoded_gpu = permuted_gpu + noise_gpu
+            if self.sigma >= 0.3:
+                encoded_gpu = encoded_gpu + 0.01 * uwb_gpu
+            encoded = cp.asnumpy(encoded_gpu)
         else:
             encoded = permuted + noise
+            if self.sigma >= 0.3:
+                encoded = encoded + 0.01 * uwb_waveform
         latent = derive_messy_latent(messy_artifact, encoded.shape)
         return NoisePacket(
             encoded=encoded,
@@ -203,9 +265,11 @@ class NoiseStreamEncoder:
             waveform_plugin=plugin.name,
         )
 
-    def encode_from_path(self, path: str | Path, seed: int) -> NoisePacket:
+    def encode_from_path(
+        self, path: str | Path, seed: int, **kwargs: Any
+    ) -> NoisePacket:
         image = self.load_image(path)
-        return self.encode(image, seed)
+        return self.encode(image, seed, **kwargs)
 
 
 __all__ = [
