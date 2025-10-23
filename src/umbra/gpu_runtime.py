@@ -9,6 +9,8 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
+import numpy as np
+
 try:  # pragma: no cover - Python 3.10+ ships with importlib.metadata
     import importlib.metadata as importlib_metadata
 except Exception:  # pragma: no cover - fallback for very old interpreters
@@ -25,6 +27,8 @@ class GPUAccelerationRequiredError(RuntimeError):
 
 logger = logging.getLogger(__name__)
 
+_HYBRID_PINNED_BUFFERS: list[object] = []
+
 _NVRTC_CHECKED = False
 _NVRTC_AVAILABLE = False
 _NVRTC_ERROR: Exception | None = None
@@ -33,6 +37,68 @@ _NVRTC_REQUIRED_VERSION: tuple[int, int | None] | None = None
 _NVRTC_DETECTED_VERSION: tuple[int, int | None] | None = None
 _NVRTC_DETECTED_LIBRARY: Path | None = None
 _NVRTC_VERSION_MATCHED = False
+
+if cp is not None:
+    try:  # pragma: no cover - attribute may be missing on older CuPy builds
+        _OOM_CLASSES: tuple[type[BaseException], ...] = (
+            cp.cuda.memory.OutOfMemoryError,  # type: ignore[attr-defined]
+        )
+    except Exception:  # pragma: no cover - fallback when CuPy API changes
+        _OOM_CLASSES = (MemoryError,)
+else:  # pragma: no cover - runtime without CuPy
+    _OOM_CLASSES = (MemoryError,)
+
+
+try:
+    CuPyOutOfMemoryError = _OOM_CLASSES[0]
+except Exception:  # pragma: no cover - defensive fallback
+
+    class CuPyOutOfMemoryError(MemoryError):
+        pass
+
+
+def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+    """Return ``True`` if *exc* represents a CuPy out-of-memory condition."""
+
+    return isinstance(exc, _OOM_CLASSES)
+
+
+def _retain_hybrid_buffer(buffer: object) -> None:
+    """Keep a strong reference to pinned buffers to avoid premature GC."""
+
+    _HYBRID_PINNED_BUFFERS.append(buffer)
+
+
+def allocate_pinned_array(shape: Iterable[int], dtype: np.dtype | type = np.float32):
+    """Allocate a CuPy array backed by pinned host memory."""
+
+    if cp is None:
+        raise GPUAccelerationRequiredError(
+            "GPU acceleration via CuPy is required for hybrid pinned allocations."
+        )
+
+    dtype_np = np.dtype(dtype)
+    size = int(np.prod(tuple(int(dim) for dim in shape))) * int(dtype_np.itemsize)
+
+    try:
+        pinned = cp.cuda.alloc_pinned_memory(size)  # type: ignore[attr-defined]
+        _retain_hybrid_buffer(pinned)
+        mem = cp.cuda.memory.UnownedMemory(int(pinned.ptr), size, pinned)  # type: ignore[attr-defined]
+        memptr = cp.cuda.memory.MemoryPointer(mem, 0)  # type: ignore[attr-defined]
+        try:
+            array = cp.ndarray(shape, dtype=dtype_np, memptr=memptr)  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - fallback for unusual CuPy builds
+            array = cp.empty(shape, dtype=dtype_np)  # pragma: no cover
+    except Exception:  # pragma: no cover - fallback when pinned allocation fails
+        array = cp.empty(shape, dtype=dtype_np)
+    else:
+        # Ensure the pinned owner is retained even if CuPy discards it.
+        try:
+            setattr(array, "_umbra_pinned_owner", pinned)
+        except Exception:  # pragma: no cover - ndarray may disallow attributes
+            _retain_hybrid_buffer((array, pinned))
+
+    return array
 
 
 def _detect_cupy_distribution_name() -> str | None:
@@ -481,6 +547,9 @@ def require_gpu(operation: str) -> None:
 __all__ = [
     "cp",
     "GPUAccelerationRequiredError",
+    "CuPyOutOfMemoryError",
+    "allocate_pinned_array",
+    "is_cupy_out_of_memory_error",
     "require_gpu",
     "ensure_nvrtc_configured",
     "recommend_cupy_install_command",

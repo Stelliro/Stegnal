@@ -268,3 +268,22 @@ def test_waveform_encoding_requires_gpu_when_disabled(monkeypatch) -> None:
             allow_cpu_fallback=False,
         )
 
+
+def test_as_backend_hybrid_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    xp = reconstruction.cp
+    if xp is None:
+        pytest.skip("CuPy unavailable")
+
+    calls = {"asarray": 0}
+
+    def _failing_asarray(array, dtype=None):  # type: ignore[override]
+        calls["asarray"] += 1
+        if calls["asarray"] == 1:
+            raise xp.cuda.memory.OutOfMemoryError("OOM")
+        return np.asarray(array, dtype=dtype)
+
+    monkeypatch.setattr(xp, "asarray", _failing_asarray, raising=False)
+
+    backend = reconstruction._as_backend(np.ones(8, dtype=np.float32), xp)
+    assert backend.shape == (8,)
+

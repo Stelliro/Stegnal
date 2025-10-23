@@ -73,6 +73,41 @@ def test_simulate_uwb_channel_gpu_failure(monkeypatch: pytest.MonkeyPatch) -> No
         )
 
 
+def test_simulate_uwb_channel_hybrid_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    import umbra.encoding as encoding
+
+    cp_stub = encoding.cp
+
+    calls = {"asarray": 0, "zeros_like": 0}
+
+    def _failing_asarray(array, dtype=None):  # type: ignore[override]
+        calls["asarray"] += 1
+        if calls["asarray"] == 1:
+            raise cp_stub.cuda.memory.OutOfMemoryError("OOM")
+        return np.asarray(array, dtype=dtype)
+
+    def _failing_zeros_like(array, dtype=None):  # type: ignore[override]
+        calls["zeros_like"] += 1
+        if calls["zeros_like"] == 1:
+            raise cp_stub.cuda.memory.OutOfMemoryError("OOM")
+        return np.zeros_like(array, dtype=dtype)
+
+    monkeypatch.setattr(cp_stub, "asarray", _failing_asarray, raising=False)
+    monkeypatch.setattr(cp_stub, "zeros_like", _failing_zeros_like, raising=False)
+
+    signal = np.ones(32, dtype=np.float32)
+    waveform, channel = encoding._simulate_uwb_channel(
+        signal,
+        np.random.default_rng(0),
+        allow_cpu_fallback=True,
+        prefer_gpu=True,
+        return_backend=True,
+    )
+
+    assert waveform.shape == signal.shape
+    assert channel.shape == (6,)
+
+
 def test_ensure_gpu_available_missing_nvrtc(monkeypatch: pytest.MonkeyPatch) -> None:
     import sys
     import types

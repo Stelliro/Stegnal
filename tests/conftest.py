@@ -19,6 +19,14 @@ class _CuPyStub:
     float32 = np.float32
     ndarray = np.ndarray
 
+    @staticmethod
+    def zeros(shape, dtype=np.float32):  # type: ignore[override]
+        return np.zeros(shape, dtype=dtype)
+
+    @staticmethod
+    def empty(shape, dtype=np.float32):  # type: ignore[override]
+        return np.empty(shape, dtype=dtype)
+
     class fft:
         @staticmethod
         def rfft(array: np.ndarray, n: int) -> np.ndarray:
@@ -94,6 +102,58 @@ class _CuPyStub:
                     return np.asarray(rng.permutation(n))
 
             return _Generator()
+
+    class cuda:
+        class memory:
+            class OutOfMemoryError(MemoryError):
+                pass
+
+            class UnownedMemory:
+                def __init__(self, ptr: int, size: int, owner: object) -> None:
+                    self.ptr = ptr
+                    self.size = size
+                    self.owner = owner
+
+            class MemoryPointer:
+                def __init__(self, mem: _CuPyStub.cuda.memory.UnownedMemory, offset: int) -> None:
+                    self.mem = mem
+                    self.ptr = mem.ptr + offset
+
+        @staticmethod
+        def alloc_pinned_memory(size: int):  # type: ignore[override]
+            buffer = np.zeros(int(size), dtype=np.uint8)
+
+            class _Pinned:
+                def __init__(self, data: np.ndarray) -> None:
+                    self._data = data
+                    self.ptr = int(data.ctypes.data)
+
+            return _Pinned(buffer)
+
+        class runtime:
+            @staticmethod
+            def runtimeGetVersion() -> int:
+                return 11040
+
+            @staticmethod
+            def driverGetVersion() -> int:
+                return 11040
+
+            @staticmethod
+            def getDeviceCount() -> int:
+                return 1
+
+            @staticmethod
+            def getDeviceProperties(index: int):
+                return {
+                    "name": "Stub GPU",
+                    "totalGlobalMem": 8 * 1024 * 1024 * 1024,
+                }
+
+        class cudnn:
+            @staticmethod
+            def getVersion() -> int:
+                return 8900
 
 
 @pytest.fixture(autouse=True)

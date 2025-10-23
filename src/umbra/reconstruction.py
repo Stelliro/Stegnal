@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
+from .gpu_runtime import (
+    GPUAccelerationRequiredError,
+    allocate_pinned_array,
+    cp,
+    is_cupy_out_of_memory_error,
+    require_gpu,
+)
 
 if TYPE_CHECKING:
     from .decoding import NoiseStreamDecoder
@@ -310,7 +316,14 @@ def _as_backend(array: Any, xp: Any) -> Any:
     """Return ``array`` as an ``xp`` ndarray with float32 dtype."""
 
     if xp is cp:
-        return cp.asarray(array, dtype=cp.float32)
+        try:
+            return cp.asarray(array, dtype=cp.float32)
+        except Exception as exc:  # pragma: no cover - diagnostic fallback
+            if not is_cupy_out_of_memory_error(exc):
+                raise
+            hybrid = allocate_pinned_array(np.shape(array), np.float32)
+            hybrid[...] = np.asarray(array, dtype=np.float32)
+            return hybrid
     return np.asarray(array, dtype=np.float32)
 
 

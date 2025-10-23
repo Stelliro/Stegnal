@@ -11,7 +11,13 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
+from .gpu_runtime import (
+    GPUAccelerationRequiredError,
+    allocate_pinned_array,
+    cp,
+    is_cupy_out_of_memory_error,
+    require_gpu,
+)
 from .sound import MessyKeyArtifact, derive_messy_latent
 
 # Backwards compatibility for code paths that relied on the legacy helper name.
@@ -90,6 +96,7 @@ def _simulate_uwb_channel(
     allow_cpu_fallback: bool,
     prefer_gpu: bool = False,
     return_backend: bool = False,
+    hybrid_memory: bool = True,
 ) -> tuple[Any, Any]:
     """Apply a simple UWB channel model, optionally returning GPU buffers.
 
@@ -106,25 +113,44 @@ def _simulate_uwb_channel(
         keep_backend: bool,
     ) -> tuple[Any, Any]:
         xp = backend
-        signal_backend = (
-            xp.asarray(signal, dtype=xp.float32)
-            if xp is not np
-            else np.asarray(signal, dtype=np.float32)
-        )
+        if xp is np:
+            signal_backend = np.asarray(signal, dtype=np.float32)
+        else:
+            try:
+                signal_backend = xp.asarray(signal, dtype=xp.float32)
+            except Exception as exc:  # pragma: no cover - diagnostic fallback
+                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                    raise
+                hybrid_signal = allocate_pinned_array(signal.shape, np.float32)
+                hybrid_signal[...] = np.asarray(signal, dtype=np.float32)
+                signal_backend = hybrid_signal
 
         taps = 6
         max_delay = max(2, int(signal_backend.size // 8) or 2)
         delays = rng.integers(1, max_delay, size=taps)
         gains_cpu = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
-        gains_backend = (
-            xp.asarray(gains_cpu, dtype=xp.float32) if xp is not np else gains_cpu
-        )
+        if xp is np:
+            gains_backend = gains_cpu
+        else:
+            try:
+                gains_backend = xp.asarray(gains_cpu, dtype=xp.float32)
+            except Exception as exc:  # pragma: no cover - diagnostic fallback
+                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                    raise
+                hybrid_gains = allocate_pinned_array(gains_cpu.shape, np.float32)
+                hybrid_gains[...] = gains_cpu
+                gains_backend = hybrid_gains
 
-        response = (
-            xp.zeros_like(signal_backend, dtype=xp.float32)
-            if xp is not np
-            else np.zeros_like(signal_backend, dtype=np.float32)
-        )
+        if xp is np:
+            response = np.zeros_like(signal_backend, dtype=np.float32)
+        else:
+            try:
+                response = xp.zeros_like(signal_backend, dtype=xp.float32)
+            except Exception as exc:  # pragma: no cover - diagnostic fallback
+                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                    raise
+                response = allocate_pinned_array(signal_backend.shape, np.float32)
+                response.fill(0)
         for gain, delay in zip(gains_backend, delays):
             response[delay:] += gain * signal_backend[:-delay]
 
