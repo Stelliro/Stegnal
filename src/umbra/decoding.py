@@ -9,6 +9,16 @@ import numpy as np
 from PIL import Image
 from skimage import filters
 
+try:  # pragma: no cover - optional acceleration
+    import cupy as cp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cp = None
+
+try:  # pragma: no cover - optional acceleration
+    from cupyx.scipy.ndimage import gaussian_filter as cupy_gaussian_filter  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cupy_gaussian_filter = None
+
 from .encoding import NoisePacket
 
 
@@ -80,6 +90,46 @@ class DiffusionInpainter:
 logger = logging.getLogger(__name__)
 
 
+def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` represents a CuPy out-of-memory error."""
+
+    module_name = getattr(exc.__class__, "__module__", "")
+    class_name = getattr(exc.__class__, "__name__", "")
+    if "cupy" in module_name.lower() and "outofmemory" in class_name.lower():
+        return True
+
+    if cp is None:
+        return False
+
+    try:  # pragma: no cover - optional CuPy internals
+        from cupy.cuda import memory as cupy_memory  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        cupy_memory = None
+
+    if cupy_memory is not None:
+        for attr in ("OutOfMemoryError", "MemoryPoolOutOfMemoryError"):
+            error_type = getattr(cupy_memory, attr, None)
+            if error_type is not None and isinstance(exc, error_type):
+                return True
+
+    try:  # pragma: no cover - optional CuPy internals
+        from cupy.cuda import runtime as cupy_runtime  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        return False
+
+    runtime_error = getattr(cupy_runtime, "CUDARuntimeError", None)
+    if runtime_error is not None and isinstance(exc, runtime_error):
+        status = getattr(exc, "status", None)
+        oom_codes = {
+            getattr(cupy_runtime, "cudaErrorMemoryAllocation", None),
+            getattr(cupy_runtime, "cudaErrorLaunchOutOfResources", None),
+        }
+        if status in oom_codes:
+            return True
+
+    return False
+
+
 class NoiseStreamDecoder:
     """Recover images from :class:`~umbra.encoding.NoisePacket` objects."""
 
@@ -112,7 +162,14 @@ class NoiseStreamDecoder:
         inpainter = DiffusionInpainter(**inpainter_cfg) if isinstance(inpainter_cfg, dict) else None
         return cls(denoise_sigma=config.get("denoise_sigma"), inpainter=inpainter)
 
-    def decode(self, packet: NoisePacket, seed: int, *, messy_latent: np.ndarray | None = None) -> np.ndarray:
+    def decode(
+        self,
+        packet: NoisePacket,
+        seed: int,
+        *,
+        messy_latent: np.ndarray | None = None,
+        allow_cpu_fallback: bool = True,
+    ) -> np.ndarray:
         """Decode the provided packet using the shared seed."""
         if seed != packet.permutation_seed:
             raise ValueError("Seed mismatch: cannot decode without the original seed")
@@ -126,11 +183,60 @@ class NoiseStreamDecoder:
         inverse = np.empty_like(permutation)
         inverse[permutation] = np.arange(flat_size)
 
-        permuted = packet.encoded
-        recovered = permuted[inverse]
-        recovered = recovered.reshape(packet.image_shape)
+        use_gpu = bool(cp is not None)
+        gaussian_applied = False
+        recovered: np.ndarray | None = None
 
-        if self.denoise_sigma and self.denoise_sigma > 0:
+        if use_gpu:  # pragma: no branch - runtime check
+            try:
+                encoded_gpu = cp.asarray(packet.encoded)  # type: ignore[assignment]
+                inverse_gpu = cp.asarray(inverse)  # type: ignore[assignment]
+                recovered_gpu = encoded_gpu[inverse_gpu]
+                recovered_gpu = recovered_gpu.reshape(packet.image_shape)
+
+                if self.denoise_sigma and self.denoise_sigma > 0 and cupy_gaussian_filter is not None:
+                    logger.debug(
+                        "Applying Gaussian denoise with sigma %.3f (CuPy)",
+                        float(self.denoise_sigma),
+                    )
+                    if recovered_gpu.ndim == 3 and recovered_gpu.shape[-1] > 1:
+                        channels = [
+                            cupy_gaussian_filter(
+                                recovered_gpu[..., idx],
+                                sigma=self.denoise_sigma,
+                                mode="reflect",
+                            )
+                            for idx in range(recovered_gpu.shape[-1])
+                        ]
+                        recovered_gpu = cp.stack(channels, axis=-1)  # type: ignore[arg-type]
+                    else:
+                        recovered_gpu = cupy_gaussian_filter(
+                            recovered_gpu,
+                            sigma=self.denoise_sigma,
+                            mode="reflect",
+                        )
+                    gaussian_applied = True
+
+                recovered = cp.asnumpy(recovered_gpu)  # type: ignore[assignment]
+            except Exception as exc:  # pragma: no cover - exercised via tests with monkeypatch
+                if allow_cpu_fallback and is_cupy_out_of_memory_error(exc):
+                    logger.debug(
+                        "CuPy out-of-memory during decode; falling back to CPU path",
+                        exc_info=True,
+                    )
+                    use_gpu = False
+                else:
+                    raise
+
+        if not use_gpu:
+            permuted = packet.encoded
+            recovered = permuted[inverse]
+            recovered = recovered.reshape(packet.image_shape)
+
+        if recovered is None:  # pragma: no cover - safety net
+            raise RuntimeError("Failed to reconstruct permutation during decoding")
+
+        if self.denoise_sigma and self.denoise_sigma > 0 and not gaussian_applied:
             logger.debug(
                 "Applying Gaussian denoise with sigma %.3f", float(self.denoise_sigma)
             )
