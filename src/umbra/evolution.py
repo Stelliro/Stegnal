@@ -240,6 +240,8 @@ class CandidateResult:
     waveform_readability_score: float | None = None
     waveform_alignment_score: float | None = None
     team_score: float | None = None
+    execution_backend: str = "cpu"
+    frame_time_ms: float | None = None
     reward: float = 0.0
     predicted_reward: float | None = None
     feature_vector: tuple[float, ...] = field(default_factory=tuple)
@@ -609,6 +611,7 @@ class EvolutionManager:
     ) -> CandidateResult:
         """Run the packet pipeline and optional waveform reconstruction for ``seed``."""
 
+        start_time = time.perf_counter()
         gpu_available = bool(cp is not None and ensure_nvrtc_configured())
         allow_cpu_fallback = not gpu_available
         if allow_cpu_fallback and not self._gpu_warning_emitted:
@@ -799,6 +802,15 @@ class EvolutionManager:
                     readability=waveform_readability_score,
                 )
 
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        backend_label = "gpu" if gpu_available else "cpu"
+        logger.debug(
+            "Evaluated seed %d on %s backend in %.2f ms",
+            seed,
+            backend_label.upper(),
+            duration_ms,
+        )
+
         return CandidateResult(
             seed=int(seed),
             reconstruction=recon_image.astype(np.float32, copy=True),
@@ -835,6 +847,8 @@ class EvolutionManager:
             if waveform_alignment_score is None
             else float(waveform_alignment_score),
             team_score=None if team_score_value is None else float(team_score_value),
+            execution_backend=backend_label,
+            frame_time_ms=float(duration_ms),
         )
 
     def _candidate_features(
@@ -1450,6 +1464,14 @@ class EvolutionManager:
                             if getattr(candidate, "team_score", None) is None
                             else float(candidate.team_score)
                         ),
+                        execution_backend=str(
+                            getattr(candidate, "execution_backend", "cpu")
+                        ),
+                        frame_time_ms=(
+                            None
+                            if getattr(candidate, "frame_time_ms", None) is None
+                            else float(candidate.frame_time_ms)
+                        ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(
                             None
@@ -1629,6 +1651,14 @@ class EvolutionManager:
                             None
                             if getattr(candidate, "team_score", None) is None
                             else float(candidate.team_score)
+                        ),
+                        execution_backend=str(
+                            getattr(candidate, "execution_backend", "cpu")
+                        ),
+                        frame_time_ms=(
+                            None
+                            if getattr(candidate, "frame_time_ms", None) is None
+                            else float(candidate.frame_time_ms)
                         ),
                         reward=float(getattr(candidate, "reward", 0.0)),
                         predicted_reward=(

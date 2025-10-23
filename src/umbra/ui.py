@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 
 try:  # pragma: no cover - optional dependency during import on minimal envs
     import tkinter as tk
@@ -891,6 +891,8 @@ class UmbraAppState:
         sound_alignment_score: float | None = None,
         team_score: float | None = None,
         ai_score_value: float | None = None,
+        frame_time_ms: float | None = None,
+        execution_backend: str | None = None,
     ) -> dict[str, float]:
         """Store metrics for a completed generation and return the entry."""
 
@@ -915,6 +917,22 @@ class UmbraAppState:
             "ai_ssim": ssim_value,
             "ai_score": ai_score,
         }
+
+        if frame_time_ms is not None:
+            try:
+                frame_value = float(frame_time_ms)
+            except (TypeError, ValueError):
+                frame_value = None
+            if frame_value is not None and np.isfinite(frame_value) and frame_value >= 0.0:
+                entry["frame_time_ms"] = frame_value
+                if frame_value > 1e-6:
+                    fps = float(np.clip(1000.0 / frame_value, 0.0, 9_999.0))
+                else:
+                    fps = 9_999.0
+                entry["frame_fps"] = fps
+
+        if execution_backend:
+            entry["execution_backend"] = str(execution_backend)
 
         sound_psnr_value: float | None = None
         sound_ssim_value: float | None = None
@@ -1208,12 +1226,24 @@ def _sanitize_history_entry(entry: Mapping[str, Any]) -> dict[str, float]:
     return sanitized
 
 
-def _to_photo_image(array: np.ndarray, *, max_edge: int = _DISPLAY_MAX_EDGE) -> ImageTk.PhotoImage:
+def _to_photo_image(
+    array: np.ndarray,
+    *,
+    max_edge: int = _DISPLAY_MAX_EDGE,
+    rotation_deg: float = 0.0,
+) -> ImageTk.PhotoImage:
     clamped = _clamp_image(array)
     data = (clamped * 255.0).astype(np.uint8)
     image = Image.fromarray(data, mode="RGB")
+    if rotation_deg:
+        image = image.rotate(
+            float(rotation_deg),
+            resample=Image.BICUBIC,
+            expand=True,
+            fillcolor=(16, 16, 16),
+        )
     if max_edge and max(image.size) > max_edge:
-        image.thumbnail((max_edge, max_edge), Image.LANCZOS)
+        image = ImageOps.contain(image, (max_edge, max_edge), Image.LANCZOS)
     return ImageTk.PhotoImage(image)
 
 
@@ -1465,6 +1495,9 @@ class UmbraDesktopApp:
         self._reading_thread: threading.Thread | None = None
         self._reading_waveform: np.ndarray | None = None
         self._pinterest_manager: PinterestDatasetManager | None = None
+        self._preview_angle = 0.0
+        self._rotation_value_var = tk.StringVar(value="0°")
+        self._rotation_slider: tk.Scale | None = None
 
         self._reference_label_widget: tk.Label | None = None
         self._reference_image_widget: tk.Label | None = None
@@ -1616,6 +1649,27 @@ class UmbraDesktopApp:
             f"\nPSNR {psnr:.2f} dB"
             f"\nReadability {readability_value:.2f}"
         )
+        frame_time = entry.get("frame_time_ms")
+        if frame_time is not None:
+            try:
+                frame_value = float(frame_time)
+            except (TypeError, ValueError):
+                frame_value = None
+            if frame_value is not None and frame_value > 0.0:
+                fps_value = entry.get("frame_fps")
+                if fps_value is not None:
+                    try:
+                        fps_numeric = float(fps_value)
+                    except (TypeError, ValueError):
+                        fps_numeric = None
+                else:
+                    fps_numeric = None
+                if fps_numeric is None and frame_value > 1e-6:
+                    fps_numeric = 1000.0 / frame_value
+                if fps_numeric is not None:
+                    message += f"\nRender {frame_value:.1f} ms ({fps_numeric:.1f} FPS)"
+                else:
+                    message += f"\nRender {frame_value:.1f} ms"
         self._show_loading_modal(message)
 
     def _build_layout(self) -> None:
@@ -1865,6 +1919,42 @@ class UmbraDesktopApp:
         )
         self._sound_info_label.pack(pady=(0, 10))
 
+        rotation_frame = tk.Frame(self.root, bg="#181818")
+        rotation_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+        tk.Label(
+            rotation_frame,
+            text="Camera orbit",
+            fg="white",
+            bg="#181818",
+        ).pack(side=tk.LEFT, padx=(6, 10))
+        slider = tk.Scale(
+            rotation_frame,
+            from_=-180,
+            to=180,
+            orient=tk.HORIZONTAL,
+            resolution=1,
+            showvalue=False,
+            length=320,
+            command=self._handle_preview_rotation,
+            bg="#181818",
+            highlightthickness=0,
+        )
+        slider.pack(side=tk.LEFT, padx=4)
+        slider.configure(troughcolor="#303030", sliderlength=14)
+        slider.set(self._preview_angle)
+        self._rotation_slider = slider
+        tk.Label(
+            rotation_frame,
+            textvariable=self._rotation_value_var,
+            fg="#9be9a8",
+            bg="#181818",
+        ).pack(side=tk.LEFT, padx=8)
+        tk.Button(
+            rotation_frame,
+            text="Reset",
+            command=lambda: self._rotation_slider.set(0) if self._rotation_slider else None,
+        ).pack(side=tk.LEFT, padx=4)
+
         graph_frame = tk.Frame(self.root, bg="#101010")
         graph_frame.pack(fill=tk.BOTH, side=tk.BOTTOM)
         self._graph_canvas = tk.Canvas(
@@ -1884,6 +1974,27 @@ class UmbraDesktopApp:
         mode = self._run_mode_var.get()
         if mode not in {"infinite", "finite"}:
             self._run_mode_var.set("finite")
+
+    def _handle_preview_rotation(self, value: str) -> None:
+        try:
+            angle = float(value)
+        except (TypeError, ValueError):
+            return
+        if math.isclose(angle, self._preview_angle, abs_tol=0.01):
+            self._preview_angle = angle
+            self._rotation_value_var.set(f"{angle:.0f}°")
+            return
+        self._preview_angle = angle
+        self._rotation_value_var.set(f"{angle:.0f}°")
+        self._refresh_preview_rotation()
+
+    def _refresh_preview_rotation(self) -> None:
+        if self.reference_image is not None:
+            self._update_reference_preview()
+        if self.reconstruction is not None:
+            self._update_reconstruction(self.reconstruction)
+        if self.sound_reconstruction is not None:
+            self._update_sound_reconstruction(self.sound_reconstruction, preprocessed=True)
 
     def _choose_image(self) -> None:
         if filedialog is None:
@@ -2294,6 +2405,8 @@ class UmbraDesktopApp:
                 sound_alignment_score=sound_payload.get("sound_alignment_score"),
                 team_score=sound_payload.get("team_score"),
                 ai_score_value=getattr(best, "ai_score", None),
+                frame_time_ms=getattr(best, "frame_time_ms", None),
+                execution_backend=getattr(best, "execution_backend", None),
             )
             self._latest_sound_payload = dict(sound_payload) if sound_payload else None
             self._latest_generation_entry = dict(entry)
@@ -2747,7 +2860,8 @@ class UmbraDesktopApp:
         if self.reference_image is None or self._reference_image_widget is None:
             return
         try:
-            photo = _to_photo_image(self.reference_image)
+            angle = getattr(self, "_preview_angle", 0.0)
+            photo = _to_photo_image(self.reference_image, rotation_deg=angle)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to render reference preview: %s", exc)
             return
@@ -2756,11 +2870,12 @@ class UmbraDesktopApp:
         self._update_reference_info()
 
     def _update_reconstruction(self, reconstruction: np.ndarray) -> None:
-        self.reconstruction = np.clip(reconstruction, 0.0, 1.0)
+        self.reconstruction = np.clip(np.asarray(reconstruction, dtype=np.float32), 0.0, 1.0)
         if self._recon_image_widget is None:
             return
         try:
-            photo = _to_photo_image(self.reconstruction)
+            angle = getattr(self, "_preview_angle", 0.0)
+            photo = _to_photo_image(self.reconstruction, rotation_deg=angle)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to render reconstruction preview: %s", exc)
             return
@@ -2768,23 +2883,33 @@ class UmbraDesktopApp:
         self._recon_image_widget.config(image=self._recon_photo, text="")
         self._recon_info_var.set("Awaiting AI reconstruction metrics…")
 
-    def _update_sound_reconstruction(self, sound_image: np.ndarray | None) -> None:
+    def _update_sound_reconstruction(
+        self, sound_image: np.ndarray | None, *, preprocessed: bool = False
+    ) -> None:
         if self._sound_image_widget is None:
             return
         if sound_image is None:
             logger.debug("Sound reconstruction unavailable for UI display")
             self._clear_sound_preview("Sound reconstruction unavailable")
             return
-        logger.info("Generating WAV reconstruction preview for UI display")
+        if preprocessed:
+            logger.debug("Refreshing sound reconstruction preview for rotation update")
+        else:
+            logger.info("Generating WAV reconstruction preview for UI display")
         try:
-            prepared = _prepare_sound_preview(sound_image)
+            array = np.asarray(sound_image, dtype=np.float32)
+            if preprocessed:
+                prepared = np.clip(array, 0.0, 1.0)
+            else:
+                prepared = _prepare_sound_preview(array)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to prepare sound reconstruction preview: %s", exc)
             self._clear_sound_preview("Sound reconstruction unavailable")
             return
         self.sound_reconstruction = prepared
         try:
-            photo = _to_photo_image(self.sound_reconstruction)
+            angle = getattr(self, "_preview_angle", 0.0)
+            photo = _to_photo_image(self.sound_reconstruction, rotation_deg=angle)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to render sound reconstruction preview: %s", exc)
             self._clear_sound_preview("Sound reconstruction unavailable")
@@ -2806,6 +2931,26 @@ class UmbraDesktopApp:
         status_parts: list[str] = []
         if "generation" in entry:
             status_parts.append(f"Generation {_as_float('generation'):.0f}")
+        frame_time = entry.get("frame_time_ms")
+        try:
+            frame_value = None if frame_time is None else float(frame_time)
+        except (TypeError, ValueError):
+            frame_value = None
+        if frame_value is not None and frame_value > 0.0:
+            fps_value = entry.get("frame_fps")
+            try:
+                fps_numeric = None if fps_value is None else float(fps_value)
+            except (TypeError, ValueError):
+                fps_numeric = None
+            if fps_numeric is None and frame_value > 1e-6:
+                fps_numeric = 1000.0 / frame_value
+            if fps_numeric is not None:
+                status_parts.append(f"Render {frame_value:.1f} ms ({fps_numeric:.1f} FPS)")
+            else:
+                status_parts.append(f"Render {frame_value:.1f} ms")
+        backend = entry.get("execution_backend")
+        if backend:
+            status_parts.append(f"Backend {str(backend).upper()}")
         sound_score = entry.get("sound_score")
         if (
             sound_score is not None

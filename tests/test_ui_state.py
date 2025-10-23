@@ -78,6 +78,8 @@ def test_app_state_records_generations() -> None:
         sound_alignment_score=alignment_score,
         team_score=team_value,
         ai_score_value=composite_score(76.0, metrics.psnr, metrics.ssim),
+        frame_time_ms=123.4,
+        execution_backend="gpu",
     )
     assert entry["generation"] == 5
     assert entry["overlap"] == 76.0
@@ -94,6 +96,9 @@ def test_app_state_records_generations() -> None:
     assert entry["sound_alignment_partial"] == pytest.approx(alignment_partial * 100.0)
     assert entry["team_score"] == pytest.approx(team_value)
     assert entry["composite_score"] == pytest.approx(team_value)
+    assert entry["frame_time_ms"] == pytest.approx(123.4)
+    assert entry["frame_fps"] == pytest.approx(1000.0 / 123.4)
+    assert entry["execution_backend"] == "gpu"
     assert state.sound_scores[-1] == entry["sound_score"]
     assert state.readability_scores[-1] == entry["sound_readability_score"]
 
