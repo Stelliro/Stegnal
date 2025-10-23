@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from umbra.gpu_runtime import allocate_pinned_array, GPUAccelerationRequiredError, require_gpu
+
 try:  # pragma: no cover - exercised indirectly in GPU environments
     import cupy as cp  # type: ignore
     from cupy.cuda import memory as _cupy_memory  # type: ignore
