@@ -210,3 +210,36 @@ def test_hyper_mode_profile_adapts(monkeypatch) -> None:
 
     monkeypatch.delenv("UMBRA_HYPER_MODE", raising=False)
     importlib.reload(evolution)
+
+
+def test_decoder_falls_back_after_cupy_oom(monkeypatch) -> None:
+    rng = np.random.default_rng(2024)
+    image = rng.random((12, 12), dtype=np.float32)
+    seed = 99
+
+    encoder = NoiseStreamEncoder(sigma=0.35)
+    decoder = NoiseStreamDecoder(denoise_sigma=0.8)
+
+    packet = encoder.encode(image, seed)
+    baseline = decoder.decode(packet, seed)
+
+    class FakeOutOfMemoryError(RuntimeError):
+        pass
+
+    FakeOutOfMemoryError.__module__ = "cupy.cuda.memory"
+
+    class FakeCuPy:
+        float32 = np.float32
+
+        def asarray(self, array, dtype=None):  # type: ignore[no-untyped-def]
+            raise FakeOutOfMemoryError("synthetic OOM")
+
+        @staticmethod
+        def asnumpy(array):  # type: ignore[no-untyped-def]
+            return np.asarray(array)
+
+    monkeypatch.setattr("umbra.decoding.cp", FakeCuPy())
+    monkeypatch.setattr("umbra.decoding.cupy_gaussian_filter", None)
+
+    result = decoder.decode(packet, seed, allow_cpu_fallback=True)
+    np.testing.assert_allclose(result, baseline)

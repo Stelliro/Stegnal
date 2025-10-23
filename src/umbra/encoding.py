@@ -11,13 +11,22 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .gpu_runtime import (
-    GPUAccelerationRequiredError,
-    allocate_pinned_array,
-    cp,
-    is_cupy_out_of_memory_error,
-    require_gpu,
-)
+try:  # pragma: no cover - exercised indirectly in GPU environments
+    import cupy as cp  # type: ignore
+    from cupy.cuda import memory as _cupy_memory  # type: ignore
+except Exception:  # pragma: no cover - handled during testing without CuPy
+    cp = None  # type: ignore[assignment]
+    CuPyOutOfMemoryError = ()  # type: ignore[misc, assignment]
+
+    def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+        return False
+
+else:  # pragma: no cover - GPU specific
+    CuPyOutOfMemoryError = _cupy_memory.OutOfMemoryError
+
+    def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+        return isinstance(exc, _cupy_memory.OutOfMemoryError)
+
 from .sound import MessyKeyArtifact, derive_messy_latent
 
 # Backwards compatibility for code paths that relied on the legacy helper name.
@@ -289,6 +298,7 @@ class NoiseStreamEncoder:
         seed: int,
         *,
         allow_cpu_fallback: bool = True,
+        use_gpu: bool | None = None,
     ) -> NoisePacket:
         """Encode the image using a permutation driven by ``seed``."""
         if image.ndim not in (2, 3):
@@ -315,60 +325,51 @@ class NoiseStreamEncoder:
         )
 
         permutation = rng.permutation(flat.size)
-
-        use_gpu = cp is not None and isinstance(uwb_waveform_backend, cp.ndarray)
-        encoded: np.ndarray
-        channel: np.ndarray
-        encoded_backend: Any | None = None
+        permuted = flat[permutation]
+        noise = rng.normal(0.0, self.sigma, size=permuted.shape)
+        uwb_waveform = uwb_waveform[: permuted.size]
+        use_gpu = cp is not None if use_gpu is None else bool(use_gpu and cp is not None)
+        flat_gpu = permutation_gpu = noise_gpu = uwb_gpu = None
         if use_gpu:
             try:
-                require_gpu("noise stream encoding")
-            except GPUAccelerationRequiredError:
-                if not allow_cpu_fallback:
-                    raise
-                use_gpu = False
-            else:
-                xp = cp  # type: ignore[assignment]
-                flat_gpu = xp.asarray(flat, dtype=xp.float32)
-                permutation_gpu = xp.asarray(permutation)
-                permuted_gpu = flat_gpu[permutation_gpu]
-                gpu_state = xp.random.default_rng(seed)
-                noise_gpu = gpu_state.standard_normal(
-                    size=permuted_gpu.shape,
-                    dtype=xp.float32,
-                )
-                noise_gpu = (noise_gpu * self.sigma).astype(xp.float32, copy=False)
-                uwb_gpu = uwb_waveform_backend[: permuted_gpu.size].astype(xp.float32, copy=False)
-                if self.sigma >= 0.3:
-                    encoded_gpu = permuted_gpu + noise_gpu + 0.01 * uwb_gpu
+                flat_gpu = cp.asarray(flat)
+                permutation_gpu = cp.asarray(permutation)
+                noise_gpu = cp.asarray(noise)
+                uwb_gpu = cp.asarray(uwb_waveform)
+            except CuPyOutOfMemoryError:  # type: ignore[misc]
+                if allow_cpu_fallback:
+                    logger.debug(
+                        "CuPy ran out of memory while allocating GPU buffers; falling back to CPU.",
+                        exc_info=True,
+                    )
+                    use_gpu = False
                 else:
-                    encoded_gpu = permuted_gpu + noise_gpu
-                encoded = cp.asnumpy(encoded_gpu).astype(np.float32, copy=False)
-                channel = cp.asnumpy(channel_backend).astype(np.float32, copy=False)
-                encoded_backend = encoded_gpu
-
-        if not use_gpu:
-            # ``uwb_waveform_backend`` may already be a NumPy array if the GPU path
-            # was unavailable or failed; convert explicitly to guarantee dtype.
-            uwb_waveform_np = (
-                np.asarray(cp.asnumpy(uwb_waveform_backend), dtype=np.float32)
-                if cp is not None and isinstance(uwb_waveform_backend, cp.ndarray)
-                else np.asarray(uwb_waveform_backend, dtype=np.float32)
-            )
-            channel = (
-                np.asarray(cp.asnumpy(channel_backend), dtype=np.float32)
-                if cp is not None and isinstance(channel_backend, cp.ndarray)
-                else np.asarray(channel_backend, dtype=np.float32)
-            )
-            permuted = flat[permutation]
-            noise = rng.normal(0.0, self.sigma, size=permuted.shape).astype(np.float32)
-            clipped_waveform = uwb_waveform_np[: permuted.size]
+                    raise
+            except Exception as exc:
+                if allow_cpu_fallback and is_cupy_out_of_memory_error(exc):
+                    logger.debug(
+                        "CuPy ran out of memory while allocating GPU buffers; falling back to CPU.",
+                        exc_info=True,
+                    )
+                    use_gpu = False
+                else:
+                    raise
+        if (
+            use_gpu
+            and flat_gpu is not None
+            and permutation_gpu is not None
+            and noise_gpu is not None
+            and uwb_gpu is not None
+        ):
+            permuted_gpu = flat_gpu[permutation_gpu]
+            encoded_gpu = permuted_gpu + noise_gpu
             if self.sigma >= 0.3:
-                encoded = permuted + noise + 0.01 * clipped_waveform
-            else:
-                encoded = permuted + noise
-            encoded = np.asarray(encoded, dtype=np.float32)
-
+                encoded_gpu = encoded_gpu + 0.01 * uwb_gpu
+            encoded = cp.asnumpy(encoded_gpu)
+        else:
+            encoded = permuted + noise
+            if self.sigma >= 0.3:
+                encoded = encoded + 0.01 * uwb_waveform
         latent = derive_messy_latent(messy_artifact, encoded.shape)
         return NoisePacket(
             encoded=encoded,
@@ -382,14 +383,10 @@ class NoiseStreamEncoder:
         )
 
     def encode_from_path(
-        self,
-        path: str | Path,
-        seed: int,
-        *,
-        allow_cpu_fallback: bool = True,
+        self, path: str | Path, seed: int, **kwargs: Any
     ) -> NoisePacket:
         image = self.load_image(path)
-        return self.encode(image, seed, allow_cpu_fallback=allow_cpu_fallback)
+        return self.encode(image, seed, **kwargs)
 
 
 __all__ = [

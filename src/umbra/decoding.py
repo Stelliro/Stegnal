@@ -9,6 +9,16 @@ import numpy as np
 from PIL import Image
 from skimage import filters
 
+try:  # pragma: no cover - optional acceleration
+    import cupy as cp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cp = None
+
+try:  # pragma: no cover - optional acceleration
+    from cupyx.scipy.ndimage import gaussian_filter as cupy_gaussian_filter  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cupy_gaussian_filter = None
+
 from .encoding import NoisePacket
 from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
 
@@ -81,32 +91,44 @@ class DiffusionInpainter:
 logger = logging.getLogger(__name__)
 
 
-def _gpu_gaussian_filter(array, sigma: float, *, allow_cpu_fallback: bool):
-    """Apply a Gaussian blur on the GPU when available."""
+def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` represents a CuPy out-of-memory error."""
+
+    module_name = getattr(exc.__class__, "__module__", "")
+    class_name = getattr(exc.__class__, "__name__", "")
+    if "cupy" in module_name.lower() and "outofmemory" in class_name.lower():
+        return True
 
     if cp is None:
-        return array
+        return False
 
-    try:  # pragma: no cover - exercised in integration tests
-        import cupyx.scipy.ndimage as ndimage  # type: ignore
-    except Exception as exc:
-        if not allow_cpu_fallback:
-            raise GPUAccelerationRequiredError(
-                "CuPy Gaussian filtering is unavailable; install cupyx.scipy or enable CPU fallback."
-            ) from exc
-        return array
+    try:  # pragma: no cover - optional CuPy internals
+        from cupy.cuda import memory as cupy_memory  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        cupy_memory = None
 
-    blurred = array
-    if array.ndim == 3 and array.shape[2] in (1, 3, 4):
-        channels = []
-        for idx in range(array.shape[2]):
-            channel = ndimage.gaussian_filter(array[..., idx], sigma=sigma, mode="reflect")
-            channels.append(channel.astype(array.dtype, copy=False))
-        blurred = cp.stack(channels, axis=-1)
-    else:
-        blurred = ndimage.gaussian_filter(array, sigma=sigma, mode="reflect")
+    if cupy_memory is not None:
+        for attr in ("OutOfMemoryError", "MemoryPoolOutOfMemoryError"):
+            error_type = getattr(cupy_memory, attr, None)
+            if error_type is not None and isinstance(exc, error_type):
+                return True
 
-    return blurred.astype(array.dtype, copy=False)
+    try:  # pragma: no cover - optional CuPy internals
+        from cupy.cuda import runtime as cupy_runtime  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        return False
+
+    runtime_error = getattr(cupy_runtime, "CUDARuntimeError", None)
+    if runtime_error is not None and isinstance(exc, runtime_error):
+        status = getattr(exc, "status", None)
+        oom_codes = {
+            getattr(cupy_runtime, "cudaErrorMemoryAllocation", None),
+            getattr(cupy_runtime, "cudaErrorLaunchOutOfResources", None),
+        }
+        if status in oom_codes:
+            return True
+
+    return False
 
 
 class NoiseStreamDecoder:
@@ -162,52 +184,69 @@ class NoiseStreamDecoder:
         inverse = np.empty_like(permutation)
         inverse[permutation] = np.arange(flat_size)
 
-        recovered: np.ndarray
-        use_gpu = cp is not None
-        encoded_backend = None
-        if cp is not None and hasattr(packet, "encoded_backend"):
-            backend_value = packet.encoded_backend
-            if backend_value is not None and isinstance(backend_value, cp.ndarray):
-                encoded_backend = backend_value
+        use_gpu = bool(cp is not None)
+        gaussian_applied = False
+        recovered: np.ndarray | None = None
 
-        if use_gpu:
+        if use_gpu:  # pragma: no branch - runtime check
             try:
-                require_gpu("noise stream decoding")
-            except GPUAccelerationRequiredError:
-                if not allow_cpu_fallback:
-                    raise
-                use_gpu = False
-            else:
-                xp = cp  # type: ignore[assignment]
-                if encoded_backend is not None:
-                    permuted_gpu = encoded_backend.astype(xp.float32, copy=False)
-                else:
-                    permuted_gpu = xp.asarray(packet.encoded, dtype=xp.float32)
-                inverse_gpu = xp.asarray(inverse)
-                recovered_gpu = permuted_gpu[inverse_gpu]
+                encoded_gpu = cp.asarray(packet.encoded)  # type: ignore[assignment]
+                inverse_gpu = cp.asarray(inverse)  # type: ignore[assignment]
+                recovered_gpu = encoded_gpu[inverse_gpu]
                 recovered_gpu = recovered_gpu.reshape(packet.image_shape)
-                if self.denoise_sigma and self.denoise_sigma > 0:
-                    recovered_gpu = _gpu_gaussian_filter(
-                        recovered_gpu, float(self.denoise_sigma), allow_cpu_fallback=allow_cpu_fallback
+
+                if self.denoise_sigma and self.denoise_sigma > 0 and cupy_gaussian_filter is not None:
+                    logger.debug(
+                        "Applying Gaussian denoise with sigma %.3f (CuPy)",
+                        float(self.denoise_sigma),
                     )
-                recovered_gpu = xp.clip(recovered_gpu, 0.0, 1.0)
-                recovered = cp.asnumpy(recovered_gpu).astype(np.float32, copy=False)
+                    if recovered_gpu.ndim == 3 and recovered_gpu.shape[-1] > 1:
+                        channels = [
+                            cupy_gaussian_filter(
+                                recovered_gpu[..., idx],
+                                sigma=self.denoise_sigma,
+                                mode="reflect",
+                            )
+                            for idx in range(recovered_gpu.shape[-1])
+                        ]
+                        recovered_gpu = cp.stack(channels, axis=-1)  # type: ignore[arg-type]
+                    else:
+                        recovered_gpu = cupy_gaussian_filter(
+                            recovered_gpu,
+                            sigma=self.denoise_sigma,
+                            mode="reflect",
+                        )
+                    gaussian_applied = True
+
+                recovered = cp.asnumpy(recovered_gpu)  # type: ignore[assignment]
+            except Exception as exc:  # pragma: no cover - exercised via tests with monkeypatch
+                if allow_cpu_fallback and is_cupy_out_of_memory_error(exc):
+                    logger.debug(
+                        "CuPy out-of-memory during decode; falling back to CPU path",
+                        exc_info=True,
+                    )
+                    use_gpu = False
+                else:
+                    raise
 
         if not use_gpu:
             permuted = packet.encoded
             recovered = permuted[inverse]
             recovered = recovered.reshape(packet.image_shape)
 
-            if self.denoise_sigma and self.denoise_sigma > 0:
-                logger.debug(
-                    "Applying Gaussian denoise with sigma %.3f", float(self.denoise_sigma)
-                )
-                recovered = filters.gaussian(
-                    recovered,
-                    sigma=self.denoise_sigma,
-                    preserve_range=True,
-                    channel_axis=-1 if recovered.ndim == 3 else None,
-                )
+        if recovered is None:  # pragma: no cover - safety net
+            raise RuntimeError("Failed to reconstruct permutation during decoding")
+
+        if self.denoise_sigma and self.denoise_sigma > 0 and not gaussian_applied:
+            logger.debug(
+                "Applying Gaussian denoise with sigma %.3f", float(self.denoise_sigma)
+            )
+            recovered = filters.gaussian(
+                recovered,
+                sigma=self.denoise_sigma,
+                preserve_range=True,
+                channel_axis=-1 if recovered.ndim == 3 else None,
+            )
 
         latent = messy_latent
         if latent is None:
