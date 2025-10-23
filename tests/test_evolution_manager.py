@@ -4,7 +4,7 @@ import numpy as np
 
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
-from umbra.evolution import EvolutionManager
+from umbra.evolution import EvolutionLimitReached, EvolutionManager
 from umbra.neural import NeuralRewardModel
 
 
@@ -20,6 +20,7 @@ def test_evolution_manager_runs_multiple_generations() -> None:
         population_size=3,
         base_seed=123,
         autosave_interval=2,
+        enable_waveform=False,
     )
 
     for _ in range(3):
@@ -31,6 +32,35 @@ def test_evolution_manager_runs_multiple_generations() -> None:
     assert all(0.0 <= metric.ssim <= 1.0 for metric in best_metrics)
     assert manager.lifetime_reward > 0.0
     assert all(record.reward_summary >= 0.0 for record in manager.generations)
+
+
+def test_generation_limit_enforced() -> None:
+    rng = np.random.default_rng(1234)
+    image = rng.random((16, 16), dtype=np.float32)
+    encoder = NoiseStreamEncoder(sigma=0.2)
+    decoder = NoiseStreamDecoder(denoise_sigma=0.9)
+    manager = EvolutionManager(
+        original=image,
+        encoder=encoder,
+        decoder=decoder,
+        population_size=2,
+        base_seed=9876,
+        autosave_interval=1,
+        enable_waveform=False,
+        max_generations=2,
+    )
+
+    first = manager.run_generation()
+    second = manager.run_generation()
+    assert first.index == 0
+    assert second.index == 1
+    try:
+        manager.run_generation()
+    except EvolutionLimitReached as exc:
+        assert exc.limit == 2
+        assert exc.attempted_generation == 2
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected EvolutionLimitReached to be raised")
 
 
 def test_parent_lineage_retains_elites_and_children() -> None:
@@ -45,6 +75,7 @@ def test_parent_lineage_retains_elites_and_children() -> None:
         population_size=4,
         base_seed=321,
         autosave_interval=2,
+        enable_waveform=False,
     )
 
     first_generation = manager.run_generation()
@@ -86,6 +117,7 @@ def test_plateau_ramp_reduces_sigma_and_improves_overlap() -> None:
         population_size=2,
         base_seed=777,
         autosave_interval=2,
+        enable_waveform=False,
     )
 
     initial_sigma = float(manager.encoder.sigma)
@@ -110,6 +142,7 @@ def test_perfect_overlap_is_reachable_with_zero_noise() -> None:
         population_size=1,
         base_seed=2024,
         autosave_interval=1,
+        enable_waveform=False,
     )
 
     generation = manager.run_generation()
@@ -136,8 +169,8 @@ def test_difficulty_respects_overlap_improvement() -> None:
     manager.decoder.denoise_sigma = 0.0
     second = manager.run_generation()
 
-    assert second.best_candidate.overlap_score <= first.best_candidate.overlap_score
-    assert second.difficulty_level <= first.difficulty_level
+    assert second.best_candidate.overlap_score >= first.best_candidate.overlap_score
+    assert second.difficulty_level >= first.difficulty_level
 
 
 def test_hyper_mode_profile_adapts(monkeypatch) -> None:

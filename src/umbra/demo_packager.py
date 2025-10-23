@@ -165,7 +165,13 @@ _DEMO_GUI_TEMPLATE = Template(
         import numpy as np
         from PIL import Image, ImageTk
 
-        from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
+        from umbra.codec import (
+            decode_wav_bytes_to_image,
+            encode_image_to_wav_bytes,
+            encode_text_to_image,
+            encode_text_to_waveform,
+            save_waveform_as_wav,
+        )
 
         _SAMPLE_IMAGE_B64 = "$IMAGE_B64"
         _SAMPLE_WAV_B64 = "$WAV_B64"
@@ -189,147 +195,121 @@ _DEMO_GUI_TEMPLATE = Template(
             return ImageTk.PhotoImage(image)
 
 
-        def _resize_for_preview(array: np.ndarray, max_edge: int = 420) -> np.ndarray:
-            array = np.clip(np.asarray(array, dtype=np.float32), 0.0, 1.0)
-            rows, cols = array.shape[:2]
-            scale = min(1.0, float(max_edge) / max(rows, cols))
+        def _resize_for_preview(array: np.ndarray, max_edge: int = 480) -> np.ndarray:
+            clipped = np.clip(np.asarray(array, dtype=np.float32), 0.0, 1.0)
+            rows, cols = clipped.shape[:2]
+            longest = max(rows, cols, 1)
+            scale = min(1.0, float(max_edge) / float(longest))
             if scale >= 1.0:
-                return array
+                return clipped
             new_size = (max(1, int(cols * scale)), max(1, int(rows * scale)))
-            image = Image.fromarray((array * 255.0).astype(np.uint8), mode="RGB")
+            image = Image.fromarray((clipped * 255.0).astype(np.uint8), mode="RGB")
             resized = image.resize(new_size, Image.BILINEAR)
             return np.asarray(resized, dtype=np.float32) / 255.0
 
 
         class DemoApp:
-            """Minimal Tkinter interface for Umbra image/audio conversions."""
+            """Compact Tk interface for sharing Umbra reconstructions."""
 
             def __init__(self, root: tk.Tk) -> None:
                 self.root = root
                 self.root.title("Umbra Demo")
-                self.root.geometry("960x600")
+                self.root.geometry("840x640")
 
-                self.sample_metadata = dict(_SAMPLE_METADATA)
+                self.metadata = dict(_SAMPLE_METADATA)
                 self.sample_array = _sample_image_array()
-                self.sample_photo = _array_to_photo(_resize_for_preview(self.sample_array))
-                self.preview_photo: ImageTk.PhotoImage | None = self.sample_photo
                 self.preview_array = self.sample_array
+                self.preview_photo = _array_to_photo(_resize_for_preview(self.sample_array))
+                self.status_var = tk.StringVar(value="Previewing bundled reconstruction.")
+                self.text_metadata = None
+                self.text_payload: str | None = None
 
-                default_rate = int(self.sample_metadata.get("sample_rate", 48000))
-                default_segments = int(self.sample_metadata.get("segments", 1))
-                default_marker = float(self.sample_metadata.get("marker_duration", 0.05))
-                rows = int(self.sample_metadata.get("rows", self.sample_array.shape[0]))
-                cols = int(self.sample_metadata.get("cols", self.sample_array.shape[1]))
-
-                self.sample_rate_var = tk.IntVar(value=default_rate)
-                self.segments_var = tk.IntVar(value=max(1, default_segments))
-                self.marker_var = tk.DoubleVar(value=max(0.001, default_marker))
-                self.rows_var = tk.IntVar(value=max(1, rows))
-                self.cols_var = tk.IntVar(value=max(1, cols))
-                self.status_var = tk.StringVar(value="Ready to encode or decode.")
+                self.sample_rate = int(self.metadata.get("sample_rate", 48000))
+                self.segments = int(self.metadata.get("segments", 1))
+                self.marker = float(self.metadata.get("marker_duration", 0.05))
+                self.rows = int(self.metadata.get("rows", self.sample_array.shape[0]))
+                self.cols = int(self.metadata.get("cols", self.sample_array.shape[1]))
 
                 self._build_layout()
 
             # ---------------------------------------------------------- layout
             def _build_layout(self) -> None:
-                main = ttk.Frame(self.root, padding=12)
+                main = ttk.Frame(self.root, padding=16)
                 main.pack(fill=tk.BOTH, expand=True)
 
-                preview_frame = ttk.LabelFrame(main, text="Sample reconstruction")
+                header = ttk.Label(main, text="Project Umbra demo", font=("Segoe UI", 16, "bold"))
+                header.pack(anchor=tk.W)
+                ttk.Label(
+                    main,
+                    text="Preview the shared reconstruction or try encoding your own images and text.",
+                    wraplength=560,
+                ).pack(anchor=tk.W, pady=(4, 16))
+
+                content = ttk.Frame(main)
+                content.pack(fill=tk.BOTH, expand=True)
+
+                preview_frame = ttk.LabelFrame(content, text="Preview")
                 preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
 
-                self.preview_label = ttk.Label(preview_frame, image=self.sample_photo)
+                self.preview_label = ttk.Label(preview_frame, image=self.preview_photo)
                 self.preview_label.pack(padx=8, pady=8)
 
-                label_text = self.sample_metadata.get("label", "Best candidate")
-                ttk.Label(preview_frame, text=label_text, font=("Arial", 12, "bold")).pack(
-                    pady=(0, 8)
+                info_lines = [
+                    f"Sample rate: {self.sample_rate} Hz",
+                    f"Segments: {self.segments}",
+                    f"Marker tone: {self.marker:.3f} s",
+                    f"Resolution: {self.rows}×{self.cols}",
+                ]
+                label_text = self.metadata.get("label")
+                if label_text:
+                    info_lines.insert(0, f"Label: {label_text}")
+                ttk.Label(preview_frame, text="\n".join(info_lines), justify=tk.LEFT).pack(padx=8, pady=(0, 12))
+
+                sample_buttons = ttk.Frame(preview_frame)
+                sample_buttons.pack(fill=tk.X, padx=8, pady=(0, 12))
+                ttk.Button(sample_buttons, text="Save sample image…", command=self.save_sample_image).pack(
+                    fill=tk.X, pady=2
+                )
+                ttk.Button(sample_buttons, text="Save sample WAV…", command=self.save_sample_wav).pack(
+                    fill=tk.X, pady=2
+                )
+                ttk.Button(sample_buttons, text="Reset preview", command=self.reset_preview).pack(
+                    fill=tk.X, pady=2
                 )
 
-                preview_buttons = ttk.Frame(preview_frame)
-                preview_buttons.pack(fill=tk.X, padx=8, pady=(0, 12))
-                ttk.Button(
-                    preview_buttons,
-                    text="Save sample image…",
-                    command=self.save_sample_image,
-                ).pack(fill=tk.X, pady=2)
-                ttk.Button(
-                    preview_buttons,
-                    text="Save sample WAV…",
-                    command=self.save_sample_wav,
-                ).pack(fill=tk.X, pady=2)
-                ttk.Button(
-                    preview_buttons,
-                    text="Preview sample WAV",
-                    command=self.preview_sample_wav,
-                ).pack(fill=tk.X, pady=2)
-
-                controls = ttk.LabelFrame(main, text="Conversions")
-                controls.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-                grid = ttk.Frame(controls)
-                grid.pack(fill=tk.X, padx=8, pady=8)
-
-                ttk.Label(grid, text="Sample rate (Hz)").grid(row=0, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=8000,
-                    to=96000,
-                    increment=1000,
-                    textvariable=self.sample_rate_var,
-                    width=8,
-                ).grid(row=0, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Segments").grid(row=1, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=1,
-                    to=128,
-                    textvariable=self.segments_var,
-                    width=8,
-                ).grid(row=1, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Marker duration (s)").grid(row=2, column=0, sticky=tk.W)
-                ttk.Entry(grid, textvariable=self.marker_var, width=10).grid(row=2, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Image rows").grid(row=3, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=16,
-                    to=2048,
-                    textvariable=self.rows_var,
-                    width=8,
-                ).grid(row=3, column=1, padx=(8, 0))
-
-                ttk.Label(grid, text="Image cols").grid(row=4, column=0, sticky=tk.W)
-                ttk.Spinbox(
-                    grid,
-                    from_=16,
-                    to=2048,
-                    textvariable=self.cols_var,
-                    width=8,
-                ).grid(row=4, column=1, padx=(8, 0))
+                actions = ttk.LabelFrame(content, text="Try it yourself")
+                actions.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
                 ttk.Button(
-                    controls,
-                    text="Encode image to WAV…",
+                    actions,
+                    text="Encode an image to WAV…",
                     command=self.encode_image_to_wav,
-                ).pack(fill=tk.X, padx=8, pady=4)
-
+                ).pack(fill=tk.X, padx=12, pady=(12, 4))
                 ttk.Button(
-                    controls,
-                    text="Decode WAV to image…",
+                    actions,
+                    text="Decode a WAV to image…",
                     command=self.decode_wav_to_image,
-                ).pack(fill=tk.X, padx=8, pady=4)
+                ).pack(fill=tk.X, padx=12, pady=4)
 
-                ttk.Button(
-                    controls,
-                    text="Upload WAV for preview…",
-                    command=self.preview_uploaded_wav,
-                ).pack(fill=tk.X, padx=8, pady=(4, 8))
+                text_frame = ttk.LabelFrame(actions, text="Text to colour static")
+                text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 4))
+                self.text_widget = tk.Text(text_frame, height=5, wrap=tk.WORD)
+                self.text_widget.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+                self.text_widget.insert(
+                    "1.0",
+                    "Paste text (even long passages) and Umbra will embed it into colourful static.",
+                )
+                text_buttons = ttk.Frame(text_frame)
+                text_buttons.pack(fill=tk.X, padx=4, pady=(0, 4))
+                ttk.Button(text_buttons, text="Preview static", command=self.preview_text_static).pack(
+                    side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2)
+                )
+                ttk.Button(text_buttons, text="Save text as WAV…", command=self.save_text_as_wav).pack(
+                    side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0)
+                )
 
-                ttk.Label(controls, textvariable=self.status_var, wraplength=320).pack(
-                    fill=tk.X, padx=8, pady=(0, 8)
+                ttk.Label(actions, textvariable=self.status_var, wraplength=320).pack(
+                    fill=tk.X, padx=12, pady=(8, 0)
                 )
 
             # ----------------------------------------------------------- helpers
@@ -339,7 +319,16 @@ _DEMO_GUI_TEMPLATE = Template(
                 self.preview_photo = _array_to_photo(resized)
                 self.preview_label.configure(image=self.preview_photo)
 
+            def _text_value(self) -> str:
+                if self.text_widget is None:
+                    return ""
+                return self.text_widget.get("1.0", tk.END).strip()
+
             # ---------------------------------------------------------- callbacks
+            def reset_preview(self) -> None:
+                self._update_preview(self.sample_array)
+                self.status_var.set("Preview reset to bundled reconstruction.")
+
             def save_sample_image(self) -> None:
                 path = filedialog.asksaveasfilename(
                     title="Save sample image",
@@ -371,22 +360,6 @@ _DEMO_GUI_TEMPLATE = Template(
                     messagebox.showerror("Save WAV", f"Failed to save WAV: {exc}")
                     self.status_var.set(f"Save failed: {exc}")
 
-            def preview_sample_wav(self) -> None:
-                try:
-                    image, _ = decode_wav_bytes_to_image(
-                        _sample_wav_bytes(),
-                        resolution=(self.rows_var.get(), self.cols_var.get()),
-                        sample_rate=self.sample_rate_var.get(),
-                        segments=max(1, int(self.segments_var.get())),
-                        marker_duration=float(self.marker_var.get()),
-                    )
-                except Exception as exc:  # pragma: no cover - GUI safety
-                    messagebox.showerror("Preview sample", f"Failed to decode sample WAV: {exc}")
-                    self.status_var.set(f"Preview failed: {exc}")
-                    return
-                self._update_preview(image)
-                self.status_var.set("Previewed sample WAV.")
-
             def encode_image_to_wav(self) -> None:
                 image_path = filedialog.askopenfilename(
                     title="Select image",
@@ -399,9 +372,9 @@ _DEMO_GUI_TEMPLATE = Template(
                         array = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
                     wav_bytes = encode_image_to_wav_bytes(
                         array,
-                        sample_rate=int(self.sample_rate_var.get()),
-                        segments=max(1, int(self.segments_var.get())),
-                        marker_duration=float(self.marker_var.get()),
+                        sample_rate=self.sample_rate,
+                        segments=max(1, self.segments),
+                        marker_duration=self.marker,
                     )
                 except Exception as exc:  # pragma: no cover - GUI safety
                     messagebox.showerror("Encode image", f"Failed to encode image: {exc}")
@@ -424,7 +397,7 @@ _DEMO_GUI_TEMPLATE = Template(
 
             def decode_wav_to_image(self) -> None:
                 wav_path = filedialog.askopenfilename(
-                    title="Select WAV file",
+                    title="Select WAV",
                     filetypes=[("WAV", "*.wav")],
                 )
                 if not wav_path:
@@ -433,10 +406,10 @@ _DEMO_GUI_TEMPLATE = Template(
                     wav_bytes = Path(wav_path).read_bytes()
                     image, detected = decode_wav_bytes_to_image(
                         wav_bytes,
-                        resolution=(self.rows_var.get(), self.cols_var.get()),
-                        sample_rate=int(self.sample_rate_var.get()),
-                        segments=max(1, int(self.segments_var.get())),
-                        marker_duration=float(self.marker_var.get()),
+                        resolution=(self.rows, self.cols),
+                        sample_rate=self.sample_rate,
+                        segments=max(1, self.segments),
+                        marker_duration=self.marker,
                     )
                 except Exception as exc:  # pragma: no cover - GUI safety
                     messagebox.showerror("Decode WAV", f"Failed to decode WAV: {exc}")
@@ -450,8 +423,8 @@ _DEMO_GUI_TEMPLATE = Template(
                 )
                 if save_path:
                     try:
-                        image_to_save = Image.fromarray((np.clip(image, 0.0, 1.0) * 255).astype(np.uint8), mode="RGB")
-                        image_to_save.save(Path(save_path))
+                        preview = Image.fromarray((np.clip(image, 0.0, 1.0) * 255).astype(np.uint8), mode="RGB")
+                        preview.save(Path(save_path))
                     except Exception as exc:  # pragma: no cover - GUI safety
                         messagebox.showerror("Save image", f"Failed to save image: {exc}")
                         self.status_var.set(f"Save failed: {exc}")
@@ -460,28 +433,50 @@ _DEMO_GUI_TEMPLATE = Template(
                 self._update_preview(image)
                 self.status_var.set(f"Decoded WAV at {detected} Hz")
 
-            def preview_uploaded_wav(self) -> None:
-                wav_path = filedialog.askopenfilename(
-                    title="Upload WAV for preview",
-                    filetypes=[("WAV", "*.wav")],
-                )
-                if not wav_path:
+            def preview_text_static(self) -> None:
+                text = self._text_value()
+                if not text:
+                    self.status_var.set("Enter text to encode before previewing.")
                     return
                 try:
-                    wav_bytes = Path(wav_path).read_bytes()
-                    image, detected = decode_wav_bytes_to_image(
-                        wav_bytes,
-                        resolution=(self.rows_var.get(), self.cols_var.get()),
-                        sample_rate=int(self.sample_rate_var.get()),
-                        segments=max(1, int(self.segments_var.get())),
-                        marker_duration=float(self.marker_var.get()),
-                    )
+                    image, metadata = encode_text_to_image(text)
                 except Exception as exc:  # pragma: no cover - GUI safety
-                    messagebox.showerror("Preview WAV", f"Failed to decode WAV: {exc}")
-                    self.status_var.set(f"Preview failed: {exc}")
+                    messagebox.showerror("Text encoding", f"Failed to encode text: {exc}")
+                    self.status_var.set(f"Text encoding failed: {exc}")
                     return
+                self.text_metadata = metadata
+                self.text_payload = text
                 self._update_preview(image)
-                self.status_var.set(f"Previewed uploaded WAV at {detected} Hz")
+                self.status_var.set(f"Previewing colour static for {len(text)} characters.")
+
+            def save_text_as_wav(self) -> None:
+                text = self._text_value()
+                if not text:
+                    self.status_var.set("Enter text to encode before saving a WAV.")
+                    return
+                try:
+                    waveform, metadata = encode_text_to_waveform(text)
+                except Exception as exc:  # pragma: no cover - GUI safety
+                    messagebox.showerror("Text to WAV", f"Failed to encode text: {exc}")
+                    self.status_var.set(f"Text encode failed: {exc}")
+                    return
+                path = filedialog.asksaveasfilename(
+                    title="Save text WAV",
+                    defaultextension=".wav",
+                    filetypes=[("WAV", "*.wav")],
+                )
+                if not path:
+                    return
+                try:
+                    save_waveform_as_wav(
+                        waveform,
+                        sample_rate=int(metadata.sample_rate or self.sample_rate),
+                        path=Path(path),
+                    )
+                    self.status_var.set(f"Saved text signal to {path}")
+                except Exception as exc:  # pragma: no cover - GUI safety
+                    messagebox.showerror("Save WAV", f"Failed to save text WAV: {exc}")
+                    self.status_var.set(f"Text WAV save failed: {exc}")
 
 
         def main() -> None:

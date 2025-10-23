@@ -8,7 +8,12 @@ from .codec import (
 )
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
-from .evolution import EvolutionManager, HyperPerformanceProfile, ParentLineage
+from .evolution import (
+    EvolutionLimitReached,
+    EvolutionManager,
+    HyperPerformanceProfile,
+    ParentLineage,
+)
 from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
 from .neural import NeuralRewardModel
@@ -37,6 +42,7 @@ __all__ = [
     "decode_waveform_to_image",
     "decode_wav_bytes_to_image",
     "EvolutionManager",
+    "EvolutionLimitReached",
     "ParentLineage",
     "HyperPerformanceProfile",
     "compute_metrics",

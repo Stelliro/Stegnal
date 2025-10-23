@@ -1,15 +1,27 @@
 """Tests for the evolutionary search helpers."""
-
 from __future__ import annotations
+
+import logging
 
 import numpy as np
 import pytest
 
-from umbra.codec import decode_waveform_to_image, encode_image_to_waveform
+import umbra.decoding as decoding
+import umbra.encoding as encoding
+import umbra.gpu_runtime as gpu_runtime
+import umbra.reconstruction as reconstruction
+from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
 from umbra.evolution import EvolutionManager, _chaotic_seed_mix
-from umbra.metrics import compute_metrics
+from umbra.metrics import (
+    audio_fidelity_score,
+    composite_score,
+    compute_metrics,
+    partial_alignment_fraction,
+    readability_score,
+    team_cohesion_score,
+)
 from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
 from umbra.visualization import multiplicative_overlap
 
@@ -69,7 +81,7 @@ def test_chaotic_seed_mix_varies_with_noise() -> None:
 
 
 def test_spawn_child_seed_uses_chaotic_mix(monkeypatch) -> None:
-    image = np.zeros((4, 4), dtype=np.float32)
+    image = np.zeros((8, 8), dtype=np.float32)
     manager = EvolutionManager(
         original=image,
         encoder=NoiseStreamEncoder(sigma=0.1),
@@ -127,26 +139,155 @@ def test_generation_metrics_track_sound_alignment() -> None:
 
     record = manager.run_generation()
     candidate = record.best_candidate
+    reference = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
     reconstruction = np.clip(np.asarray(candidate.reconstruction, dtype=np.float32), 0.0, 1.0)
-    sample_rate = suggest_sample_rate(reconstruction)
-    segments, marker_duration = suggest_transmission_profile(reconstruction)
-    waveform = encode_image_to_waveform(
+    packet_metrics = compute_metrics(reference, reconstruction)
+    _, packet_overlap = multiplicative_overlap(reference, reconstruction)
+
+    assert candidate.metrics.psnr == pytest.approx(
+        packet_metrics.psnr, rel=1e-5, abs=1e-5
+    )
+    assert candidate.metrics.ssim == pytest.approx(
+        packet_metrics.ssim, rel=1e-5, abs=1e-5
+    )
+    assert candidate.overlap_score == pytest.approx(
+        float(packet_overlap), rel=1e-5, abs=1e-5
+    )
+
+    sample_rate = suggest_sample_rate(reference)
+    segments, marker_duration = suggest_transmission_profile(reference)
+    wav_bytes = encode_image_to_wav_bytes(
         reconstruction,
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
     )
-    sound_image = decode_waveform_to_image(
-        waveform,
+    sound_image, metadata = decode_wav_bytes_to_image(
+        wav_bytes,
+        resolution=reference.shape[:2],
         sample_rate=sample_rate,
-        resolution=reconstruction.shape[:2],
         segments=segments,
         marker_duration=marker_duration,
+        return_metadata=True,
     )
     sound_clipped = np.clip(np.asarray(sound_image, dtype=np.float32), 0.0, 1.0)
-    expected_metrics = compute_metrics(reconstruction, sound_clipped)
-    _, expected_overlap = multiplicative_overlap(reconstruction, sound_clipped)
 
-    assert candidate.metrics.psnr == pytest.approx(expected_metrics.psnr, rel=1e-5, abs=1e-5)
-    assert candidate.metrics.ssim == pytest.approx(expected_metrics.ssim, rel=1e-5, abs=1e-5)
-    assert candidate.overlap_score == pytest.approx(float(expected_overlap), rel=1e-5, abs=1e-5)
+    assert candidate.waveform_reconstruction is not None
+    np.testing.assert_allclose(
+        np.clip(np.asarray(candidate.waveform_reconstruction, dtype=np.float32), 0.0, 1.0),
+        sound_clipped,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+    expected_reference_metrics = compute_metrics(reference, sound_clipped)
+    _, expected_reference_overlap = multiplicative_overlap(reference, sound_clipped)
+    assert candidate.waveform_reference_metrics is not None
+    assert candidate.waveform_reference_metrics.psnr == pytest.approx(
+        expected_reference_metrics.psnr, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_reference_metrics.ssim == pytest.approx(
+        expected_reference_metrics.ssim, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_reference_overlap == pytest.approx(
+        float(expected_reference_overlap), rel=1e-5, abs=1e-5
+    )
+
+    expected_packet_metrics = compute_metrics(reconstruction, sound_clipped)
+    _, expected_packet_overlap = multiplicative_overlap(reconstruction, sound_clipped)
+    assert candidate.waveform_packet_metrics is not None
+    assert candidate.waveform_packet_metrics.psnr == pytest.approx(
+        expected_packet_metrics.psnr, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_packet_metrics.ssim == pytest.approx(
+        expected_packet_metrics.ssim, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_packet_overlap == pytest.approx(
+        float(expected_packet_overlap), rel=1e-5, abs=1e-5
+    )
+
+    assert candidate.waveform_sample_rate == int(metadata.sample_rate)
+    assert candidate.waveform_segments == int(metadata.segments)
+    assert candidate.waveform_marker_duration == pytest.approx(
+        metadata.marker_duration, rel=1e-6, abs=1e-6
+    )
+    expected_reference_partial = partial_alignment_fraction(reference, sound_clipped)
+    expected_packet_partial = partial_alignment_fraction(reconstruction, sound_clipped)
+    expected_sound_score = audio_fidelity_score(
+        float(expected_reference_overlap),
+        expected_reference_metrics.psnr,
+        expected_reference_metrics.ssim,
+        partial_credit=expected_reference_partial,
+    )
+    assert candidate.waveform_sound_score == pytest.approx(
+        expected_sound_score, rel=1e-5, abs=1e-5
+    )
+    expected_readability = readability_score(
+        float(expected_reference_overlap),
+        expected_reference_metrics.psnr,
+        expected_reference_metrics.ssim,
+    )
+    assert candidate.waveform_readability_score == pytest.approx(
+        expected_readability, rel=1e-5, abs=1e-5
+    )
+    expected_alignment_score = audio_fidelity_score(
+        float(expected_packet_overlap),
+        expected_packet_metrics.psnr,
+        expected_packet_metrics.ssim,
+        partial_credit=expected_packet_partial,
+    )
+    assert candidate.waveform_alignment_score == pytest.approx(
+        expected_alignment_score, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_reference_partial == pytest.approx(
+        expected_reference_partial, rel=1e-5, abs=1e-5
+    )
+    assert candidate.waveform_alignment_partial == pytest.approx(
+        expected_packet_partial, rel=1e-5, abs=1e-5
+    )
+    expected_team_score = team_cohesion_score(
+        float(packet_overlap),
+        packet_metrics.psnr,
+        packet_metrics.ssim,
+        sound_reference_overlap=float(expected_reference_overlap),
+        sound_reference_psnr=expected_reference_metrics.psnr,
+        sound_reference_ssim=expected_reference_metrics.ssim,
+        sound_alignment_overlap=float(expected_packet_overlap),
+        sound_alignment_psnr=expected_packet_metrics.psnr,
+        sound_alignment_ssim=expected_packet_metrics.ssim,
+        sound_reference_partial=expected_reference_partial,
+        sound_alignment_partial=expected_packet_partial,
+        readability=expected_readability,
+    )
+    assert candidate.team_score == pytest.approx(
+        expected_team_score, rel=1e-5, abs=1e-5
+    )
+    expected_ai_score = composite_score(
+        float(packet_overlap), packet_metrics.psnr, packet_metrics.ssim
+    )
+    assert candidate.ai_score == pytest.approx(
+        expected_ai_score, rel=1e-5, abs=1e-5
+    )
+
+
+def test_evolution_falls_back_to_cpu_when_gpu_unavailable(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(gpu_runtime, "cp", None, raising=False)
+    monkeypatch.setattr(reconstruction, "cp", None, raising=False)
+    monkeypatch.setattr(encoding, "cp", None, raising=False)
+    monkeypatch.setattr(decoding, "cp", None, raising=False)
+
+    image = np.zeros((8, 8), dtype=np.float32)
+    manager = EvolutionManager(
+        original=image,
+        encoder=NoiseStreamEncoder(sigma=0.1),
+        decoder=NoiseStreamDecoder(denoise_sigma=None),
+        population_size=1,
+        base_seed=1,
+        autosave_interval=1,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        record = manager.run_generation()
+
+    assert manager._gpu_warning_emitted is True
+    assert record.candidates, "CPU fallback should still evaluate candidates"

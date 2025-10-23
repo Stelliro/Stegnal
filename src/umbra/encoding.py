@@ -29,6 +29,9 @@ else:  # pragma: no cover - GPU specific
 
 from .sound import MessyKeyArtifact, derive_messy_latent
 
+# Backwards compatibility for code paths that relied on the legacy helper name.
+_ensure_gpu_available = require_gpu
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,16 +96,119 @@ def register_waveform_plugin(factory: Callable[[], WaveformPlugin]) -> None:
     _PLUGIN_REGISTRY[plugin.name] = plugin
 
 
-def _simulate_uwb_channel(signal: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
-    taps = 6
-    delays = rng.integers(1, max(2, signal.size // 8), size=taps)
-    gains = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
-    response = np.zeros_like(signal, dtype=np.float32)
-    for gain, delay in zip(gains, delays):
-        response[delay:] += gain * signal[:-delay]
-    faded = 0.6 * signal + response
-    faded = faded / np.max(np.abs(faded) + 1e-6)
-    return faded.astype(np.float32), gains.astype(np.float32)
+
+
+def _simulate_uwb_channel(
+    signal: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    allow_cpu_fallback: bool,
+    prefer_gpu: bool = False,
+    return_backend: bool = False,
+    hybrid_memory: bool = True,
+) -> tuple[Any, Any]:
+    """Apply a simple UWB channel model, optionally returning GPU buffers.
+
+    When ``prefer_gpu`` is ``True`` and CuPy is available, the channel simulation
+    is executed on the GPU. If ``return_backend`` is also ``True`` the resulting
+    waveform and channel response are returned as CuPy arrays so callers can keep
+    subsequent work on the accelerator. Otherwise the results are converted back
+    to NumPy to avoid unexpected device transfers.
+    """
+
+    def _simulate_with_backend(
+        backend: Any,
+        *,
+        keep_backend: bool,
+    ) -> tuple[Any, Any]:
+        xp = backend
+        if xp is np:
+            signal_backend = np.asarray(signal, dtype=np.float32)
+        else:
+            try:
+                signal_backend = xp.asarray(signal, dtype=xp.float32)
+            except Exception as exc:  # pragma: no cover - diagnostic fallback
+                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                    raise
+                hybrid_signal = allocate_pinned_array(signal.shape, np.float32)
+                hybrid_signal[...] = np.asarray(signal, dtype=np.float32)
+                signal_backend = hybrid_signal
+
+        taps = 6
+        max_delay = max(2, int(signal_backend.size // 8) or 2)
+        delays = rng.integers(1, max_delay, size=taps)
+        gains_cpu = rng.rayleigh(scale=0.6, size=taps).astype(np.float32)
+        if xp is np:
+            gains_backend = gains_cpu
+        else:
+            try:
+                gains_backend = xp.asarray(gains_cpu, dtype=xp.float32)
+            except Exception as exc:  # pragma: no cover - diagnostic fallback
+                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                    raise
+                hybrid_gains = allocate_pinned_array(gains_cpu.shape, np.float32)
+                hybrid_gains[...] = gains_cpu
+                gains_backend = hybrid_gains
+
+        if xp is np:
+            response = np.zeros_like(signal_backend, dtype=np.float32)
+        else:
+            try:
+                response = xp.zeros_like(signal_backend, dtype=xp.float32)
+            except Exception as exc:  # pragma: no cover - diagnostic fallback
+                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                    raise
+                response = allocate_pinned_array(signal_backend.shape, np.float32)
+                response.fill(0)
+        for gain, delay in zip(gains_backend, delays):
+            response[delay:] += gain * signal_backend[:-delay]
+
+        faded = 0.6 * signal_backend + response
+        faded = faded / xp.max(xp.abs(faded) + 1e-6)
+
+        if xp is np or not keep_backend:
+            faded_np = (
+                faded.astype(np.float32, copy=False)
+                if xp is np
+                else cp.asnumpy(faded).astype(np.float32, copy=False)
+            )
+            gains_np = (
+                gains_backend.astype(np.float32, copy=False)
+                if xp is np
+                else cp.asnumpy(gains_backend).astype(np.float32, copy=False)
+            )
+            return faded_np, gains_np
+
+        return (
+            faded.astype(xp.float32, copy=False),
+            gains_backend.astype(xp.float32, copy=False),
+        )
+
+    if not allow_cpu_fallback and cp is None:
+        raise GPUAccelerationRequiredError(
+            "GPU acceleration via CuPy is required for UWB channel simulation; CPU fallback is disabled."
+        )
+
+    prefer_gpu = (prefer_gpu or not allow_cpu_fallback) and cp is not None
+
+    if prefer_gpu:
+        try:
+            require_gpu("UWB channel simulation")
+        except GPUAccelerationRequiredError:
+            if not allow_cpu_fallback:
+                raise
+        else:
+            try:
+                return _simulate_with_backend(cp, keep_backend=return_backend)  # type: ignore[arg-type]
+            except Exception as exc:  # pragma: no cover - exercised via integration tests
+                if not allow_cpu_fallback:
+                    raise GPUAccelerationRequiredError(
+                        "GPU acceleration failed while simulating the UWB channel. "
+                        "Ensure the CUDA runtime (including nvrtc) is installed or enable CPU fallback."
+                    ) from exc
+
+    # CPU fallback or preferred execution.
+    return _simulate_with_backend(np, keep_backend=False)
 
 
 @dataclass
@@ -116,6 +222,7 @@ class NoisePacket:
     messy_latent: np.ndarray | None = None
     channel_response: np.ndarray | None = None
     waveform_plugin: str | None = None
+    encoded_backend: Any | None = None
 
     def to_file(self, path: str | Path) -> None:
         """Serialize the packet to disk using NumPy."""
@@ -157,6 +264,7 @@ class NoisePacket:
                 channel_response.astype(np.float32) if channel_response is not None else None
             ),
             waveform_plugin=plugin_name,
+            encoded_backend=None,
         )
 
 
@@ -203,11 +311,19 @@ class NoiseStreamEncoder:
             seed,
         )
         rng = np.random.default_rng(seed)
-        flat = np.asarray(image, dtype=np.float32).reshape(-1)
         plugin = _PLUGIN_REGISTRY[self.waveform]
         plugin_rng = np.random.default_rng(seed ^ 0x5F5A1)
+        flat = np.asarray(image, dtype=np.float32).reshape(-1)
         waveform, messy_artifact = plugin.generate(flat, plugin_rng)
-        uwb_waveform, channel = _simulate_uwb_channel(waveform, plugin_rng)
+        prefer_gpu = cp is not None
+        uwb_waveform_backend, channel_backend = _simulate_uwb_channel(
+            waveform,
+            plugin_rng,
+            allow_cpu_fallback=allow_cpu_fallback,
+            prefer_gpu=prefer_gpu,
+            return_backend=True,
+        )
+
         permutation = rng.permutation(flat.size)
         permuted = flat[permutation]
         noise = rng.normal(0.0, self.sigma, size=permuted.shape)
@@ -263,6 +379,7 @@ class NoiseStreamEncoder:
             messy_latent=latent,
             channel_response=channel,
             waveform_plugin=plugin.name,
+            encoded_backend=encoded_backend,
         )
 
     def encode_from_path(

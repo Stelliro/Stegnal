@@ -29,6 +29,9 @@ dev = [
     "mypy>=1.10",
     "types-Pillow",
 ]
+gpu = [
+    "cupy-cuda12x",
+]
 
 [project.scripts]
 umbra = "umbra.cli:main"
