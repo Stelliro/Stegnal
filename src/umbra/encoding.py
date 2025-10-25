@@ -1,5 +1,4 @@
 """Noise-stream encoder for the Project Umbra test build."""
-
 from __future__ import annotations
 
 import logging
@@ -11,7 +10,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from umbra.gpu_runtime import allocate_pinned_array, GPUAccelerationRequiredError, require_gpu
+from umbra.gpu_runtime import GPUAccelerationRequiredError, allocate_pinned_array, require_gpu
 
 try:  # pragma: no cover - exercised indirectly in GPU environments
     import cupy as cp  # type: ignore
@@ -124,13 +123,14 @@ def _simulate_uwb_channel(
         keep_backend: bool,
     ) -> tuple[Any, Any]:
         xp = backend
+        xp_float32 = getattr(xp, "float32", np.float32)
         if xp is np:
             signal_backend = np.asarray(signal, dtype=np.float32)
         else:
             try:
-                signal_backend = xp.asarray(signal, dtype=xp.float32)
+                signal_backend = xp.asarray(signal, dtype=xp_float32)
             except Exception as exc:  # pragma: no cover - diagnostic fallback
-                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                if (not hybrid_memory or not allow_cpu_fallback) or not is_cupy_out_of_memory_error(exc):
                     raise
                 hybrid_signal = allocate_pinned_array(signal.shape, np.float32)
                 hybrid_signal[...] = np.asarray(signal, dtype=np.float32)
@@ -144,9 +144,9 @@ def _simulate_uwb_channel(
             gains_backend = gains_cpu
         else:
             try:
-                gains_backend = xp.asarray(gains_cpu, dtype=xp.float32)
+                gains_backend = xp.asarray(gains_cpu, dtype=xp_float32)
             except Exception as exc:  # pragma: no cover - diagnostic fallback
-                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                if (not hybrid_memory or not allow_cpu_fallback) or not is_cupy_out_of_memory_error(exc):
                     raise
                 hybrid_gains = allocate_pinned_array(gains_cpu.shape, np.float32)
                 hybrid_gains[...] = gains_cpu
@@ -156,9 +156,9 @@ def _simulate_uwb_channel(
             response = np.zeros_like(signal_backend, dtype=np.float32)
         else:
             try:
-                response = xp.zeros_like(signal_backend, dtype=xp.float32)
+                response = xp.zeros_like(signal_backend, dtype=xp_float32)
             except Exception as exc:  # pragma: no cover - diagnostic fallback
-                if not hybrid_memory or not is_cupy_out_of_memory_error(exc):
+                if (not hybrid_memory or not allow_cpu_fallback) or not is_cupy_out_of_memory_error(exc):
                     raise
                 response = allocate_pinned_array(signal_backend.shape, np.float32)
                 response.fill(0)
@@ -182,8 +182,8 @@ def _simulate_uwb_channel(
             return faded_np, gains_np
 
         return (
-            faded.astype(xp.float32, copy=False),
-            gains_backend.astype(xp.float32, copy=False),
+            faded.astype(xp_float32, copy=False),
+            gains_backend.astype(xp_float32, copy=False),
         )
 
     if not allow_cpu_fallback and cp is None:
@@ -204,6 +204,8 @@ def _simulate_uwb_channel(
                 return _simulate_with_backend(cp, keep_backend=return_backend)  # type: ignore[arg-type]
             except Exception as exc:  # pragma: no cover - exercised via integration tests
                 if not allow_cpu_fallback:
+                    if isinstance(exc, CuPyOutOfMemoryError) or is_cupy_out_of_memory_error(exc):
+                        raise
                     raise GPUAccelerationRequiredError(
                         "GPU acceleration failed while simulating the UWB channel. "
                         "Ensure the CUDA runtime (including nvrtc) is installed or enable CPU fallback."
@@ -329,6 +331,32 @@ class NoiseStreamEncoder:
         permutation = rng.permutation(flat.size)
         permuted = flat[permutation]
         noise = rng.normal(0.0, self.sigma, size=permuted.shape)
+
+        channel: np.ndarray | None
+        encoded_backend: dict[str, Any] | None
+        cp_array_type: tuple[type[Any], ...] = ()
+        if cp is not None:
+            ndarray_type = getattr(cp, "ndarray", None)
+            if ndarray_type is not None:
+                cp_array_type = (ndarray_type,)
+        using_gpu_backend = bool(cp_array_type) and isinstance(uwb_waveform_backend, cp_array_type)
+
+        if using_gpu_backend:
+            uwb_waveform = cp.asnumpy(uwb_waveform_backend).astype(np.float32, copy=False)
+            channel = cp.asnumpy(channel_backend).astype(np.float32, copy=False)
+            encoded_backend = {
+                "uwb_waveform": uwb_waveform_backend,
+                "channel_response": channel_backend,
+            }
+        else:
+            uwb_waveform = np.asarray(uwb_waveform_backend, dtype=np.float32)
+            channel = (
+                None
+                if channel_backend is None
+                else np.asarray(channel_backend, dtype=np.float32)
+            )
+            encoded_backend = None
+
         uwb_waveform = uwb_waveform[: permuted.size]
         use_gpu = cp is not None if use_gpu is None else bool(use_gpu and cp is not None)
         flat_gpu = permutation_gpu = noise_gpu = uwb_gpu = None

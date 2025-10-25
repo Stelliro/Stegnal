@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover - optional dependency
     cupy_gaussian_filter = None
 
 from .encoding import NoisePacket
-from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
+from .gpu_runtime import cp
 
 
 class DiffusionInpainter:
