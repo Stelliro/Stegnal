@@ -1,3 +1,5 @@
+# reconstruction.py
+
 """Noise-to-image reconstruction helpers for experimental workflows."""
 
 from __future__ import annotations
@@ -35,8 +37,6 @@ _MARKER_STEP_FREQUENCY = 220.0
 _MARKER_RATIO_BAND = 180.0
 _SEGMENT_RATIO_MIN = 0.05
 _GPU_MIN_FFT_SAMPLES = 65_536
-
-
 
 
 def suggest_sample_rate(image: np.ndarray) -> int:
@@ -108,136 +108,71 @@ def _draw_filled_polygon(
     if poly.size == 0:
         return
 
-    min_y = max(int(np.floor(poly[:, 0].min())), 0)
-    max_y = min(int(np.ceil(poly[:, 0].max())), rows - 1)
-    min_x = max(int(np.floor(poly[:, 1].min())), 0)
-    max_x = min(int(np.ceil(poly[:, 1].max())), cols - 1)
+    min_y = max(int(np.floor(poly[:, 1].min())), 0)
+    max_y = min(int(np.ceil(poly[:, 1].max())), rows - 1)
+    min_x = max(int(np.floor(poly[:, 0].min())), 0)
+    max_x = min(int(np.ceil(poly[:, 0].max())), cols - 1)
 
     if min_y > max_y or min_x > max_x:
         return
 
     y_coords = np.arange(min_y, max_y + 1)
     x_coords = np.arange(min_x, max_x + 1)
-    yy = y_coords[:, None].astype(np.float32) + 0.5
-    xx = x_coords[None, :].astype(np.float32) + 0.5
+    yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
 
-    inside = np.zeros((y_coords.size, x_coords.size), dtype=bool)
-    y_vertices = poly[:, 0]
-    x_vertices = poly[:, 1]
-    count = len(poly)
+    # Inside polygon check (ray casting)
+    inside = np.zeros((len(y_coords), len(x_coords)), dtype=bool)
+    for i in range(poly.shape[0]):
+        j = (i + 1) % poly.shape[0]
+        x1, y1 = poly[i]
+        x2, y2 = poly[j]
+        cond1 = ((yy >= y1) != (yy >= y2))
+        cond2 = (xx < x1 + ((yy - y1) / (y2 - y1 + 1e-6)) * (x2 - x1))
+        inside = np.logical_xor(inside, cond1 & cond2)
 
-    for idx in range(count):
-        nxt = (idx + 1) % count
-        y0, y1 = y_vertices[idx], y_vertices[nxt]
-        x0, x1 = x_vertices[idx], x_vertices[nxt]
-
-        if np.isclose(y0, y1):
-            continue
-
-        intersects = (y0 > yy) != (y1 > yy)
-        x_intersect = (x1 - x0) * (yy - y0) / (y1 - y0) + x0
-        inside ^= intersects & (xx < x_intersect)
-
-    subregion = canvas[min_y : max_y + 1, min_x : max_x + 1]
-    subregion[inside] = np.maximum(subregion[inside], color)
-    canvas[min_y : max_y + 1, min_x : max_x + 1] = subregion
+    canvas[yy[inside], xx[inside]] = np.maximum(canvas[yy[inside], xx[inside]], color)
 
 
-def _rotate_offsets(points: np.ndarray, angle: float) -> np.ndarray:
-    rotation = np.array(
-        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
-        dtype=np.float32,
-    )
-    return points @ rotation.T
+def _rotate_offsets(offsets: np.ndarray, angle: float) -> np.ndarray:
+    rad = np.deg2rad(angle)
+    cos, sin = np.cos(rad), np.sin(rad)
+    rotation = np.array([[cos, -sin], [sin, cos]])
+    return np.dot(offsets, rotation)
 
 
 def generate_shape_collage(
-    seed: int,
-    *,
-    resolution: tuple[int, int] = (192, 192),
-    shape_count: int | None = None,
+    seed: int, *, resolution: tuple[int, int] = (192, 192), shape_count: int = 3
 ) -> tuple[np.ndarray, tuple[GeneratedShape, ...]]:
-    """Create a colour image composed of multiple geometric primitives.
+    """Generate a collage of random shapes on a canvas."""
 
-    Each collage contains between three and fifteen shapes (inclusive) unless
-    ``shape_count`` is provided explicitly.
-    """
-
-    rows, cols = resolution
-    canvas = np.zeros((rows, cols, 3), dtype=np.float32)
     rng = np.random.default_rng(seed)
-    count = int(shape_count or rng.integers(3, 16))
-    count = int(np.clip(count, 3, 15))
+    canvas = np.zeros(resolution + (3,), dtype=np.float32)
+    shapes = []
 
-    min_extent = max(min(rows, cols) // 9, 12)
-    max_extent = max(min(rows, cols) // 3, min_extent + 6)
-    padding = int(np.ceil(max_extent * 0.75))
+    prototypes = {
+        "circle": lambda size: np.array([[0, 0]]),  # Placeholder, uses circle func
+        "square": lambda size: np.array([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]) * size,
+        "triangle": lambda size: np.array([[0, -0.577], [-0.5, 0.289], [0.5, 0.289]]) * size,
+    }
 
-    shapes: list[GeneratedShape] = []
-    shape_types = ("circle", "square", "triangle", "diamond")
+    for _ in range(shape_count):
+        shape_type = rng.choice(list(prototypes.keys()))
+        color = rng.uniform(0.2, 0.8, size=3)
+        size = int(rng.uniform(20, min(resolution) / 2))
+        center = tuple(rng.integers(size // 2, dim - size // 2) for dim in resolution)
+        rotation = float(rng.uniform(0, 360))
 
-    for _ in range(count):
-        extent = int(rng.integers(min_extent, max_extent + 1))
-        cy = int(rng.integers(padding, rows - padding)) if rows > 2 * padding else rows // 2
-        cx = int(rng.integers(padding, cols - padding)) if cols > 2 * padding else cols // 2
-        center = (cy, cx)
-        shape = str(rng.choice(shape_types))
-        rotation = float(rng.uniform(0, 2 * np.pi)) if shape != "circle" else 0.0
-        color = rng.uniform(0.25, 1.0, size=3).astype(np.float32)
-
-        if shape == "circle":
-            _draw_filled_circle(canvas, center, extent, color)
+        if shape_type == "circle":
+            _draw_filled_circle(canvas, center, size // 2, color)
         else:
-            if shape == "square":
-                half = float(extent)
-                base = np.array(
-                    [
-                        [-half, -half],
-                        [half, -half],
-                        [half, half],
-                        [-half, half],
-                    ],
-                    dtype=np.float32,
-                )
-            elif shape == "triangle":
-                height = float(extent)
-                base = np.array(
-                    [
-                        [0.0, -height],
-                        [height, height],
-                        [-height, height],
-                    ],
-                    dtype=np.float32,
-                )
-            else:  # diamond
-                radius = float(extent)
-                base = np.array(
-                    [
-                        [0.0, -radius],
-                        [radius, 0.0],
-                        [0.0, radius],
-                        [-radius, 0.0],
-                    ],
-                    dtype=np.float32,
-                )
+            offsets = prototypes[shape_type](size)
+            rotated = _rotate_offsets(offsets, rotation)
+            vertices = rotated + np.array(center)
+            _draw_filled_polygon(canvas, vertices, color)
 
-            rotated = _rotate_offsets(base, rotation)
-            vertices = [(center[0] + pt[1], center[1] + pt[0]) for pt in rotated]
-            _draw_filled_polygon(canvas, np.asarray(vertices, dtype=np.float32), color)
+        shapes.append(GeneratedShape(color=tuple(color), shape=shape_type, center=center, rotation=rotation, size=size))
 
-        shapes.append(
-            GeneratedShape(
-                color=(float(color[0]), float(color[1]), float(color[2])),
-                shape=shape,
-                center=center,
-                rotation=np.degrees(rotation),
-                size=extent,
-            )
-        )
-
-    collage = np.clip(canvas, 0.0, 1.0)
-    logger.debug("Generated collage with %d shapes", len(shapes))
-    return collage, tuple(shapes)
+    return np.clip(canvas, 0.0, 1.0), tuple(shapes)
 
 
 def create_variations(
@@ -248,809 +183,116 @@ def create_variations(
     dropout_probability: float = 0.35,
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
-    """Create multiple noisy glimpses of ``image`` by masking and corrupting pixels."""
+    """Create corrupted variations of ``image`` for ensemble prediction."""
 
-    if variation_count <= 0:
-        raise ValueError("variation_count must be positive")
+    if rng is None:
+        rng = np.random.default_rng()
 
-    base = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
-    generator = rng or np.random.default_rng()
-    variations: list[np.ndarray] = []
+    array = np.asarray(image, dtype=np.float32)
+    variations = np.empty((variation_count,) + array.shape, dtype=np.float32)
 
-    for _ in range(int(variation_count)):
-        dropout_mask = generator.random(base.shape[:2], dtype=np.float32) > dropout_probability
-        dropout_mask = dropout_mask[..., None]
-        noise = generator.normal(0.0, noise_sigma, size=base.shape).astype(np.float32)
-        jittered = np.clip(base + noise, 0.0, 1.0)
-        filler = generator.random(base.shape, dtype=np.float32) * 0.35
-        variant = np.where(dropout_mask, jittered, filler)
-        variations.append(np.clip(variant, 0.0, 1.0))
+    for idx in range(variation_count):
+        noise = rng.normal(0.0, noise_sigma, size=array.shape).astype(np.float32)
+        noisy = array + noise
+        mask = rng.random(size=array.shape) < dropout_probability
+        noisy[mask] = 0.0
+        variations[idx] = np.clip(noisy, 0.0, 1.0)
 
-    stacked = np.stack(variations, axis=0)
-    logger.debug("Created %d noisy variations", stacked.shape[0])
-    return stacked
+    return variations
 
 
 def predict_missing_pixels(variations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate the underlying image and coverage map from ``variations``."""
+    """Predict an ensemble image and coverage map from ``variations``."""
 
-    stack = np.asarray(variations, dtype=np.float32)
-    if stack.ndim != 4 or stack.shape[-1] != 3:
-        raise ValueError("Expected variations with shape (n, h, w, 3)")
-    coverage = np.mean(stack > 0.05, axis=0)
-    if coverage.ndim == 3:
-        coverage = coverage.mean(axis=2)
-    ensemble = np.median(stack, axis=0)
-    ensemble = np.clip(ensemble, 0.0, 1.0)
+    if variations.ndim != 4:
+        raise ValueError("Variations must be 4D (N, H, W, C)")
+
+    valid_mask = variations > 0.0
+    count = np.sum(valid_mask, axis=0)
+    ensemble = np.sum(variations, axis=0) / np.maximum(count, 1)
+    coverage = count / variations.shape[0]
+
     return ensemble.astype(np.float32), coverage.astype(np.float32)
 
 
-def tiled_reconstruction(
-    decoder: NoiseStreamDecoder,
-    packet: NoisePacket,
-    seed: int,
-    *,
-    tile_size: tuple[int, int] = (256, 256),
-) -> np.ndarray:
-    """Decode ``packet`` using tiles to limit peak memory usage."""
-
-    decoded_full = decoder.decode(packet, seed)
-    single_channel = decoded_full.ndim == 2 or (
-        decoded_full.ndim == 3 and decoded_full.shape[2] == 1
-    )
-    if decoded_full.ndim == 2:
-        decoded_full = decoded_full[:, :, None]
-    height, width = decoded_full.shape[:2]
-    tile_h, tile_w = tile_size
-    assembled = np.zeros_like(decoded_full)
-    for y in range(0, height, tile_h):
-        for x in range(0, width, tile_w):
-            tile = decoded_full[y : y + tile_h, x : x + tile_w]
-            assembled[y : y + tile.shape[0], x : x + tile.shape[1]] = tile
-    if single_channel:
-        return assembled[:, :, 0]
-    return assembled
-
-
-def _as_backend(array: Any, xp: Any) -> Any:
-    """Return ``array`` as an ``xp`` ndarray with float32 dtype."""
-
-    if xp is cp:
-        try:
-            return cp.asarray(array, dtype=cp.float32)
-        except Exception as exc:  # pragma: no cover - diagnostic fallback
-            if not is_cupy_out_of_memory_error(exc):
-                raise
-            hybrid = allocate_pinned_array(np.shape(array), np.float32)
-            hybrid[...] = np.asarray(array, dtype=np.float32)
-            return hybrid
-    return np.asarray(array, dtype=np.float32)
-
-
-def _to_numpy(array: Any) -> np.ndarray:
-    """Convert ``array`` to a NumPy float32 array."""
-
-    if cp is not None and isinstance(array, cp.ndarray):  # pragma: no cover - runtime guard
-        return cp.asnumpy(array.astype(cp.float32, copy=False))
-    return np.asarray(array, dtype=np.float32)
-
-
-def _fft_magnitude(
-    samples: np.ndarray,
-    n: int,
-    *,
-    advanced_logging: bool,
-    allow_cpu_fallback: bool,
-) -> np.ndarray:
-    """Return ``|rfft(samples)|`` preferring a GPU backend when available."""
-
-    array = np.asarray(samples, dtype=np.float32)
-    if array.size == 0 or n <= 0:
-        return np.zeros(0, dtype=np.float32)
-
-    backends: tuple[Any, ...]
-    if cp is None:
-        if allow_cpu_fallback:
-            backends = (np,)
-        else:
-            raise GPUAccelerationRequiredError(
-                "GPU acceleration via CuPy is required for FFT magnitude computation; CPU fallback is disabled."
-            )
-    else:
-        if not allow_cpu_fallback or array.size >= _GPU_MIN_FFT_SAMPLES:
-            try:
-                require_gpu("FFT magnitude computation")
-            except GPUAccelerationRequiredError:
-                if not allow_cpu_fallback:
-                    raise
-                backends = (np,)
-            else:
-                backends = (cp,) if not allow_cpu_fallback else (cp, np)
-        else:
-            backends = (np,)
-
-    last_error: Exception | None = None
-    for backend in backends:
-        try:
-            backend_array = backend.asarray(array, dtype=backend.float32)
-            spectrum = backend.fft.rfft(backend_array, n=n)
-            magnitude = backend.abs(spectrum)
-            if backend is cp and advanced_logging:
-                logger.debug(
-                    "Computed FFT magnitude on GPU backend: samples=%d n=%d",
-                    array.size,
-                    n,
-                )
-            return _to_numpy(magnitude).astype(np.float32, copy=False)
-        except Exception as exc:  # pragma: no cover - diagnostic fallback
-            last_error = exc
-            if backend is cp:
-                logger.debug("Falling back to NumPy FFT magnitude: %s", exc)
-                continue
-            raise
-
-    assert last_error is not None  # pragma: no cover - defensive
-    raise last_error
-
-
-def _encode_stripe_waveform(
-    stripe: np.ndarray,
-    *,
-    sample_count: int,
-    allow_cpu_fallback: bool,
-) -> np.ndarray:
-    """Encode an image stripe into ``sample_count`` audio samples."""
-
-    if sample_count <= 0:
-        return np.zeros(0, dtype=np.float32)
-
-    backends: tuple[Any, ...]
-    if cp is None:
-        if allow_cpu_fallback:
-            backends = (np,)
-        else:
-            raise GPUAccelerationRequiredError(
-                "GPU acceleration via CuPy is required for waveform stripe encoding; CPU fallback is disabled."
-            )
-    else:
-        if not allow_cpu_fallback:
-            require_gpu("waveform stripe encoding")
-            backends = (cp,)
-        else:
-            try:
-                require_gpu("waveform stripe encoding")
-            except GPUAccelerationRequiredError:
-                backends = (np,)
-            else:
-                backends = (cp, np)
-
-    last_error: Exception | None = None
-    for xp in backends:
-        try:
-            weights = _as_backend([0.5, 0.35, 0.15], xp)
-            intensities = _as_backend(stripe, xp)[..., :3] @ weights
-            intensities = intensities.reshape(-1)
-            if intensities.size == 0:
-                return np.zeros(sample_count, dtype=np.float32)
-
-            intensities -= intensities.min()
-            max_val = float(xp.max(intensities))
-            if max_val > 0:
-                intensities /= max_val
-
-            bins = sample_count // 2 + 1
-            xp_lin = xp.linspace(
-                0.0,
-                max(float(intensities.size - 1), 0.0),
-                bins,
-                dtype=xp.float32,
-            )
-            xp_idx = xp.arange(intensities.size, dtype=xp.float32)
-            spectrum = xp.interp(xp_lin, xp_idx, intensities)
-            waveform = xp.fft.irfft(spectrum, n=sample_count)
-            if waveform.size < sample_count:
-                waveform = xp.pad(waveform, (0, sample_count - waveform.size))
-            peak = float(xp.max(xp.abs(waveform)))
-            if peak > 0:
-                waveform /= peak
-            return _to_numpy(waveform)
-        except Exception as exc:  # pragma: no cover - backend fallback
-            last_error = exc
-            if xp is cp:
-                logger.debug(
-                    "Falling back to NumPy for stripe waveform encoding: %s", exc
-                )
-                continue
-            raise
-
-    assert last_error is not None  # pragma: no cover - defensive
-    raise last_error
-
-
-def segment_image_rows(
-    image: np.ndarray, segments: int, *, minimum_rows: int = 8
-) -> list[tuple[int, int, float]]:
-    """Return adaptive row ranges for ``image`` split into ``segments`` parts."""
+def image_to_waveform(image: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Convert ``image`` to a fax-style waveform with markers."""
 
     array = np.asarray(image, dtype=np.float32)
-    if array.ndim != 3:
-        raise ValueError("segment_image_rows expects an RGB image")
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("Expected RGB image")
 
-    total_rows = int(array.shape[0])
-    if total_rows <= 0:
-        raise ValueError("image must contain at least one row")
+    height, width = array.shape[:2]
+    flat = array.mean(axis=2).reshape(-1)
 
-    safe_segments = max(1, int(segments))
-    if safe_segments == 1:
-        return [(0, total_rows, 1.0)]
+    t = np.linspace(0, height / sample_rate, height, endpoint=False)
+    waveform = np.sin(2 * np.pi * 1200 * t) * flat
 
-    gray = np.mean(array[..., :3], axis=2, dtype=np.float32)
-    diffs = np.abs(np.diff(gray, axis=0))
-    if diffs.size == 0:
-        stripe_height = int(np.ceil(total_rows / safe_segments))
-        slices: list[tuple[int, int, float]] = []
-        for idx in range(safe_segments):
-            start = min(idx * stripe_height, max(total_rows - 1, 0))
-            end = min(start + stripe_height, total_rows)
-            if idx == safe_segments - 1:
-                end = total_rows
-            height = max(end - start, 1)
-            slices.append((start, end, height / float(total_rows)))
-        return slices
+    return np.clip(waveform, -1.0, 1.0).astype(np.float32)
 
-    energy = diffs.mean(axis=1)
-    energy = np.where(np.isfinite(energy), energy, 0.0)
-    energy = np.maximum(energy, 1e-6)
-    cumulative = np.cumsum(energy)
-    total_energy = float(cumulative[-1])
-    if total_energy <= 0:
-        total_energy = float(total_rows)
-        cumulative = np.arange(1, total_rows, dtype=np.float32)
 
-    boundaries: list[int] = []
-    for idx in range(1, safe_segments):
-        target = total_energy * (idx / safe_segments)
-        boundary = int(np.searchsorted(cumulative, target, side="left")) + 1
-        boundaries.append(boundary)
+def segment_image_rows(image: np.ndarray, num_segments: int) -> list[slice]:
+    """Divide ``image`` rows into ``num_segments`` for tiled reconstruction."""
 
-    min_rows = max(int(minimum_rows), 1)
-    adjusted: list[int] = []
-    last = 0
-    for boundary in boundaries:
-        boundary = max(boundary, last + min_rows)
-        if boundary >= total_rows - min_rows:
-            break
-        adjusted.append(boundary)
-        last = boundary
-
-    adjusted = sorted(set(adjusted))
-    if len(adjusted) < safe_segments - 1:
-        stripe_height = int(np.ceil(total_rows / safe_segments))
-        while len(adjusted) < safe_segments - 1:
-            candidate = (len(adjusted) + 1) * stripe_height
-            if candidate >= total_rows - min_rows:
-                break
-            adjusted.append(candidate)
-        adjusted = sorted(set(adjusted))
-
+    height = image.shape[0]
+    segment_size = height // num_segments
+    remainder = height % num_segments
+    segments = []
     start = 0
-    slices: list[tuple[int, int, float]] = []
-    for boundary in adjusted:
-        end = min(boundary, total_rows)
-        height = max(end - start, min_rows)
-        if end - start < min_rows and end < total_rows:
-            end = min(total_rows, start + min_rows)
-        height = max(end - start, 1)
-        slices.append((start, end, height / float(total_rows)))
+    for i in range(num_segments):
+        end = start + segment_size + (1 if i < remainder else 0)
+        segments.append(slice(start, end))
         start = end
-
-    if start < total_rows:
-        height = max(total_rows - start, 1)
-        slices.append((start, total_rows, height / float(total_rows)))
-
-    if len(slices) > safe_segments:
-        slices = slices[: safe_segments - 1] + [(slices[-1][0], total_rows, 1.0)]
-
-    while len(slices) < safe_segments:
-        slices.append((slices[-1][0], total_rows, (total_rows - slices[-1][0]) / float(total_rows)))
-
-    ratio_total = sum(max(segment[2], _SEGMENT_RATIO_MIN) for segment in slices)
-    if ratio_total <= 0:
-        ratio_total = float(len(slices))
-
-    normalised: list[tuple[int, int, float]] = []
-    cursor = 0
-    for idx, (start_row, end_row, ratio) in enumerate(slices):
-        start_row = max(start_row, cursor)
-        if idx == safe_segments - 1:
-            end_row = total_rows
-        else:
-            end_row = min(max(end_row, start_row + min_rows), total_rows)
-        if end_row <= start_row:
-            end_row = min(total_rows, start_row + min_rows)
-        cursor = end_row
-        height = max(end_row - start_row, 1)
-        clamped = max(float(ratio), _SEGMENT_RATIO_MIN)
-        normalised.append((start_row, end_row, clamped / ratio_total))
-
-    if normalised[-1][1] != total_rows:
-        start_row, _end_row, ratio = normalised[-1]
-        normalised[-1] = (start_row, total_rows, max(total_rows - start_row, 1) / float(total_rows))
-
-    return normalised[:safe_segments]
+    return segments
 
 
-def _marker_tone(
-    *,
-    sample_rate: int,
-    marker_samples: int,
-    index: int,
-    segment_ratio: float | None = None,
-) -> np.ndarray:
-    """Return a short sinusoidal marker identifying ``index``."""
+def tiled_reconstruction(waveform: np.ndarray, resolution: tuple[int, int], sample_rate: int) -> np.ndarray:
+    """Reconstruct large waveforms in tiles to avoid OOM."""
 
-    if marker_samples <= 0:
-        return np.zeros(0, dtype=np.float32)
+    if waveform.size < _GPU_MIN_FFT_SAMPLES or cp is None:
+        return reconstruct_from_waveform(waveform, resolution, sample_rate)  # Fallback to full
 
-    frequency = _MARKER_BASE_FREQUENCY + index * _MARKER_STEP_FREQUENCY
-    if segment_ratio is not None:
-        encoded = float(np.clip(segment_ratio, _SEGMENT_RATIO_MIN, 1.0))
-        frequency += encoded * _MARKER_RATIO_BAND
+    require_gpu("tiled FFT reconstruction")
 
-    frequency = max(frequency, 80.0)
-    t = np.linspace(0.0, marker_samples / sample_rate, marker_samples, endpoint=False)
-    envelope = np.linspace(0.2, 1.0, marker_samples, dtype=np.float32)
-    tone = np.sin(2 * np.pi * frequency * t)
-    tone = tone.astype(np.float32) * envelope
-    return tone
+    num_tiles = max(1, int(np.ceil(waveform.size / _GPU_MIN_FFT_SAMPLES)))
+    tile_size = waveform.size // num_tiles
+    reconstructed = np.zeros(resolution + (3,), dtype=np.float32)
 
+    for i in range(num_tiles):
+        start = i * tile_size
+        end = start + tile_size if i < num_tiles - 1 else waveform.size
+        tile_wave = waveform[start:end]
+        tile_res = (resolution[0] // num_tiles, resolution[1])
+        tile_recon = reconstruct_from_waveform(tile_wave, tile_res, sample_rate)
+        row_start = i * tile_res[0]
+        row_end = row_start + tile_recon.shape[0]
+        reconstructed[row_start:row_end] = tile_recon
 
-def _estimate_marker_ratio(
-    marker: np.ndarray,
-    *,
-    index: int,
-    sample_rate: int,
-    allow_cpu_fallback: bool,
-) -> float:
-    """Return the encoded segment ratio from ``marker`` if present."""
-
-    samples = np.asarray(marker, dtype=np.float32)
-    if samples.size <= 1:
-        return float("nan")
-
-    spectrum = _fft_magnitude(
-        samples,
-        samples.size,
-        advanced_logging=False,
-        allow_cpu_fallback=allow_cpu_fallback,
-    )
-    if spectrum.size <= 1:
-        return float("nan")
-
-    spectrum[0] = 0.0
-    peak_index = int(np.argmax(spectrum))
-    freqs = np.fft.rfftfreq(samples.size, d=1.0 / float(sample_rate))
-    if peak_index >= freqs.size:
-        return float("nan")
-
-    peak_frequency = float(freqs[peak_index])
-    base_frequency = _MARKER_BASE_FREQUENCY + index * _MARKER_STEP_FREQUENCY
-    if _MARKER_RATIO_BAND <= 0:
-        return float("nan")
-    return (peak_frequency - base_frequency) / float(_MARKER_RATIO_BAND)
-
-
-def _normalise_segment_heights(
-    ratios: Sequence[float], *, rows: int, segments: int
-) -> list[int]:
-    """Convert ``ratios`` into integer stripe heights covering ``rows``."""
-
-    if rows <= 0:
-        return [1] * max(int(segments), 1)
-
-    if not ratios:
-        base = max(1, int(np.ceil(rows / max(segments, 1))))
-        return [base for _ in range(max(segments, 1))]
-
-    clamped = [
-        float(np.clip(ratio, _SEGMENT_RATIO_MIN, 1.0))
-        if np.isfinite(ratio)
-        else 1.0
-        for ratio in ratios
-    ]
-    total = sum(clamped)
-    if total <= 0:
-        clamped = [1.0 for _ in clamped]
-        total = float(len(clamped))
-
-    scale = rows / total
-    heights = [max(1, int(round(value * scale))) for value in clamped]
-    if not heights:
-        heights = [max(1, int(np.ceil(rows / max(segments, 1)))) for _ in range(max(segments, 1))]
-
-    diff = rows - sum(heights)
-    if diff != 0:
-        order = sorted(range(len(heights)), key=lambda idx: clamped[idx], reverse=True)
-        while diff > 0:
-            for idx in order:
-                heights[idx] += 1
-                diff -= 1
-                if diff == 0:
-                    break
-        while diff < 0:
-            candidates = [idx for idx in order if heights[idx] > 1]
-            if not candidates:
-                break
-            for idx in candidates:
-                if diff == 0:
-                    break
-                heights[idx] -= 1
-                diff += 1
-
-    if len(heights) < segments:
-        heights.extend([heights[-1] if heights else 1] * (segments - len(heights)))
-
-    return heights[:segments]
-
-
-def _decode_stripe_heights(
-    markers: Sequence[np.ndarray],
-    *,
-    rows: int,
-    sample_rate: int,
-    marker_samples: int,
-    segments: int,
-    allow_cpu_fallback: bool,
-) -> list[int]:
-    """Infer stripe heights from encoded ``markers``."""
-
-    if marker_samples <= 0 or not markers:
-        base = max(1, int(np.ceil(rows / max(segments, 1))))
-        return [base for _ in range(max(segments, 1))]
-
-    ratios = [
-        _estimate_marker_ratio(
-            marker[:marker_samples],
-            index=idx,
-            sample_rate=sample_rate,
-            allow_cpu_fallback=allow_cpu_fallback,
-        )
-        for idx, marker in enumerate(markers)
-    ]
-
-    return _normalise_segment_heights(ratios, rows=rows, segments=max(segments, len(ratios)))
-
-
-def image_to_waveform(
-    image: np.ndarray,
-    *,
-    sample_rate: int = 48_000,
-    segments: int = 1,
-    marker_duration: float = 0.05,
-    allow_cpu_fallback: bool = True,
-) -> np.ndarray:
-    """Encode ``image`` into a mono waveform using spectral weighting.
-
-    When ``segments`` is greater than one a fax-style transmission is produced
-    where each stripe of the image is emitted as its own block separated by a
-    short audible marker tone. The markers help the decoder realign segments
-    when reconstructing the image from an extended audio clip.
-    """
-
-    if sample_rate <= 0:
-        raise ValueError("sample_rate must be positive")
-
-    array = np.asarray(image, dtype=np.float32)
-    if array.ndim != 3 or array.shape[2] < 3:
-        raise ValueError("Expected an RGB image for conversion to waveform")
-
-    safe_segments = max(1, int(segments))
-    marker_seconds = float(max(0.0, marker_duration))
-    marker_samples = max(int(round(marker_seconds * sample_rate)), 0)
-    payload_samples = max(sample_rate, 1)
-    segment_length = marker_samples + payload_samples
-
-    max_total_samples = int(max(_MAX_FAX_DURATION_SECONDS * sample_rate, sample_rate))
-    if safe_segments > 1:
-        max_segments = max(1, max_total_samples // max(segment_length, 1))
-        if safe_segments > max_segments:
-            logger.warning(
-                "Truncating fax transmission from %d to %d segments to respect the %.1f s cap",
-                safe_segments,
-                max_segments,
-                _MAX_FAX_DURATION_SECONDS,
-            )
-            safe_segments = max_segments
-
-    if safe_segments == 1:
-        waveform = _encode_stripe_waveform(
-            array,
-            sample_count=sample_rate,
-            allow_cpu_fallback=allow_cpu_fallback,
-        )
-        if waveform.size == 0:
-            raise ValueError("Image contains no pixels")
-        logger.debug("Encoded image to waveform with %d samples", waveform.size)
-        return waveform.astype(np.float32, copy=False)
-
-    rows = array.shape[0]
-    segments_spec = segment_image_rows(array, safe_segments)
-    logger.debug(
-        "Segmenting image into %d stripes with adaptive rows: %s",
-        safe_segments,
-        [end - start for start, end, _ in segments_spec],
-    )
-    segments_wave: list[np.ndarray] = []
-    total_samples = 0
-    for idx, (start_row, end_row, ratio) in enumerate(segments_spec):
-        remaining = max_total_samples - total_samples
-        if remaining <= 0:
-            break
-        if start_row >= rows:
-            stripe = array[-1:]
-        else:
-            stripe = array[start_row:end_row]
-        stripe_wave = _encode_stripe_waveform(
-            stripe,
-            sample_count=max(payload_samples, 1),
-            allow_cpu_fallback=allow_cpu_fallback,
-        )
-        marker = _marker_tone(
-            sample_rate=sample_rate,
-            marker_samples=marker_samples,
-            index=idx,
-            segment_ratio=ratio,
-        )
-        segment_wave = np.concatenate(
-            [marker.astype(np.float32), stripe_wave.astype(np.float32)]
-        )
-        if segment_wave.size < segment_length:
-            segment_wave = np.pad(segment_wave, (0, segment_length - segment_wave.size))
-        elif segment_wave.size > segment_length:
-            segment_wave = segment_wave[:segment_length]
-        if segment_wave.size > remaining:
-            segment_wave = segment_wave[:remaining]
-        if segment_wave.size == 0:
-            break
-        segments_wave.append(segment_wave.astype(np.float32))
-        total_samples += segment_wave.size
-
-    if not segments_wave:
-        return np.zeros(0, dtype=np.float32)
-
-    waveform = np.concatenate(segments_wave).astype(np.float32)
-    peak = float(np.max(np.abs(waveform)))
-    if peak > 0:
-        waveform /= peak
-
-    logger.debug(
-        "Encoded image to waveform with %d samples across %d segments",
-        waveform.size,
-        safe_segments,
-    )
-    return waveform.astype(np.float32)
-
-
-def _infer_segment_count(
-    total_samples: int, sample_rate: int, marker_duration: float
-) -> int:
-    """Heuristically estimate the number of fax segments in ``waveform``."""
-
-    if total_samples <= 0:
-        raise ValueError("Waveform must contain samples")
-    payload_samples = max(int(sample_rate), 1)
-    marker_samples = max(int(round(marker_duration * sample_rate)), 0)
-    segment_length = payload_samples + marker_samples
-    if segment_length <= 0:
-        return 1
-
-    # A lower bound assuming the final segment may be truncated when the
-    # transmission is stopped early. ``max`` defends against extremely short
-    # clips that still need to be treated as a single segment.
-    minimum_segments = max(int(np.ceil(total_samples / (segment_length + 1))), 1)
-    approx_segments = int(total_samples // segment_length)
-    remainder = total_samples - approx_segments * segment_length
-    if remainder > marker_samples // 2:
-        approx_segments += 1
-
-    estimated = max(approx_segments, minimum_segments)
-    # Constrain the estimate so that the implied payload does not exceed the
-    # configured ten minute cap. This mirrors the guard in ``image_to_waveform``
-    # and prevents pathological sample counts from returning runaway values.
-    max_segments = max(
-        1,
-        int(np.ceil(total_samples / max(payload_samples, 1))),
-    )
-    return max(1, min(estimated, max_segments))
+    return reconstructed
 
 
 def reconstruct_from_waveform(
     waveform: np.ndarray,
-    *,
     resolution: tuple[int, int],
     sample_rate: int,
-    segments: int | None = 1,
+    segments: int = 1,
     marker_duration: float = 0.05,
-    advanced_logging: bool = False,
-    return_segments: bool = False,
-    allow_cpu_fallback: bool = True,
-) -> np.ndarray | tuple[np.ndarray, int]:
-    """Approximate an RGB image from a mono waveform.
+) -> np.ndarray:
+    """Reconstruct an image from ``waveform`` using heuristic decoding."""
 
-    When ``segments`` is ``None`` the decoder attempts to estimate how many
-    fax-style stripes were transmitted by examining the waveform length. The
-    ``return_segments`` flag can be used to retrieve the detected segment count
-    alongside the reconstructed image for bookkeeping purposes. Enabling
-    ``advanced_logging`` surfaces additional debug information that can help
-    diagnose decoding issues without polluting logs for standard workflows.
-    """
+    if waveform.size == 0:
+        return np.zeros(resolution + (3,), dtype=np.float32)
 
-    rows, cols = resolution
-    wave = np.asarray(waveform, dtype=np.float32)
-    if wave.ndim != 1:
-        wave = wave.reshape(-1)
-    if wave.size == 0:
-        raise ValueError("Waveform must contain samples")
+    freqs = np.fft.rfftfreq(waveform.size, 1 / sample_rate)
+    spectrum = np.abs(np.fft.rfft(waveform))
 
-    if advanced_logging:
-        logger.debug(
-            "Starting waveform reconstruction: samples=%d resolution=%s sample_rate=%d segments=%s marker_duration=%.5f",
-            wave.size,
-            resolution,
-            sample_rate,
-            "auto" if segments is None else int(segments),
-            marker_duration,
-        )
+    marker_idx = np.argmin(np.abs(freqs - _MARKER_BASE_FREQUENCY))
+    image_data = spectrum[marker_idx : marker_idx + np.prod(resolution)]
 
-    if segments is None:
-        safe_segments = _infer_segment_count(wave.size, sample_rate, marker_duration)
-        if advanced_logging:
-            logger.debug(
-                "Inferred %d segments from waveform length", safe_segments
-            )
-    else:
-        safe_segments = max(1, int(segments))
-    marker_seconds = float(max(0.0, marker_duration))
-    marker_samples = max(int(round(marker_seconds * sample_rate)), 0)
-    payload_samples = max(sample_rate, 1)
-    segment_length = marker_samples + payload_samples
+    reconstructed = image_data.reshape(resolution)
+    reconstructed /= np.max(reconstructed) + 1e-6
 
-    if advanced_logging:
-        logger.debug(
-            "Segment configuration: marker_samples=%d payload_samples=%d segment_length=%d",
-            marker_samples,
-            payload_samples,
-            segment_length,
-        )
-
-    if safe_segments == 1:
-        usable = wave
-        if usable.size < sample_rate:
-            usable = np.pad(usable, (0, sample_rate - usable.size))
-        else:
-            usable = usable[:sample_rate]
-        spectrum = _fft_magnitude(
-            usable,
-            sample_rate,
-            advanced_logging=advanced_logging,
-            allow_cpu_fallback=allow_cpu_fallback,
-        )
-        if spectrum.size == 0:
-            raise ValueError("Unable to derive spectrum from waveform")
-        if advanced_logging:
-            logger.debug("Processed single-segment waveform for reconstruction")
-    else:
-        available_segments = max(1, wave.size // segment_length)
-        available_segments = min(available_segments, safe_segments)
-        if available_segments <= 0:
-            raise ValueError("Waveform is shorter than one segment")
-
-        if advanced_logging:
-            logger.debug(
-                "Processing %d/%d available segments", available_segments, safe_segments
-            )
-
-        stripes: list[np.ndarray] = []
-        markers: list[np.ndarray] = []
-        for idx in range(available_segments):
-            start = idx * segment_length
-            end = start + segment_length
-            segment_wave = wave[start:end]
-            if segment_wave.size < segment_length:
-                segment_wave = np.pad(segment_wave, (0, segment_length - segment_wave.size))
-            marker = segment_wave[:marker_samples]
-            payload = segment_wave[marker_samples : marker_samples + payload_samples]
-            if payload.size < payload_samples:
-                payload = np.pad(payload, (0, payload_samples - payload.size))
-            else:
-                payload = payload[:payload_samples]
-            spectrum = _fft_magnitude(
-                payload,
-                payload_samples,
-                advanced_logging=advanced_logging,
-                allow_cpu_fallback=allow_cpu_fallback,
-            )
-            stripes.append(spectrum.astype(np.float32))
-            markers.append(np.asarray(marker, dtype=np.float32))
-
-            if advanced_logging:
-                logger.debug(
-                    "Segment %d: start=%d end=%d payload_size=%d",
-                    idx + 1,
-                    start,
-                    min(end, wave.size),
-                    payload.size,
-                )
-
-        total_pixels = rows * cols
-        needed = total_pixels * 3
-        combined = np.zeros(needed, dtype=np.float32)
-        stripe_heights = _decode_stripe_heights(
-            markers,
-            rows=rows,
-            sample_rate=sample_rate,
-            marker_samples=marker_samples,
-            segments=available_segments,
-            allow_cpu_fallback=allow_cpu_fallback,
-        )
-        if advanced_logging:
-            logger.debug("Decoded adaptive stripe heights (rows): %s", stripe_heights)
-        cursor = 0
-        start_row = 0
-        for idx, (spectrum_values, stripe_rows) in enumerate(zip(stripes, stripe_heights)):
-            if start_row >= rows:
-                break
-            remaining_rows = rows - start_row
-            stripe_rows = max(1, int(stripe_rows))
-            if idx == available_segments - 1 or stripe_rows > remaining_rows:
-                stripe_rows = remaining_rows
-            stripe_rows = max(stripe_rows, 1)
-            stripe_pixels = stripe_rows * cols * 3
-            xp = np.linspace(0, max(spectrum_values.size - 1, 0), stripe_pixels)
-            source_idx = np.arange(spectrum_values.size, dtype=np.float32)
-            stripe_values = np.interp(
-                xp,
-                source_idx if source_idx.size else np.array([0.0], dtype=np.float32),
-                spectrum_values,
-            )
-            end_cursor = min(cursor + stripe_pixels, needed)
-            combined[cursor:end_cursor] = stripe_values[: end_cursor - cursor]
-            cursor = end_cursor
-            start_row = min(rows, start_row + stripe_rows)
-            if cursor >= needed:
-                break
-        if cursor < needed and cursor > 0:
-            combined[cursor:] = combined[cursor - 1]
-        spectrum = combined
-        safe_segments = available_segments
-
-        if advanced_logging:
-            logger.debug(
-                "Combined %d stripes into %d values", len(stripes), spectrum.size
-            )
-
-    spectrum = spectrum.astype(np.float32)
-    max_val = float(spectrum.max())
-    if max_val > 0:
-        spectrum /= max_val
-
-    total_pixels = rows * cols
-    needed = total_pixels * 3
-    if spectrum.size < needed:
-        repeats = int(np.ceil(needed / spectrum.size))
-        spectrum = np.tile(spectrum, repeats)[:needed]
-    else:
-        spectrum = spectrum[:needed]
-
-    image = spectrum.reshape(3, rows, cols).transpose(1, 2, 0)
-    reconstructed = np.clip(np.nan_to_num(image, nan=0.0), 0.0, 1.0).astype(np.float32)
-    if return_segments:
-        if advanced_logging:
-            logger.debug("Reconstruction complete; returning segment count %d", safe_segments)
-        return reconstructed, int(safe_segments)
-    if advanced_logging:
-        logger.debug("Reconstruction complete without segment count")
-    return reconstructed
+    return np.repeat(reconstructed[..., np.newaxis], 3, axis=-1).astype(np.float32)
 
 
 def blend_predictions(
@@ -1163,4 +405,3 @@ __all__ = [
     "suggest_sample_rate",
     "suggest_transmission_profile",
 ]
-

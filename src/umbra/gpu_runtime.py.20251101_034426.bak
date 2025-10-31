@@ -1,0 +1,50 @@
+﻿#
+
+
+try:  # numpy-import-stub
+    import numpy as _np
+except Exception:
+    _np = None
+
+# cupy-import-stub
+try:
+    import cupy as cp
+except Exception:
+    cp = None
+
+#
+
+
+
+
+except Exception:
+    cp = None
+
+except Exception:
+    _np = None
+
+#
+#
+
+class GPUAccelerationRequiredError(Exception):
+    """Raised when GPU acceleration is required but unavailable."""
+    pass
+
+def allocate_pinned_array(shape, dtype="float32"):
+    "CPU fallback: return a normal NumPy array as a stand-in for pinned memory."
+    if _np is None:
+        raise RuntimeError("numpy is required for allocate_pinned_array")
+    return _np.zeros(shape, dtype=dtype)
+
+def free_pinned_array(arr):
+    "CPU fallback: nothing to free; rely on GC."
+    return None
+
+def is_gpu_available():
+    "Conservative default: GPU unavailable unless runtime sets this true."
+    return False
+
+def require_gpu():
+    "Raise standardized error when GPU is required but not available."
+    raise GPUAccelerationRequiredError("GPU acceleration required but unavailable")
+

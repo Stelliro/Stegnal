@@ -1,0 +1,7 @@
+﻿#
+#
+
+class GPUAccelerationRequiredError(Exception):
+    """Raised when GPU acceleration is required but unavailable."""
+    pass
+

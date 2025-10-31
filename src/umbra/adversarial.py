@@ -1,3 +1,5 @@
+# adversarial.py
+
 """Adversarial co-evolution between a predictive generator and decoder.
 
 The generator learns editable parameters to predict how an image would look after
@@ -37,7 +39,7 @@ def _gaussian_kernel1d(sigma: float) -> np.ndarray:
     radius = max(1, int(np.ceil(3.0 * sigma)))
     x = np.arange(-radius, radius + 1, dtype=np.float32)
     kernel = np.exp(-(x ** 2) / (2.0 * sigma ** 2))
-    kernel /= float(kernel.sum())
+    kernel /= float(kernel.sum() + 1e-6)  # Avoid div by zero
     return kernel
 
 
@@ -109,13 +111,15 @@ class AdversarialManager:
     """Coordinate co-evolution of generator and decoder hyperparameters."""
 
     def __init__(self, *, initial_generator: GeneratorParams | None = None, initial_decoder_sigma: float = 1.0) -> None:
+        self.rng = np.random.default_rng()
+        if initial_generator is None:
+            initial_generator = GeneratorParams()
         self.state = CoevolutionState(
-            generator=initial_generator or GeneratorParams(),
-            decoder_sigma=float(initial_decoder_sigma),
-            best_score=-np.inf,
+            generator=initial_generator,
+            decoder_sigma=float(np.clip(initial_decoder_sigma, 0.05, 2.5)),
+            best_score=0.0,
             step_count=0,
         )
-        self.rng = np.random.default_rng()
         logger.info(
             "Initialised adversarial manager with decoder sigma %.3f",
             self.state.decoder_sigma,
@@ -133,6 +137,9 @@ class AdversarialManager:
         The generator proposes parameter jitters; the decoder responds by nudging
         its sigma based on target similarity. Returns (best_params, best_score, decoder_sigma).
         """
+
+        if original.shape != target.shape:
+            raise ValueError("Original and target must have the same shape")
 
         current = self.state.generator
         base_score = self._score(original, target, current)
@@ -186,7 +193,7 @@ class AdversarialManager:
         indices = self.rng.integers(0, flat.size, size=bursts)
         noise = self.rng.normal(0.0, severity, size=bursts)
         flat[indices] = np.clip(flat[indices] + noise, 0.0, 1.0)
-        return flat.reshape(arr.shape)
+        return flat.reshape(arr.shape).astype(np.float32)
 
 
 __all__ = [

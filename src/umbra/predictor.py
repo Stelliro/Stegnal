@@ -1,3 +1,5 @@
+# predictor.py
+
 """Helpers for predicting images from audio waveforms."""
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from .reconstruction import reconstruct_from_waveform
 
 try:  # pragma: no cover - import guard
     import torch
-except Exception:  # pragma: no cover - torch optional dependency
+except ImportError:  # pragma: no cover - torch optional dependency
     torch = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,9 @@ def predict_image_from_waveform(
     used instead.
     """
 
+    if waveform.size == 0:
+        return np.zeros(resolution + (3,), dtype=np.float32)
+
     base_prediction = reconstruct_from_waveform(
         waveform,
         resolution=resolution,
@@ -51,7 +56,7 @@ def predict_image_from_waveform(
         tensor = torch.as_tensor(np.asarray(waveform, dtype=np.float32)).view(1, 1, -1)
         if device is not None:
             tensor = tensor.to(device)
-        elif hasattr(torch, "cuda") and torch.cuda.is_available():  # pragma: no cover - GPU
+        elif torch.cuda.is_available():  # pragma: no cover - GPU
             tensor = tensor.to("cuda")
 
         extra_args: dict[str, Any] = {
@@ -80,8 +85,10 @@ def predict_image_from_waveform(
 
         array = array[..., :3]
         array = np.clip(array, 0.0, 1.0)
-        if array.shape[0] != resolution[0] or array.shape[1] != resolution[1]:
-            array = np.resize(array, (*resolution, 3))
+        if array.shape[:2] != resolution:
+            from scipy.ndimage import zoom
+            zoom_factors = (resolution[0] / array.shape[0], resolution[1] / array.shape[1], 1)
+            array = zoom(array, zoom_factors, order=3)
         return array.astype(np.float32)
     except Exception:  # pragma: no cover - graceful fallback
         logger.exception("Torch predictor failed; falling back to heuristic decoder")
@@ -89,4 +96,3 @@ def predict_image_from_waveform(
 
 
 __all__ = ["predict_image_from_waveform"]
-

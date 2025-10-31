@@ -1,3 +1,5 @@
+# decoding.py
+
 """Decoding logic for the Project Umbra toy pipeline."""
 
 from __future__ import annotations
@@ -11,16 +13,18 @@ from skimage import filters
 
 try:  # pragma: no cover - optional acceleration
     import cupy as cp  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover - optional dependency
     cp = None
 
 try:  # pragma: no cover - optional acceleration
     from cupyx.scipy.ndimage import gaussian_filter as cupy_gaussian_filter  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover - optional dependency
     cupy_gaussian_filter = None
 
 from .encoding import NoisePacket
-from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
+from .gpu_runtime import is_cupy_out_of_memory_error
+
+logger = logging.getLogger(__name__)
 
 
 class DiffusionInpainter:
@@ -48,7 +52,9 @@ class DiffusionInpainter:
     ) -> None:
         self.steps = max(1, int(steps))
         self.guidance_scale = float(np.clip(guidance_scale, 0.0, 2.0))
-        self.schedule = schedule
+        self.schedule = schedule.lower()
+        if self.schedule not in ("linear", "cosine"):
+            raise ValueError("Schedule must be 'linear' or 'cosine'")
 
     def _noise_schedule(self, step: int) -> float:
         if self.schedule == "linear":
@@ -67,13 +73,13 @@ class DiffusionInpainter:
             reshaped = np.tile(reshaped, repeats)
         trimmed = reshaped[:required]
         centered = trimmed - float(trimmed.mean())
-        scale = float(trimmed.std()) or 1.0
+        scale = float(np.std(trimmed)) or 1.0
         normalized = np.clip(centered / scale, -1.0, 1.0)
         normalized = (normalized + 1.0) * 0.5
         return normalized.reshape(target_shape).astype(np.float32)
 
     def inpaint(self, decoded: np.ndarray, latent: np.ndarray | None) -> np.ndarray:
-        if latent is None:
+        if latent is None or latent.size == 0:
             return decoded
 
         guided_latent = self._prepare_latent(latent, decoded.shape)
@@ -88,116 +94,43 @@ class DiffusionInpainter:
 
         return working.astype(np.float32)
 
-logger = logging.getLogger(__name__)
-
-
-def is_cupy_out_of_memory_error(exc: BaseException) -> bool:
-    """Return ``True`` if ``exc`` represents a CuPy out-of-memory error."""
-
-    module_name = getattr(exc.__class__, "__module__", "")
-    class_name = getattr(exc.__class__, "__name__", "")
-    if "cupy" in module_name.lower() and "outofmemory" in class_name.lower():
-        return True
-
-    if cp is None:
-        return False
-
-    try:  # pragma: no cover - optional CuPy internals
-        from cupy.cuda import memory as cupy_memory  # type: ignore
-    except Exception:  # pragma: no cover - optional dependency
-        cupy_memory = None
-
-    if cupy_memory is not None:
-        for attr in ("OutOfMemoryError", "MemoryPoolOutOfMemoryError"):
-            error_type = getattr(cupy_memory, attr, None)
-            if error_type is not None and isinstance(exc, error_type):
-                return True
-
-    try:  # pragma: no cover - optional CuPy internals
-        from cupy.cuda import runtime as cupy_runtime  # type: ignore
-    except Exception:  # pragma: no cover - optional dependency
-        return False
-
-    runtime_error = getattr(cupy_runtime, "CUDARuntimeError", None)
-    if runtime_error is not None and isinstance(exc, runtime_error):
-        status = getattr(exc, "status", None)
-        oom_codes = {
-            getattr(cupy_runtime, "cudaErrorMemoryAllocation", None),
-            getattr(cupy_runtime, "cudaErrorLaunchOutOfResources", None),
-        }
-        if status in oom_codes:
-            return True
-
-    return False
-
 
 class NoiseStreamDecoder:
-    """Recover images from :class:`~umbra.encoding.NoisePacket` objects."""
+    """Decode a :class:`NoisePacket` back into an image."""
 
     def __init__(
         self,
-        denoise_sigma: float | None = 1.0,
         *,
+        denoise_sigma: float | None = 1.0,
         inpainter: DiffusionInpainter | None = None,
     ) -> None:
-        self.denoise_sigma = denoise_sigma
+        self.denoise_sigma = float(denoise_sigma) if denoise_sigma is not None else None
         self._inpainter = inpainter or DiffusionInpainter()
 
-    def to_config(self) -> dict[str, float | None]:
-        """Return a serializable configuration for persistence."""
+    def decode(self, packet: NoisePacket, seed: int, *, allow_cpu_fallback: bool = True) -> np.ndarray:
+        if packet.encoded.size == 0:
+            raise ValueError("Packet encoded data is empty")
+        if packet.permutation_seed != seed:
+            raise ValueError("Seed mismatch during decoding")
 
-        return {
-            "denoise_sigma": None if self.denoise_sigma is None else float(self.denoise_sigma),
-            "inpainter": {
-                "steps": self._inpainter.steps,
-                "guidance_scale": self._inpainter.guidance_scale,
-                "schedule": self._inpainter.schedule,
-            },
-        }
-
-    @classmethod
-    def from_config(cls, config: dict[str, float | None]) -> NoiseStreamDecoder:
-        """Instantiate the decoder from :meth:`to_config` output."""
-
-        inpainter_cfg = config.get("inpainter", {}) if isinstance(config, dict) else {}
-        inpainter = DiffusionInpainter(**inpainter_cfg) if isinstance(inpainter_cfg, dict) else None
-        return cls(denoise_sigma=config.get("denoise_sigma"), inpainter=inpainter)
-
-    def decode(
-        self,
-        packet: NoisePacket,
-        seed: int,
-        *,
-        messy_latent: np.ndarray | None = None,
-        allow_cpu_fallback: bool = True,
-    ) -> np.ndarray:
-        """Decode the provided packet using the shared seed."""
-        if seed != packet.permutation_seed:
-            raise ValueError("Seed mismatch: cannot decode without the original seed")
-
-        logger.debug(
-            "Decoding packet with sigma %s using seed %d", packet.sigma, seed
-        )
         rng = np.random.default_rng(seed)
-        flat_size = int(np.prod(packet.image_shape))
-        permutation = rng.permutation(flat_size)
-        inverse = np.empty_like(permutation)
-        inverse[permutation] = np.arange(flat_size)
+        inverse = np.argsort(rng.permutation(packet.encoded.size))
 
-        use_gpu = bool(cp is not None)
+        use_gpu = cp is not None
+        recovered = None
         gaussian_applied = False
-        recovered: np.ndarray | None = None
+        messy_latent = packet.messy_latent
 
-        if use_gpu:  # pragma: no branch - runtime check
+        if use_gpu:
             try:
-                encoded_gpu = cp.asarray(packet.encoded)  # type: ignore[assignment]
-                inverse_gpu = cp.asarray(inverse)  # type: ignore[assignment]
+                encoded_gpu = cp.asarray(packet.encoded)
+                inverse_gpu = cp.asarray(inverse)
                 recovered_gpu = encoded_gpu[inverse_gpu]
                 recovered_gpu = recovered_gpu.reshape(packet.image_shape)
 
                 if self.denoise_sigma and self.denoise_sigma > 0 and cupy_gaussian_filter is not None:
                     logger.debug(
-                        "Applying Gaussian denoise with sigma %.3f (CuPy)",
+                        "Applying Gaussian denoise with sigma %.3f on GPU",
                         float(self.denoise_sigma),
                     )
                     if recovered_gpu.ndim == 3 and recovered_gpu.shape[-1] > 1:
@@ -248,13 +181,10 @@ class NoiseStreamDecoder:
                 channel_axis=-1 if recovered.ndim == 3 else None,
             )
 
-        latent = messy_latent
-        if latent is None:
-            latent = packet.messy_latent
         recovered = np.clip(recovered, 0.0, 1.0)
         if (packet.sigma or 0.0) <= 0.151:
             return recovered.astype(np.float32)
-        return self._inpainter.inpaint(recovered, latent).astype(np.float32)
+        return self._inpainter.inpaint(recovered, messy_latent).astype(np.float32)
 
     def decode_to_image(self, packet: NoisePacket, seed: int, path: str | Path) -> None:
         array = self.decode(packet, seed)
@@ -267,6 +197,7 @@ class NoiseStreamDecoder:
         elif array.ndim != 2:
             raise ValueError("Unsupported array shape for image export")
 
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         image = Image.fromarray(data)
         image.save(path)
 
@@ -285,6 +216,7 @@ class NoiseStreamDecoder:
         elif array.ndim != 2:
             raise ValueError("Unsupported array shape for image export")
 
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         image = Image.fromarray(data)
         image.save(path)
 
