@@ -329,8 +329,7 @@ class NoiseStreamEncoder:
         )
 
         permutation = rng.permutation(flat.size)
-        permuted = flat[permutation]
-        noise = rng.normal(0.0, self.sigma, size=permuted.shape)
+        noise = rng.normal(0.0, self.sigma, size=flat.size)
 
         channel: np.ndarray | None
         encoded_backend: dict[str, Any] | None
@@ -341,12 +340,27 @@ class NoiseStreamEncoder:
                 cp_array_type = (ndarray_type,)
         using_gpu_backend = bool(cp_array_type) and isinstance(uwb_waveform_backend, cp_array_type)
 
+        cp_float32 = np.float32
+        if cp is not None:
+            cp_float32 = getattr(cp, "float32", np.float32)
+
         if using_gpu_backend:
-            uwb_waveform = cp.asnumpy(uwb_waveform_backend).astype(np.float32, copy=False)
-            channel = cp.asnumpy(channel_backend).astype(np.float32, copy=False)
+            uwb_waveform_gpu = uwb_waveform_backend.astype(cp_float32, copy=False)
+            uwb_waveform_gpu = uwb_waveform_gpu.ravel()[: flat.size]
+            channel_gpu = (
+                None
+                if channel_backend is None
+                else channel_backend.astype(cp_float32, copy=False).ravel()[: flat.size]
+            )
+            uwb_waveform = cp.asnumpy(uwb_waveform_gpu).astype(np.float32, copy=False)
+            channel = (
+                None
+                if channel_gpu is None
+                else cp.asnumpy(channel_gpu).astype(np.float32, copy=False)
+            )
             encoded_backend = {
-                "uwb_waveform": uwb_waveform_backend,
-                "channel_response": channel_backend,
+                "uwb_waveform": uwb_waveform_gpu,
+                "channel_response": channel_gpu,
             }
         else:
             uwb_waveform = np.asarray(uwb_waveform_backend, dtype=np.float32)
@@ -357,15 +371,20 @@ class NoiseStreamEncoder:
             )
             encoded_backend = None
 
-        uwb_waveform = uwb_waveform[: permuted.size]
+        uwb_waveform = uwb_waveform[: flat.size]
         use_gpu = cp is not None if use_gpu is None else bool(use_gpu and cp is not None)
         flat_gpu = permutation_gpu = noise_gpu = uwb_gpu = None
         if use_gpu:
             try:
-                flat_gpu = cp.asarray(flat)
+                flat_gpu = cp.asarray(flat, dtype=cp_float32)
                 permutation_gpu = cp.asarray(permutation)
-                noise_gpu = cp.asarray(noise)
-                uwb_gpu = cp.asarray(uwb_waveform)
+                if using_gpu_backend:
+                    uwb_gpu = encoded_backend["uwb_waveform"] if encoded_backend else None
+                    if uwb_gpu is not None:
+                        uwb_gpu = uwb_gpu.astype(cp_float32, copy=False)
+                if uwb_gpu is None:
+                    uwb_gpu = cp.asarray(uwb_waveform, dtype=cp_float32)
+                noise_gpu = cp.asarray(noise, dtype=cp_float32)
             except CuPyOutOfMemoryError:  # type: ignore[misc]
                 if allow_cpu_fallback:
                     logger.debug(
@@ -396,7 +415,9 @@ class NoiseStreamEncoder:
             if self.sigma >= 0.3:
                 encoded_gpu = encoded_gpu + 0.01 * uwb_gpu
             encoded = cp.asnumpy(encoded_gpu)
+            noise = None
         else:
+            permuted = flat[permutation]
             encoded = permuted + noise
             if self.sigma >= 0.3:
                 encoded = encoded + 0.01 * uwb_waveform
