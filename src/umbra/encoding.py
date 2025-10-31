@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -374,17 +375,31 @@ class NoiseStreamEncoder:
         uwb_waveform = uwb_waveform[: flat.size]
         use_gpu = cp is not None if use_gpu is None else bool(use_gpu and cp is not None)
         flat_gpu = permutation_gpu = noise_gpu = uwb_gpu = None
+        gpu_elements = flat.size
+        split_cpu_slice: slice | None = None
+        if use_gpu and cp is not None and flat.size >= 65536:
+            gpu_elements = self._estimate_gpu_workload(flat.size)
+            if gpu_elements < flat.size:
+                split_cpu_slice = slice(gpu_elements, flat.size)
         if use_gpu:
             try:
                 flat_gpu = cp.asarray(flat, dtype=cp_float32)
-                permutation_gpu = cp.asarray(permutation)
+                permutation_gpu = cp.asarray(permutation[:gpu_elements] if split_cpu_slice else permutation)
                 if using_gpu_backend:
                     uwb_gpu = encoded_backend["uwb_waveform"] if encoded_backend else None
                     if uwb_gpu is not None:
                         uwb_gpu = uwb_gpu.astype(cp_float32, copy=False)
+                        if split_cpu_slice is not None:
+                            uwb_gpu = uwb_gpu[:gpu_elements]
                 if uwb_gpu is None:
-                    uwb_gpu = cp.asarray(uwb_waveform, dtype=cp_float32)
-                noise_gpu = cp.asarray(noise, dtype=cp_float32)
+                    uwb_gpu = cp.asarray(
+                        uwb_waveform[:gpu_elements] if split_cpu_slice else uwb_waveform,
+                        dtype=cp_float32,
+                    )
+                noise_gpu = cp.asarray(
+                    noise[:gpu_elements] if split_cpu_slice else noise,
+                    dtype=cp_float32,
+                )
             except CuPyOutOfMemoryError:  # type: ignore[misc]
                 if allow_cpu_fallback:
                     logger.debug(
@@ -410,12 +425,36 @@ class NoiseStreamEncoder:
             and noise_gpu is not None
             and uwb_gpu is not None
         ):
-            permuted_gpu = flat_gpu[permutation_gpu]
-            encoded_gpu = permuted_gpu + noise_gpu
-            if self.sigma >= 0.3:
-                encoded_gpu = encoded_gpu + 0.01 * uwb_gpu
-            encoded = cp.asnumpy(encoded_gpu)
-            noise = None
+            if split_cpu_slice is None:
+                permuted_gpu = flat_gpu[permutation_gpu]
+                encoded_gpu = permuted_gpu + noise_gpu
+                if self.sigma >= 0.3:
+                    encoded_gpu = encoded_gpu + 0.01 * uwb_gpu
+                encoded = cp.asnumpy(encoded_gpu)
+                noise = None
+            else:
+                encoded = np.empty(flat.size, dtype=np.float32)
+
+                def _gpu_encode_chunk() -> np.ndarray:
+                    permuted_gpu_chunk = flat_gpu[permutation_gpu]
+                    encoded_gpu_chunk = permuted_gpu_chunk + noise_gpu
+                    if self.sigma >= 0.3:
+                        encoded_gpu_chunk = encoded_gpu_chunk + 0.01 * uwb_gpu
+                    return cp.asnumpy(encoded_gpu_chunk.astype(cp_float32, copy=False))
+
+                def _cpu_encode_chunk() -> np.ndarray:
+                    cpu_permutation = permutation[split_cpu_slice]
+                    permuted_cpu = flat[cpu_permutation]
+                    encoded_cpu = permuted_cpu + noise[split_cpu_slice]
+                    if self.sigma >= 0.3:
+                        encoded_cpu = encoded_cpu + 0.01 * uwb_waveform[split_cpu_slice]
+                    return encoded_cpu.astype(np.float32, copy=False)
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    gpu_future = executor.submit(_gpu_encode_chunk)
+                    cpu_future = executor.submit(_cpu_encode_chunk)
+                    encoded[:gpu_elements] = gpu_future.result()
+                    encoded[split_cpu_slice] = cpu_future.result()
         else:
             permuted = flat[permutation]
             encoded = permuted + noise
@@ -438,6 +477,35 @@ class NoiseStreamEncoder:
     ) -> NoisePacket:
         image = self.load_image(path)
         return self.encode(image, seed, **kwargs)
+
+    def _estimate_gpu_workload(self, total_items: int) -> int:
+        """Heuristically determine how many samples should be processed on the GPU."""
+
+        if cp is None or total_items <= 0:
+            return total_items
+        try:
+            free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()  # type: ignore[attr-defined]
+        except Exception:
+            return max(total_items // 2, min(total_items, 1 << 18))
+
+        # Reserve a safety margin to avoid triggering OOM mid-flight.
+        safety_margin = max(int(total_bytes * 0.1), 128 * 1024 * 1024)
+        usable = max(0, free_bytes - safety_margin)
+
+        # Approximate memory footprint per encoded element covering:
+        #   - float32 flat buffer
+        #   - float32 noise buffer
+        #   - float32 uwb waveform
+        #   - index buffer (int64/int32 depending on CuPy build)
+        bytes_per_element = 4 * 3 + 8
+        if usable <= 0:
+            return max(total_items // 4, 1)
+
+        capacity = usable // bytes_per_element
+        if capacity <= 0:
+            return max(total_items // 4, 1)
+
+        return max(min(total_items, capacity), min(total_items, 1 << 18))
 
 
 __all__ = [
