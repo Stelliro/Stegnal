@@ -1,8 +1,11 @@
+# cli.py
+
 """Command-line interface for Project Umbra's test build."""
 
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -12,20 +15,30 @@ from .metrics import compute_metrics
 from .pipeline import run_pipeline
 from .testing import run_smoke_test
 
+logger = logging.getLogger(__name__)
+
 
 def _add_common_seed_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, required=True, help="Shared seed used for permutation")
 
 
 def command_encode(args: argparse.Namespace) -> None:
+    if args.sigma <= 0:
+        raise ValueError("Sigma must be positive")
     encoder = NoiseStreamEncoder(sigma=args.sigma)
-    packet = encoder.encode_from_path(args.image, args.seed)
+    try:
+        packet = encoder.encode_from_path(args.image, args.seed)
+    except Exception as exc:
+        logger.error(f"Failed to encode image: {exc}")
+        raise
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     packet.to_file(args.output)
     print(f"Packet saved to {args.output}")
 
 
 def command_decode(args: argparse.Namespace) -> None:
+    if args.denoise_sigma < 0:
+        raise ValueError("Denoise sigma must be non-negative")
     packet = NoisePacket.from_file(args.packet)
     decoder = NoiseStreamDecoder(denoise_sigma=args.denoise_sigma)
     decoder.decode_to_image(packet, args.seed, args.output)
@@ -33,6 +46,10 @@ def command_decode(args: argparse.Namespace) -> None:
 
 
 def command_pipeline(args: argparse.Namespace) -> None:
+    if args.sigma <= 0:
+        raise ValueError("Sigma must be positive")
+    if args.denoise_sigma < 0:
+        raise ValueError("Denoise sigma must be non-negative")
     result = run_pipeline(
         image_path=args.image,
         seed=args.seed,
@@ -49,8 +66,12 @@ def command_pipeline(args: argparse.Namespace) -> None:
 
 def command_evaluate(args: argparse.Namespace) -> None:
     encoder = NoiseStreamEncoder()
-    reference = encoder.load_image(args.reference)
-    candidate = encoder.load_image(args.candidate)
+    try:
+        reference = encoder.load_image(args.reference)
+        candidate = encoder.load_image(args.candidate)
+    except Exception as exc:
+        logger.error(f"Failed to load images for evaluation: {exc}")
+        raise
     metrics = compute_metrics(reference, candidate)
     print("Evaluation metrics:")
     print(f"  PSNR: {metrics.psnr:.3f}")
@@ -58,6 +79,10 @@ def command_evaluate(args: argparse.Namespace) -> None:
 
 
 def command_smoke_test(args: argparse.Namespace) -> None:
+    if args.sigma <= 0:
+        raise ValueError("Sigma must be positive")
+    if args.denoise_sigma < 0:
+        raise ValueError("Denoise sigma must be non-negative")
     metrics = run_smoke_test(
         seed=args.seed,
         size=args.size,
@@ -70,13 +95,17 @@ def command_smoke_test(args: argparse.Namespace) -> None:
 
 
 def command_ui(_args: argparse.Namespace) -> None:
-    from .ui import main as launch_ui
-
+    try:
+        from .ui import main as launch_ui
+    except ImportError:
+        logger.error("UI dependencies not installed; install with 'pip install .[ui]'")
+        raise
     launch_ui()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Project Umbra toy pipeline CLI")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     encode_parser = subparsers.add_parser("encode", help="Encode an image into a noise packet")
@@ -151,6 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
     func: Callable[[argparse.Namespace], None] = args.func
     func(args)
 

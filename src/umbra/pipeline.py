@@ -1,11 +1,15 @@
+# pipeline.py
+
 """High-level helpers for the Project Umbra toy pipeline."""
 
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -35,6 +39,11 @@ def run_pipeline(
 ) -> PipelineResult:
     """Execute the encode/decode process and return reconstruction metrics."""
 
+    if sigma <= 0:
+        raise ValueError("Sigma must be positive")
+    if denoise_sigma is not None and denoise_sigma < 0:
+        raise ValueError("Denoise sigma must be non-negative")
+
     encoder = NoiseStreamEncoder(sigma=sigma)
     decoder = NoiseStreamDecoder(denoise_sigma=denoise_sigma, inpainter=DiffusionInpainter())
 
@@ -42,16 +51,23 @@ def run_pipeline(
         "Running pipeline with seed=%d sigma=%.3f denoise=%.3f", seed, sigma, denoise_sigma
     )
 
-    original = encoder.load_image(image_path)
+    try:
+        original = encoder.load_image(image_path)
+    except Exception as exc:
+        logger.error(f"Failed to load image from {image_path}: {exc}")
+        raise
+
     packet = encoder.encode(original, seed)
 
     if packet_path is not None:
+        Path(packet_path).parent.mkdir(parents=True, exist_ok=True)
         packet.to_file(packet_path)
         logger.debug("Saved encoded packet to %s", packet_path)
 
     reconstructed = decoder.decode(packet, seed)
 
     if reconstruction_path is not None:
+        Path(reconstruction_path).parent.mkdir(parents=True, exist_ok=True)
         decoder.save_image(reconstructed, reconstruction_path)
         logger.debug("Saved reconstruction to %s", reconstruction_path)
 
@@ -75,8 +91,14 @@ def run_pipeline(
 
 def replay_packet(packet_path: str | Path, seed: int, denoise_sigma: float | None = 1.0) -> np.ndarray:
     """Decode an existing packet."""
+    if denoise_sigma is not None and denoise_sigma < 0:
+        raise ValueError("Denoise sigma must be non-negative")
     logger.info("Replaying packet from %s with seed=%d", packet_path, seed)
-    packet = NoisePacket.from_file(packet_path)
+    try:
+        packet = NoisePacket.from_file(packet_path)
+    except Exception as exc:
+        logger.error(f"Failed to load packet from {packet_path}: {exc}")
+        raise
     decoder = NoiseStreamDecoder(denoise_sigma=denoise_sigma)
     return decoder.decode(packet, seed)
 
@@ -86,10 +108,12 @@ def run_pipeline_async(
     *,
     sigma: float = 0.2,
     denoise_sigma: float | None = 1.0,
-    max_workers: int = 4,
+    max_workers: int | None = None,
 ) -> list[PipelineResult]:
     """Evaluate multiple encode/decode tasks asynchronously."""
 
+    if max_workers is None:
+        max_workers = os.cpu_count() or 4
     results: list[PipelineResult] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
@@ -108,6 +132,7 @@ def run_pipeline_async(
             except Exception as exc:  # pragma: no cover - defensive logging
                 image_path, seed = future_map[future]
                 logger.exception("Pipeline job failed for %s seed=%s: %s", image_path, seed, exc)
+                raise  # Propagate to caller
     return results
 
 
