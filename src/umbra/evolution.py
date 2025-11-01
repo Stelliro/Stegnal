@@ -10,7 +10,8 @@ import os
 import pickle
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -93,6 +94,37 @@ def _batched(iterable: Sequence[int], size: int) -> Iterable[list[int]]:
         raise ValueError("batch size must be positive")
     for start in range(0, len(iterable), size):
         yield list(iterable[start : start + size])
+
+
+class _LoopProfiler:
+    """Collect timing samples for major evolution loop phases."""
+
+    def __init__(self) -> None:
+        self._samples: list[tuple[str, float]] = []
+
+    @contextmanager
+    def track(self, name: str) -> Iterator[None]:
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            duration = time.perf_counter() - start
+            self._samples.append((name, max(0.0, float(duration))))
+
+    def add(self, name: str, duration: float) -> None:
+        self._samples.append((name, max(0.0, float(duration))))
+
+    def aggregated(self) -> list[tuple[str, float]]:
+        totals: dict[str, float] = {}
+        for name, duration in self._samples:
+            totals[name] = totals.get(name, 0.0) + float(duration)
+        return sorted(totals.items(), key=lambda item: item[1], reverse=True)
+
+    def as_dicts(self) -> list[dict[str, float]]:
+        return [
+            {"name": name, "seconds": float(duration)}
+            for name, duration in self.aggregated()
+        ]
 
 
 PLATEAU_CFG_DEFAULTS = {
@@ -335,13 +367,16 @@ class EvolutionManager:
         self._hyper_enabled = self.hyper_mode_enabled()
         self._hyper_profile = self.default_hyper_profile(population_size, autosave_interval)
         if self._hyper_profile.enabled:
-            self.population_size = max(1, int(self._hyper_profile.batch_size or population_size))
+            initial_population = max(
+                1, int(self._hyper_profile.batch_size or population_size)
+            )
             self.autosave_interval = max(
                 1, int(self._hyper_profile.autosave_interval or autosave_interval)
             )
         else:
-            self.population_size = max(1, int(population_size))
+            initial_population = max(1, int(population_size))
             self.autosave_interval = max(1, int(autosave_interval))
+        self.population_size = initial_population
         if run_id is None:
             run_id, run_dir = new_run()
         else:
@@ -385,8 +420,24 @@ class EvolutionManager:
             _env_int("UMBRA_EVOLUTION_ACTIVE_BATCH", default_active),
         )
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._base_population = self.population_size
+        self._population_floor = max(
+            1,
+            _env_int("UMBRA_EVOLUTION_MIN_POPULATION", min(self.population_size, 6)),
+        )
+        self._population_ceiling = max(
+            self.population_size,
+            _env_int("UMBRA_EVOLUTION_MAX_POPULATION", self.population_size),
+        )
+        if self._population_floor > self._population_ceiling:
+            self._population_floor = self._population_ceiling
+        self._target_generation_seconds = max(
+            1.0,
+            _env_float("UMBRA_EVOLUTION_TARGET_SECONDS", 25.0),
+        )
         self._duration_ema = 0.0
         self._throughput_ema = 0.0
+        self._set_population_size(self.population_size)
 
         if cp is not None:
             try:
@@ -398,6 +449,24 @@ class EvolutionManager:
                     )
             except Exception:  # pragma: no cover - diagnostic path for GPU hosts
                 logger.debug("Failed to configure GPU memory pool", exc_info=True)
+
+    def _set_population_size(self, value: int) -> bool:
+        """Clamp and apply a new population size, returning ``True`` if it changed."""
+
+        desired = int(value)
+        if desired <= 0:
+            desired = 1
+        if self._population_ceiling >= self._population_floor:
+            desired = int(np.clip(desired, self._population_floor, self._population_ceiling))
+        changed = desired != getattr(self, "population_size", desired)
+        self.population_size = desired
+        if self._active_batch_size > self.population_size:
+            self._active_batch_size = self.population_size
+        if self._hyper_profile.enabled:
+            self._hyper_profile.batch_size = self.population_size
+        if changed:
+            logger.debug("Population size adjusted to %d", self.population_size)
+        return changed
 
     # ------------------------------------------------------------------ basic properties
     @property
@@ -862,13 +931,118 @@ class EvolutionManager:
             self._plateau_generations = 0
             self._mutation_boost = max(0, self._mutation_boost - 1)
 
+    def _adapt_population(
+        self,
+        duration: float,
+        evaluated: int,
+        worker_count: int,
+        batch_size: int,
+    ) -> dict[str, Any]:
+        """Adjust population and batch sizing heuristics for the next generation."""
+
+        adjustments: dict[str, Any] = {
+            "evaluated": int(evaluated),
+            "previous_population": int(self.population_size),
+            "previous_batch_size": int(batch_size),
+            "target_duration": float(self._target_generation_seconds),
+        }
+
+        duration = float(max(duration, 1e-6))
+        smoothing = 0.25
+        if self._duration_ema <= 0.0:
+            self._duration_ema = duration
+        else:
+            self._duration_ema = (
+                (1.0 - smoothing) * self._duration_ema + smoothing * duration
+            )
+        throughput = float(evaluated) / max(duration, 1e-6)
+        if self._throughput_ema <= 0.0:
+            self._throughput_ema = throughput
+        else:
+            self._throughput_ema = (
+                (1.0 - smoothing) * self._throughput_ema + smoothing * throughput
+            )
+
+        adjustments["duration_ema"] = float(self._duration_ema)
+        adjustments["throughput_ema"] = float(self._throughput_ema)
+
+        population_before = int(self.population_size)
+        reason: str | None = None
+        slow_threshold = self._target_generation_seconds * 1.15
+        fast_threshold = self._target_generation_seconds * 0.6
+
+        if (
+            self._duration_ema > slow_threshold
+            and self.population_size > self._population_floor
+        ):
+            proposed = max(
+                self._population_floor,
+                int(round(self.population_size * 0.75)),
+            )
+            if proposed >= self.population_size:
+                proposed = max(self._population_floor, self.population_size - 1)
+            if self._set_population_size(proposed):
+                reason = "slow"
+        elif (
+            self._duration_ema < fast_threshold
+            and self.population_size < self._population_ceiling
+        ):
+            proposed = min(
+                self._population_ceiling,
+                max(self.population_size + 1, int(round(self.population_size * 1.15))),
+            )
+            if self._set_population_size(proposed):
+                reason = "fast"
+
+        max_batch = min(self.population_size, self._parallel_workers * 2)
+        desired_batch = self._active_batch_size
+        if self._duration_ema > slow_threshold:
+            desired_batch = max(1, min(desired_batch, worker_count))
+        elif self._duration_ema < fast_threshold:
+            desired_batch = max(desired_batch, min(max_batch, worker_count + 1))
+
+        if self._throughput_ema > 0.0:
+            throughput_batch = int(
+                max(
+                    1,
+                    min(
+                        self.population_size,
+                        round(
+                            self._throughput_ema
+                            * min(self._target_generation_seconds * 0.5, slow_threshold)
+                            / max(worker_count or 1, 1)
+                        ),
+                    ),
+                )
+            )
+            if self._duration_ema > slow_threshold:
+                desired_batch = min(desired_batch, throughput_batch)
+            elif self._duration_ema < fast_threshold:
+                desired_batch = max(desired_batch, throughput_batch)
+
+        desired_batch = max(1, min(desired_batch, max_batch))
+        if desired_batch < self._active_batch_size:
+            self._active_batch_size = max(1, (self._active_batch_size + desired_batch) // 2)
+        else:
+            self._active_batch_size = min(max_batch, desired_batch)
+
+        adjustments["population"] = int(self.population_size)
+        adjustments["population_changed"] = self.population_size != population_before
+        if reason is not None and adjustments["population_changed"]:
+            adjustments["population_adjustment_reason"] = reason
+            adjustments["population_adjusted_to"] = int(self.population_size)
+        adjustments["next_batch_size"] = int(self._active_batch_size)
+        return adjustments
+
     def _apply_hyper_feedback(self, generation: GenerationRecord, duration: float) -> None:
         if not self._hyper_profile.enabled:
             return
         profile = self._hyper_profile
         previous_capacity = profile.batch_size * max(profile.dwell_generations, 1)
         profile.batch_size = max(profile.batch_size, self.population_size)
-        profile.batch_size = max(5, profile.batch_size + (1 if generation.reward_peak > 0 else 0))
+        if generation.reward_peak > 0 and profile.batch_size < self._population_ceiling:
+            profile.batch_size = min(self._population_ceiling, profile.batch_size + 1)
+        profile.batch_size = max(self._population_floor, profile.batch_size)
         profile.dwell_generations = max(profile.dwell_generations, 10)
         profile.dwell_generations += 1
         profile.autosave_interval = max(profile.autosave_interval, self.autosave_interval)
@@ -888,7 +1062,7 @@ class EvolutionManager:
         current_capacity = profile.batch_size * profile.dwell_generations
         if current_capacity < previous_capacity:
             profile.dwell_generations = max(profile.dwell_generations, previous_capacity // max(profile.batch_size, 1))
-        self.population_size = max(self.population_size, profile.batch_size)
+        self._set_population_size(profile.batch_size)
         self.autosave_interval = max(self.autosave_interval, profile.autosave_interval)
 
     # ------------------------------------------------------------------ main evolution loop
@@ -899,7 +1073,9 @@ class EvolutionManager:
         generation_index = self.next_generation_index
         difficulty = self._current_difficulty(generation_index)
         mutation_extra = self._mutation_boost if self._mutation_boost > 0 else 0
-        seeds = self._select_seed_pool(parent_selection, mutation_extra)
+        profiler = _LoopProfiler()
+        with profiler.track("seed_selection"):
+            seeds = self._select_seed_pool(parent_selection, mutation_extra)
 
         record = GenerationRecord(index=generation_index)
         record.difficulty_raw = difficulty
@@ -931,34 +1107,110 @@ class EvolutionManager:
                 candidate.reward,
             )
 
-        if worker_count > 1:
-            executor = self._ensure_parallel_executor(worker_count)
-            for chunk in _batched(seeds, batch_size):
-                if len(chunk) == 1:
-                    _ingest(self._evaluate_candidate(chunk[0], difficulty))
-                    continue
-                for candidate in executor.map(
-                    self._evaluate_candidate,
-                    chunk,
-                    itertools.repeat(difficulty, len(chunk)),
-                ):
-                    _ingest(candidate)
-        else:
-            for seed in seeds:
-                _ingest(self._evaluate_candidate(seed, difficulty))
+        with profiler.track("candidate_evaluation"):
+            if worker_count > 1:
+                executor = self._ensure_parallel_executor(worker_count)
+                for chunk in _batched(seeds, batch_size):
+                    if len(chunk) == 1:
+                        _ingest(self._evaluate_candidate(chunk[0], difficulty))
+                        continue
+                    for candidate in executor.map(
+                        self._evaluate_candidate,
+                        chunk,
+                        itertools.repeat(difficulty, len(chunk)),
+                        chunksize=1,
+                    ):
+                        _ingest(candidate)
+            else:
+                for seed in seeds:
+                    _ingest(self._evaluate_candidate(seed, difficulty))
 
-        if not record.candidates:
-            raise RuntimeError("No candidates evaluated; population size may be zero")
+        with profiler.track("postprocess"):
+            if not record.candidates:
+                raise RuntimeError("No candidates evaluated; population size may be zero")
 
-        best_candidate = record.best_candidate
-        record.improvement = max(best_candidate.overlap_score - self._best_overlap, 0.0)
-        self._best_overlap = max(self._best_overlap, best_candidate.overlap_score)
-        record.difficulty_level = float(np.clip(best_candidate.overlap_score / 100.0, 0.0, 1.0))
-        record.cumulative_reward = self.lifetime_reward + record.reward_summary
+            best_candidate = record.best_candidate
+            record.improvement = max(best_candidate.overlap_score - self._best_overlap, 0.0)
+            self._best_overlap = max(self._best_overlap, best_candidate.overlap_score)
+            record.difficulty_level = float(np.clip(best_candidate.overlap_score / 100.0, 0.0, 1.0))
+            record.cumulative_reward = self.lifetime_reward + record.reward_summary
 
         duration = time.time() - start
+        adapt_start = time.perf_counter()
+        adjustments = self._adapt_population(
+            duration, len(record.candidates), worker_count, batch_size
+        )
+        population_before_hyper = self.population_size
         self._apply_hyper_feedback(record, duration)
+        if self.population_size != population_before_hyper:
+            adjustments["population"] = int(self.population_size)
+            adjustments["population_changed"] = True
+            adjustments["population_adjusted_to"] = int(self.population_size)
+            adjustments["population_adjustment_reason"] = "hyper"
+        adjustments["next_batch_size"] = int(self._active_batch_size)
         self._update_plateau(best_overlap)
+        profiler.add("adaptive_controls", time.perf_counter() - adapt_start)
+
+        persist_start = time.perf_counter()
+        self._persist_generation_history(record)
+        persist_duration = time.perf_counter() - persist_start
+        profiler.add("history_persist", persist_duration)
+
+        loop_data = profiler.as_dicts()
+        loop_map = {entry["name"]: float(entry["seconds"]) for entry in loop_data}
+        record.loop_timings = loop_data
+
+        frame_times = [
+            float(candidate.frame_time_ms)
+            for candidate in record.candidates
+            if candidate.frame_time_ms is not None
+        ]
+        avg_frame_ms = float(np.mean(frame_times)) if frame_times else 0.0
+
+        record.timing_summary = {
+            "total_seconds": float(duration),
+            "candidate_count": len(record.candidates),
+            "average_frame_ms": float(avg_frame_ms),
+            "throughput": float(len(record.candidates) / max(duration, 1e-6)),
+            "best_overlap": float(best_candidate.overlap_score),
+            "reward_peak": float(record.reward_peak),
+            "improvement": float(record.improvement),
+            "ema_duration": float(self._duration_ema),
+            "ema_throughput": float(self._throughput_ema),
+            "seed_selection_seconds": float(loop_map.get("seed_selection", 0.0)),
+            "evaluation_seconds": float(loop_map.get("candidate_evaluation", 0.0)),
+            "postprocess_seconds": float(loop_map.get("postprocess", 0.0)),
+            "adaptive_seconds": float(loop_map.get("adaptive_controls", 0.0)),
+            "persist_seconds": float(loop_map.get("history_persist", persist_duration)),
+        }
+
+        population_adjusted_to = adjustments.get("population_adjusted_to")
+        if population_adjusted_to is not None:
+            population_adjusted_to = int(population_adjusted_to)
+
+        record.worker_summary = {
+            "evaluated": len(record.candidates),
+            "seed_count": len(seeds),
+            "workers": int(worker_count),
+            "batch_size": int(batch_size),
+            "next_batch_size": int(adjustments.get("next_batch_size", self._active_batch_size)),
+            "previous_batch_size": int(adjustments.get("previous_batch_size", batch_size)),
+            "population": int(self.population_size),
+            "previous_population": int(
+                adjustments.get("previous_population", self.population_size)
+            ),
+            "population_changed": bool(adjustments.get("population_changed", False)),
+            "population_adjusted_to": population_adjusted_to,
+            "population_adjustment_reason": adjustments.get(
+                "population_adjustment_reason"
+            ),
+            "duration": float(duration),
+            "duration_ema": float(self._duration_ema),
+            "throughput_ema": float(self._throughput_ema),
+            "target_duration": float(self._target_generation_seconds),
+            "warmup_penalty": float(warmup_penalty),
+            "history_persist_seconds": float(loop_map.get("history_persist", persist_duration)),
+        }
 
         self.generations.append(record)
         self.next_generation_index += 1
@@ -971,7 +1223,6 @@ class EvolutionManager:
             if len(self._elite_pool) > self.population_size * 4:
                 self._elite_pool = self._elite_pool[-self.population_size * 4 :]
 
-        self._persist_generation_history(record)
         return record
 
     # ------------------------------------------------------------------ persistence API

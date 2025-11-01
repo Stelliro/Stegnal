@@ -1515,6 +1515,14 @@ class UmbraDesktopApp:
         self._loading_modal: tk.Toplevel | None = None
         self._loading_progress: Any = None
         self._text_input: tk.Text | None = None
+        self._diagnostics_notebook: Any | None = None
+        self._log_text: tk.Text | None = None
+        self._loop_tree: Any | None = None
+        self._loop_summary_var = tk.StringVar(
+            value="Loop diagnostics will appear after the first generation."
+        )
+        self._pending_logs: list[str] = []
+        self._pending_loop_payloads: list[Mapping[str, Any]] = []
 
         self._build_layout()
         self._use_demo_image()
@@ -1956,18 +1964,212 @@ class UmbraDesktopApp:
         ).pack(side=tk.LEFT, padx=4)
 
         graph_frame = tk.Frame(self.root, bg="#101010")
-        graph_frame.pack(fill=tk.BOTH, side=tk.BOTTOM)
-        self._graph_canvas = tk.Canvas(
-            graph_frame,
-            width=_GRAPH_WIDTH,
-            height=_GRAPH_HEIGHT,
-            bg="#0e0e0e",
-            highlightthickness=0,
-        )
-        self._graph_canvas.pack(fill=tk.BOTH, expand=True)
-        self._graph_canvas.bind("<Configure>", lambda _event: self._draw_graph())
+        graph_frame.pack(fill=tk.BOTH, side=tk.BOTTOM, expand=True)
+        if ttk is not None:
+            notebook = ttk.Notebook(graph_frame)
+            notebook.pack(fill=tk.BOTH, expand=True)
+            self._diagnostics_notebook = notebook
+
+            metrics_tab = tk.Frame(notebook, bg="#101010")
+            notebook.add(metrics_tab, text="Metrics")
+            self._graph_canvas = tk.Canvas(
+                metrics_tab,
+                width=_GRAPH_WIDTH,
+                height=_GRAPH_HEIGHT,
+                bg="#0e0e0e",
+                highlightthickness=0,
+            )
+            self._graph_canvas.pack(fill=tk.BOTH, expand=True)
+            self._graph_canvas.bind("<Configure>", lambda _event: self._draw_graph())
+
+            log_tab = tk.Frame(notebook, bg="#080808")
+            notebook.add(log_tab, text="Complex Logs")
+            log_scroll = tk.Scrollbar(log_tab)
+            log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            log_text = tk.Text(
+                log_tab,
+                state=tk.DISABLED,
+                bg="#080808",
+                fg="#f5f5f5",
+                wrap=tk.NONE,
+                insertbackground="#f5f5f5",
+                relief=tk.FLAT,
+                yscrollcommand=log_scroll.set,
+            )
+            log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
+            log_scroll.config(command=log_text.yview)
+            self._log_text = log_text
+
+            loops_tab = tk.Frame(notebook, bg="#101010")
+            notebook.add(loops_tab, text="Loop Timings")
+            if ttk is not None:
+                columns = ("loop", "duration", "percent")
+                loop_tree = ttk.Treeview(
+                    loops_tab,
+                    columns=columns,
+                    show="headings",
+                    height=9,
+                )
+                loop_tree.heading("loop", text="Loop")
+                loop_tree.heading("duration", text="Duration (s)")
+                loop_tree.heading("percent", text="Share")
+                loop_tree.column("loop", anchor="w", width=220)
+                loop_tree.column("duration", anchor="center", width=120)
+                loop_tree.column("percent", anchor="center", width=100)
+                loop_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+                self._loop_tree = loop_tree
+            summary_label = tk.Label(
+                loops_tab,
+                textvariable=self._loop_summary_var,
+                fg="#f0f6fc",
+                bg="#101010",
+                anchor=tk.W,
+                justify=tk.LEFT,
+                wraplength=_GRAPH_WIDTH - 40,
+            )
+            summary_label.pack(fill=tk.X, padx=12, pady=(0, 10))
+
+            if self._pending_logs:
+                pending = list(self._pending_logs)
+                self._pending_logs.clear()
+                for entry in pending:
+                    self._append_log_entry(entry)
+            if self._pending_loop_payloads:
+                pending_profiles = list(self._pending_loop_payloads)
+                self._pending_loop_payloads.clear()
+                for payload in pending_profiles:
+                    self._update_loop_profile(payload)
+        else:
+            self._graph_canvas = tk.Canvas(
+                graph_frame,
+                width=_GRAPH_WIDTH,
+                height=_GRAPH_HEIGHT,
+                bg="#0e0e0e",
+                highlightthickness=0,
+            )
+            self._graph_canvas.pack(fill=tk.BOTH, expand=True)
+            self._graph_canvas.bind("<Configure>", lambda _event: self._draw_graph())
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _append_log_entry(self, message: str) -> None:
+        """Display a complex log entry, buffering if the widget is unavailable."""
+
+        if self._log_text is None:
+            self._pending_logs.append(message)
+            return
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}"
+        widget = self._log_text
+        widget.configure(state=tk.NORMAL)
+        widget.insert(tk.END, line + "\n")
+        try:
+            total_lines = int(float(widget.index("end-1line")))
+        except Exception:
+            total_lines = 0
+        max_lines = 600
+        if total_lines > max_lines:
+            widget.delete("1.0", f"{total_lines - max_lines + 1}.0")
+        widget.see(tk.END)
+        widget.configure(state=tk.DISABLED)
+
+    def _update_loop_profile(self, payload: Mapping[str, Any]) -> None:
+        """Update the loop diagnostics tab with the latest profiling payload."""
+
+        loops_list: list[dict[str, float | str]] = []
+        raw_loops = payload.get("loops", [])
+        if isinstance(raw_loops, Sequence):
+            for entry in raw_loops:
+                if isinstance(entry, Mapping):
+                    loops_list.append(
+                        {
+                            "name": str(entry.get("name", "loop")),
+                            "seconds": float(entry.get("seconds") or 0.0),
+                        }
+                    )
+                elif isinstance(entry, Sequence) and len(entry) >= 2:
+                    loops_list.append(
+                        {
+                            "name": str(entry[0]),
+                            "seconds": float(entry[1] or 0.0),
+                        }
+                    )
+        summary = payload.get("summary") or {}
+        worker = payload.get("worker") or {}
+        generation = payload.get("generation", "?")
+        duration_seconds = float(
+            worker.get("duration") or summary.get("total_seconds") or 0.0
+        )
+        evaluated = int(
+            worker.get("evaluated")
+            or summary.get("candidate_count")
+            or len(loops_list)
+        )
+        population = worker.get("population")
+        batch = worker.get("batch_size")
+        next_batch = worker.get("next_batch_size")
+        workers = worker.get("workers")
+        population_adjusted_to = worker.get("population_adjusted_to")
+        reason = worker.get("population_adjustment_reason")
+        duration_ema = worker.get("duration_ema")
+        target_duration = worker.get("target_duration")
+        throughput = summary.get("throughput")
+
+        summary_text = (
+            f"Gen {generation} · {evaluated} candidates in {duration_seconds:.2f}s"
+        )
+        if population is not None:
+            summary_text += f" · population {int(population)}"
+        if batch is not None and next_batch is not None:
+            summary_text += f" · batch {int(batch)}→{int(next_batch)}"
+        elif batch is not None:
+            summary_text += f" · batch {int(batch)}"
+        if workers is not None:
+            summary_text += f" · workers {int(workers)}"
+        if reason and population_adjusted_to is not None:
+            try:
+                adjusted = int(population_adjusted_to)
+            except Exception:
+                adjusted = population_adjusted_to
+            if reason == "slow":
+                summary_text += f" · reduced to {adjusted}"
+            elif reason == "fast":
+                summary_text += f" · increased to {adjusted}"
+            elif reason == "hyper":
+                summary_text += f" · tuned to {adjusted}"
+        if throughput is not None:
+            try:
+                summary_text += f" · throughput {float(throughput):.2f} cand/s"
+            except Exception:
+                pass
+        if duration_ema is not None and target_duration is not None:
+            try:
+                summary_text += (
+                    f" · EMA {float(duration_ema):.2f}s target {float(target_duration):.2f}s"
+                )
+            except Exception:
+                pass
+        self._loop_summary_var.set(summary_text)
+
+        if self._loop_tree is None:
+            self._pending_loop_payloads.append(
+                {
+                    "generation": generation,
+                    "loops": loops_list,
+                    "summary": dict(summary),
+                    "worker": dict(worker),
+                }
+            )
+            return
+
+        tree = self._loop_tree
+        tree.delete(*tree.get_children())
+        total_seconds = duration_seconds if duration_seconds > 0 else 0.0
+        for entry in loops_list:
+            name = str(entry.get("name", "loop"))
+            seconds = float(entry.get("seconds") or 0.0)
+            percent = (seconds / total_seconds * 100.0) if total_seconds > 0 else 0.0
+            tree.insert("", "end", values=(name, f"{seconds:.3f}", f"{percent:.1f}%"))
 
     # ------------------------------------------------------------------ Controls
     def _toggle_run_mode(self) -> None:
@@ -2272,9 +2474,9 @@ class UmbraDesktopApp:
             self.reference_image,
             self.encoder,
             self.decoder,
-            population_size=6,
+            population_size=4,
             base_seed=base_seed,
-            autosave_interval=6,
+            autosave_interval=4,
             max_generations=_UI_GENERATION_LIMIT,
         )
 
@@ -2421,6 +2623,56 @@ class UmbraDesktopApp:
                 )
             )
 
+            timing_summary = getattr(generation, "timing_summary", {}) or {}
+            worker_summary = getattr(generation, "worker_summary", {}) or {}
+            loops_payload = getattr(generation, "loop_timings", []) or []
+            duration_seconds = float(
+                worker_summary.get("duration")
+                or timing_summary.get("total_seconds")
+                or 0.0
+            )
+            summary_text = (
+                f"Gen {generation.index}: {len(generation.candidates)} candidates "
+                f"in {duration_seconds:.2f}s"
+            )
+            summary_text += f" · best {best.overlap_score:.2f}%"
+            try:
+                summary_text += f" · reward {float(best.reward):.2f}"
+            except Exception:
+                pass
+            population = worker_summary.get("population")
+            if population is not None:
+                summary_text += f" · population {int(population)}"
+            batch_size = worker_summary.get("batch_size")
+            next_batch = worker_summary.get("next_batch_size")
+            if batch_size is not None and next_batch is not None:
+                summary_text += f" · batch {int(batch_size)}→{int(next_batch)}"
+            reason = worker_summary.get("population_adjustment_reason")
+            adjusted = worker_summary.get("population_adjusted_to")
+            if reason and adjusted is not None:
+                try:
+                    adjusted_int = int(adjusted)
+                except Exception:
+                    adjusted_int = adjusted
+                if reason == "slow":
+                    summary_text += f" · reduced to {adjusted_int}"
+                elif reason == "fast":
+                    summary_text += f" · increased to {adjusted_int}"
+                elif reason == "hyper":
+                    summary_text += f" · tuned to {adjusted_int}"
+            self._queue.put(("complex_log", summary_text))
+            self._queue.put(
+                (
+                    "loop_profile",
+                    {
+                        "generation": generation.index,
+                        "summary": dict(timing_summary),
+                        "worker": dict(worker_summary),
+                        "loops": list(loops_payload),
+                    },
+                )
+            )
+
             if self.reference_image is not None and self._run_mode_var.get() == "infinite":
                 threshold = float(self._score_threshold.get())
                 if entry["composite_score"] >= threshold and (time.time() - self._last_refresh) > 30.0:
@@ -2456,6 +2708,13 @@ class UmbraDesktopApp:
                 )
                 self._apply_generation_entry(entry)
                 self._draw_graph()
+            elif kind == "complex_log":
+                _, text = message
+                self._append_log_entry(str(text))
+            elif kind == "loop_profile":
+                _, payload = message
+                if isinstance(payload, Mapping):
+                    self._update_loop_profile(payload)
             elif kind == "status":
                 _, text = message
                 self._status_var.set(str(text))
