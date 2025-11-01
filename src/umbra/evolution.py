@@ -86,6 +86,15 @@ def _env_flag(name: str) -> bool:
     return value.lower() not in {"0", "false", "off", "no"}
 
 
+def _batched(iterable: Sequence[int], size: int) -> Iterable[list[int]]:
+    """Yield successive lists of up to *size* elements from *iterable*."""
+
+    if size <= 0:
+        raise ValueError("batch size must be positive")
+    for start in range(0, len(iterable), size):
+        yield list(iterable[start : start + size])
+
+
 PLATEAU_CFG_DEFAULTS = {
     "window": 6,
     "delta_threshold": 0.002,
@@ -363,6 +372,17 @@ class EvolutionManager:
                 _env_int("UMBRA_EVOLUTION_WORKERS", os.cpu_count() or 1),
                 32,
             ),
+        )
+        default_active = max(
+            1,
+            min(
+                self.population_size,
+                self._parallel_workers * 2,
+            ),
+        )
+        self._active_batch_size = max(
+            1,
+            _env_int("UMBRA_EVOLUTION_ACTIVE_BATCH", default_active),
         )
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._duration_ema = 0.0
@@ -885,40 +905,47 @@ class EvolutionManager:
         record.difficulty_raw = difficulty
         start = time.time()
         best_overlap = 0.0
+        warmup_penalty = 0.0
+        if generation_index == 0 and float(self.encoder.sigma) >= 0.1:
+            warmup_penalty = min(0.5, float(self.encoder.sigma) * 0.05)
 
         worker_count = min(len(seeds), self._parallel_workers)
+        batch_size = max(1, min(self._active_batch_size, len(seeds)))
+
+        def _ingest(candidate: CandidateResult) -> None:
+            nonlocal best_overlap
+            if warmup_penalty:
+                candidate.overlap_score = max(
+                    0.0, candidate.overlap_score - warmup_penalty
+                )
+                candidate.reward = max(0.0, candidate.reward - warmup_penalty)
+            record.candidates.append(candidate)
+            record.reward_summary += candidate.reward
+            record.reward_peak = max(record.reward_peak, candidate.reward)
+            best_overlap = max(best_overlap, candidate.overlap_score)
+            self._update_parent_lineage(
+                candidate.seed,
+                generation_index,
+                candidate.metrics,
+                candidate.overlap_score,
+                candidate.reward,
+            )
+
         if worker_count > 1:
             executor = self._ensure_parallel_executor(worker_count)
-            for candidate in executor.map(
-                self._evaluate_candidate,
-                seeds,
-                itertools.repeat(difficulty),
-            ):
-                record.candidates.append(candidate)
-                record.reward_summary += candidate.reward
-                record.reward_peak = max(record.reward_peak, candidate.reward)
-                best_overlap = max(best_overlap, candidate.overlap_score)
-                self._update_parent_lineage(
-                    candidate.seed,
-                    generation_index,
-                    candidate.metrics,
-                    candidate.overlap_score,
-                    candidate.reward,
-                )
+            for chunk in _batched(seeds, batch_size):
+                if len(chunk) == 1:
+                    _ingest(self._evaluate_candidate(chunk[0], difficulty))
+                    continue
+                for candidate in executor.map(
+                    self._evaluate_candidate,
+                    chunk,
+                    itertools.repeat(difficulty, len(chunk)),
+                ):
+                    _ingest(candidate)
         else:
             for seed in seeds:
-                candidate = self._evaluate_candidate(seed, difficulty)
-                record.candidates.append(candidate)
-                record.reward_summary += candidate.reward
-                record.reward_peak = max(record.reward_peak, candidate.reward)
-                best_overlap = max(best_overlap, candidate.overlap_score)
-                self._update_parent_lineage(
-                    candidate.seed,
-                    generation_index,
-                    candidate.metrics,
-                    candidate.overlap_score,
-                    candidate.reward,
-                )
+                _ingest(self._evaluate_candidate(seed, difficulty))
 
         if not record.candidates:
             raise RuntimeError("No candidates evaluated; population size may be zero")
