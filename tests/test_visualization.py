@@ -2,6 +2,9 @@ import numpy as np
 import pytest
 
 from umbra.visualization import (
+    _feature_weight_map,
+    _overlap_against_constant,
+    _weighted_overlap_score,
     colorize_comparison,
     multiplicative_overlap,
     normalize_for_display,
@@ -28,7 +31,13 @@ def test_multiplicative_overlap_returns_map_and_score():
     overlap, score = multiplicative_overlap(reference, candidate)
     expected_overlap = np.clip(1.0 - np.abs(reference - candidate), 0.0, 1.0)
     assert np.allclose(overlap, expected_overlap)
-    assert score == pytest.approx(expected_overlap.mean() * 100.0)
+    weights = _feature_weight_map(reference)
+    raw_score = _weighted_overlap_score(expected_overlap, weights)
+    baseline_zero = _weighted_overlap_score(_overlap_against_constant(reference, 0.0), weights)
+    baseline_one = _weighted_overlap_score(_overlap_against_constant(reference, 1.0), weights)
+    baseline = max(baseline_zero, baseline_one)
+    expected_score = max(raw_score - baseline, 0.0) / max(1.0 - baseline, 1e-6) * 100.0
+    assert score == pytest.approx(expected_score)
 
 
 def test_multiplicative_overlap_reaches_hundred_for_identical_images():
@@ -36,6 +45,18 @@ def test_multiplicative_overlap_reaches_hundred_for_identical_images():
     overlap, score = multiplicative_overlap(reference, reference.copy())
     assert np.allclose(overlap, 1.0)
     assert score == pytest.approx(100.0)
+
+
+def test_multiplicative_overlap_penalizes_blank_background_matches():
+    reference = np.zeros((64, 64), dtype=np.float32)
+    reference[24:40, 24:40] = 1.0
+    blank = np.zeros_like(reference)
+
+    _, blank_score = multiplicative_overlap(reference, blank)
+    _, perfect_score = multiplicative_overlap(reference, reference.copy())
+
+    assert blank_score < 1.0
+    assert perfect_score == pytest.approx(100.0)
 
 
 def test_multiplicative_overlap_requires_matching_shapes():
