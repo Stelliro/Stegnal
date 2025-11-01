@@ -123,7 +123,10 @@ class NoiseStreamDecoder:
 
         if use_gpu:
             try:
-                encoded_gpu = cp.asarray(packet.encoded)
+                if packet.encoded_backend == "gpu" and packet.encoded_gpu is not None:
+                    encoded_gpu = cp.asarray(packet.encoded_gpu)
+                else:
+                    encoded_gpu = cp.asarray(packet.encoded)
                 inverse_gpu = cp.asarray(inverse)
                 recovered_gpu = encoded_gpu[inverse_gpu]
                 recovered_gpu = recovered_gpu.reshape(packet.image_shape)

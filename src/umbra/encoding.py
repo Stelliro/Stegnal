@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +12,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from umbra.gpu_runtime import GPUAccelerationRequiredError, allocate_pinned_array, require_gpu
+from umbra.gpu_runtime import GPUAccelerationRequiredError, require_gpu
 
 try:  # pragma: no cover - exercised indirectly in GPU environments
     import cupy as cp  # type: ignore
@@ -148,16 +147,28 @@ class NoisePacket:
     channel_response: np.ndarray | None = None
     waveform_plugin: str = "dsss"
     encoded_backend: str = "cpu"
+    encoded_gpu: Any | None = None
 
     def to_file(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        encoded = np.asarray(self.encoded)
+        if encoded.ndim != 1:
+            encoded = encoded.reshape(-1)
+
+        channel = self.channel_response
+        if cp is not None and channel is not None and hasattr(channel, "__array__"):
+            try:
+                channel = cp.asnumpy(channel)  # type: ignore[arg-type]
+            except Exception:
+                channel = np.asarray(channel)
+
         data = {
-            "encoded": self.encoded,
+            "encoded": encoded,
             "image_shape": np.array(self.image_shape, dtype=np.int32),
             "permutation_seed": np.array(self.permutation_seed, dtype=np.int64),
             "sigma": np.array(self.sigma, dtype=np.float32),
             "messy_latent": self.messy_latent,
-            "channel_response": self.channel_response,
+            "channel_response": channel,
             "waveform_plugin": np.array(self.waveform_plugin, dtype="S"),
             "encoded_backend": np.array(self.encoded_backend, dtype="S"),
         }
@@ -215,25 +226,39 @@ class NoiseStreamEncoder:
         rng = np.random.default_rng(seed)
         waveform, messy_artifact = self._plugin.generate(array, rng)
         channel, backend = _simulate_uwb_channel(
-            waveform, rng, allow_cpu_fallback=allow_cpu_fallback, prefer_gpu=prefer_gpu, return_backend=True
+            waveform,
+            rng,
+            allow_cpu_fallback=allow_cpu_fallback,
+            prefer_gpu=prefer_gpu,
+            return_backend=True,
         )
         flat = array.reshape(-1)
         permutation = rng.permutation(flat.size)
         noise = rng.normal(0, self.sigma, size=flat.size).astype(np.float32)
+        encoded_gpu: Any | None = None
+
         if prefer_gpu and cp is not None:
             try:
-                flat_gpu = cp.asarray(flat)
-                permutation_gpu = cp.asarray(permutation)
-                noise_gpu = cp.asarray(noise)
-                permuted_gpu = flat_gpu[permutation_gpu]
-                encoded_gpu = permuted_gpu + noise_gpu
-                encoded = cp.asnumpy(encoded_gpu)
-                backend = "gpu"
-            except CuPyOutOfMemoryError:
+                require_gpu("noise stream encoding")
+            except GPUAccelerationRequiredError:
                 if allow_cpu_fallback:
-                    logger.debug("GPU OOM in encoding; falling back to CPU")
+                    logger.debug("GPU unavailable during encoding; using CPU fallback")
                 else:
                     raise
+            else:
+                try:
+                    flat_gpu = cp.asarray(flat)
+                    permutation_gpu = cp.asarray(permutation)
+                    noise_gpu = cp.asarray(noise)
+                    permuted_gpu = flat_gpu[permutation_gpu]
+                    encoded_gpu = permuted_gpu + noise_gpu
+                    encoded = cp.asnumpy(encoded_gpu)
+                    backend = "gpu"
+                except CuPyOutOfMemoryError:
+                    if allow_cpu_fallback:
+                        logger.debug("GPU OOM in encoding; falling back to CPU")
+                    else:
+                        raise
         else:
             permuted = flat[permutation]
             encoded = permuted + noise
@@ -248,6 +273,7 @@ class NoiseStreamEncoder:
             channel_response=channel,
             waveform_plugin=self._plugin.name,
             encoded_backend=backend,
+            encoded_gpu=encoded_gpu if backend == "gpu" else None,
         )
 
     def encode_from_path(
