@@ -2636,6 +2636,21 @@ class UmbraDesktopApp:
                 f"in {duration_seconds:.2f}s"
             )
             summary_text += f" · best {best.overlap_score:.2f}%"
+            ref_overlap = getattr(best, "reference_overlap", None)
+            if (
+                ref_overlap is not None
+                and np.isfinite(ref_overlap)
+                and abs(ref_overlap - best.overlap_score) > 1e-3
+            ):
+                summary_text += f" (ref {ref_overlap:.2f}%)"
+            bootstrap_overlap = getattr(best, "sound_bootstrap_overlap", None)
+            if (
+                bootstrap_overlap is not None
+                and np.isfinite(bootstrap_overlap)
+                and ref_overlap is not None
+                and abs(bootstrap_overlap - ref_overlap) > 1e-3
+            ):
+                summary_text += f" · bootstrap {bootstrap_overlap:.2f}%"
             try:
                 summary_text += f" · reward {float(best.reward):.2f}"
             except Exception:

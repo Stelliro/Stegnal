@@ -150,8 +150,26 @@ def test_generation_metrics_track_sound_alignment() -> None:
     assert candidate.metrics.ssim == pytest.approx(
         packet_metrics.ssim, rel=1e-5, abs=1e-5
     )
-    assert candidate.overlap_score == pytest.approx(
+
+    bootstrap_payload = manager._get_sound_reference_payload()
+    if bootstrap_payload and "image" in bootstrap_payload:
+        baseline_image = np.clip(
+            np.asarray(bootstrap_payload["image"], dtype=np.float32), 0.0, 1.0
+        )
+        _, bootstrap_overlap = multiplicative_overlap(baseline_image, reconstruction)
+        expected_overlap = min(float(packet_overlap), float(bootstrap_overlap))
+        assert candidate.sound_bootstrap_overlap == pytest.approx(
+            float(bootstrap_overlap), rel=1e-5, abs=1e-5
+        )
+    else:
+        expected_overlap = float(packet_overlap)
+        assert candidate.sound_bootstrap_overlap is None
+
+    assert candidate.reference_overlap == pytest.approx(
         float(packet_overlap), rel=1e-5, abs=1e-5
+    )
+    assert candidate.overlap_score == pytest.approx(
+        float(expected_overlap), rel=1e-5, abs=1e-5
     )
 
     sample_rate = suggest_sample_rate(reference)

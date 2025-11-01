@@ -238,6 +238,8 @@ class CandidateResult:
     waveform_readability_score: float | None = None
     waveform_alignment_score: float | None = None
     team_score: float | None = None
+    reference_overlap: float | None = None
+    sound_bootstrap_overlap: float | None = None
 
 
 @dataclass
@@ -334,6 +336,10 @@ def _chaotic_seed_mix(values: Sequence[int], noise: int, logistic: float) -> int
 def compute_image_signature(array: np.ndarray) -> str:
     arr = np.asarray(array, dtype=np.float32)
     return hashlib.sha1(arr.tobytes()).hexdigest()
+
+
+def _clone_image(array: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(array, dtype=np.float32), 0.0, 1.0).copy()
 
 
 class EvolutionManager:
@@ -437,6 +443,8 @@ class EvolutionManager:
         )
         self._duration_ema = 0.0
         self._throughput_ema = 0.0
+        self._sound_reference_cache: dict[str, Any] | None = None
+        self._sound_reference_ready = False
         self._set_population_size(self.population_size)
 
         if cp is not None:
@@ -487,6 +495,154 @@ class EvolutionManager:
 
     def set_advisor(self, advisor: NeuralRewardModel | None) -> None:
         self._reward_model = advisor
+
+    # ------------------------------------------------------------------ waveform bootstrap helpers
+    def _get_sound_reference_payload(self) -> dict[str, Any] | None:
+        """Return a cached waveform reconstruction of the reference image."""
+
+        if not self.enable_waveform:
+            return None
+
+        with self._state_lock:
+            if self._sound_reference_ready:
+                return self._sound_reference_cache
+
+        reference = self.original
+        try:
+            sample_rate = suggest_sample_rate(reference)
+            segments, marker_duration = suggest_transmission_profile(reference)
+            wav_bytes = encode_image_to_wav_bytes(
+                reference,
+                sample_rate=sample_rate,
+                segments=segments,
+                marker_duration=marker_duration,
+            )
+            waveform_image, metadata = decode_wav_bytes_to_image(
+                wav_bytes,
+                resolution=reference.shape[:2],
+                sample_rate=sample_rate,
+                segments=segments,
+                marker_duration=marker_duration,
+                return_metadata=True,
+            )
+            waveform_image = _ensure_three_channel(waveform_image)
+            resolved_sample_rate = metadata.sample_rate or sample_rate
+            resolved_segments = metadata.segments or segments
+            resolved_marker = metadata.marker_duration or marker_duration
+            metrics = compute_metrics(reference, waveform_image)
+            _, overlap = multiplicative_overlap(reference, waveform_image)
+            channel_axis = -1 if reference.ndim == 3 else None
+            ms_ssim = compute_ms_ssim(reference, waveform_image, channel_axis)
+            dct_corr = dct_band_correlation(reference, waveform_image)
+            try:
+                partial = partial_alignment_fraction(reference, waveform_image)
+            except ValueError:
+                partial = None
+            readability = readability_score(float(overlap), metrics.psnr, metrics.ssim)
+            sound_score = audio_fidelity_score(
+                float(overlap),
+                metrics.psnr,
+                metrics.ssim,
+                partial_credit=partial,
+            )
+            team_score = team_cohesion_score(
+                float(overlap),
+                metrics.psnr,
+                metrics.ssim,
+                sound_reference_overlap=float(overlap),
+                sound_reference_psnr=metrics.psnr,
+                sound_reference_ssim=metrics.ssim,
+                sound_alignment_overlap=float(overlap),
+                sound_alignment_psnr=metrics.psnr,
+                sound_alignment_ssim=metrics.ssim,
+                sound_reference_partial=partial,
+                sound_alignment_partial=partial,
+                readability=readability,
+            )
+            payload: dict[str, Any] = {
+                "image": np.asarray(waveform_image, dtype=np.float32),
+                "metrics": metrics,
+                "overlap": float(overlap),
+                "ms_ssim": float(ms_ssim),
+                "dct": float(dct_corr),
+                "partial": None if partial is None else float(partial),
+                "sample_rate": int(resolved_sample_rate),
+                "segments": int(resolved_segments),
+                "marker_duration": float(resolved_marker),
+                "sound_score": float(sound_score),
+                "readability": float(readability),
+                "team_score": float(team_score),
+            }
+        except Exception:  # pragma: no cover - waveform bootstrap optional
+            logger.debug("Failed to compute waveform bootstrap candidate", exc_info=True)
+            payload = {}
+
+        with self._state_lock:
+            self._sound_reference_cache = payload or None
+            self._sound_reference_ready = True
+            return self._sound_reference_cache
+
+    def _build_waveform_bootstrap_candidate(
+        self, payload: dict[str, Any] | None
+    ) -> CandidateResult | None:
+        """Create a pseudo-candidate from the reference waveform reconstruction."""
+
+        if not payload or "image" not in payload:
+            return None
+
+        image = _clone_image(payload["image"])
+        metrics: ReconstructionMetrics = payload["metrics"]
+        overlap = float(payload["overlap"])
+        ms_ssim = float(payload["ms_ssim"])
+        dct_corr = float(payload["dct"])
+        partial = payload.get("partial")
+        feature_vector: tuple[float, ...] = (
+            float(overlap),
+            metrics.psnr,
+            metrics.ssim,
+            ms_ssim,
+            dct_corr,
+        )
+        reward = composite_score(overlap, metrics.psnr, metrics.ssim)
+        reward_components = {
+            "overlap": float(overlap),
+            "overlap_reference": float(overlap),
+            "overlap_combined": float(overlap),
+            "sound_bootstrap_overlap": float(overlap),
+            "psnr": metrics.psnr,
+            "ssim": metrics.ssim,
+        }
+
+        return CandidateResult(
+            seed=self.base_seed,
+            reconstruction=image,
+            metrics=metrics,
+            overlap_score=float(overlap),
+            ai_score=reward,
+            reward=reward,
+            execution_backend="waveform-bootstrap",
+            sigma=0.0,
+            frame_time_ms=None,
+            predicted_reward=None,
+            feature_vector=feature_vector,
+            reward_components=reward_components,
+            waveform_reconstruction=image.copy(),
+            waveform_reference_metrics=metrics,
+            waveform_reference_overlap=float(overlap),
+            waveform_packet_metrics=metrics,
+            waveform_packet_overlap=float(overlap),
+            waveform_reference_partial=partial,
+            waveform_alignment_partial=partial,
+            waveform_sample_rate=payload.get("sample_rate"),
+            waveform_segments=payload.get("segments"),
+            waveform_marker_duration=payload.get("marker_duration"),
+            waveform_sound_score=payload.get("sound_score"),
+            waveform_readability_score=payload.get("readability"),
+            waveform_alignment_score=payload.get("sound_score"),
+            team_score=payload.get("team_score"),
+            reference_overlap=float(overlap),
+            sound_bootstrap_overlap=float(overlap),
+        )
 
     @property
     def hyper_profile(self) -> HyperPerformanceProfile:
@@ -734,23 +890,40 @@ class EvolutionManager:
 
         recon = np.clip(np.asarray(reconstruction, dtype=np.float32), 0.0, 1.0)
         metrics = compute_metrics(reference, recon)
-        _, overlap = multiplicative_overlap(reference, recon)
-        reward = composite_score(overlap, metrics.psnr, metrics.ssim)
+        _, overlap_ref = multiplicative_overlap(reference, recon)
+        reference_overlap = float(overlap_ref)
+        bootstrap_overlap: float | None = None
+        combined_overlap = reference_overlap
+        bootstrap_payload = self._get_sound_reference_payload()
+        if bootstrap_payload and "image" in bootstrap_payload:
+            baseline_image = np.asarray(bootstrap_payload["image"], dtype=np.float32)
+            _, overlap_bootstrap = multiplicative_overlap(baseline_image, recon)
+            bootstrap_overlap = float(overlap_bootstrap)
+            combined_overlap = float(
+                np.clip(min(reference_overlap, bootstrap_overlap), 0.0, 100.0)
+            )
+        reward = composite_score(combined_overlap, metrics.psnr, metrics.ssim)
         ai_score = reward
         predicted_reward: float | None = None
         channel_axis = -1 if reference.ndim == 3 else None
+        ms_ssim_value = compute_ms_ssim(reference, recon, channel_axis)
+        dct_value = dct_band_correlation(reference, recon)
         feature_vector: tuple[float, ...] = (
-            float(overlap),
+            float(combined_overlap),
             metrics.psnr,
             metrics.ssim,
-            compute_ms_ssim(reference, recon, channel_axis),
-            dct_band_correlation(reference, recon),
+            ms_ssim_value,
+            dct_value,
         )
         reward_components = {
-            "overlap": float(overlap),
+            "overlap": float(combined_overlap),
+            "overlap_combined": float(combined_overlap),
+            "overlap_reference": float(reference_overlap),
             "psnr": metrics.psnr,
             "ssim": metrics.ssim,
         }
+        if bootstrap_overlap is not None:
+            reward_components["sound_bootstrap_overlap"] = float(bootstrap_overlap)
 
         if self._reward_model is not None:
             try:
@@ -833,7 +1006,7 @@ class EvolutionManager:
                         waveform_reference_metrics.ssim,
                     )
                 team_score_value = team_cohesion_score(
-                    float(overlap),
+                    float(combined_overlap),
                     metrics.psnr,
                     metrics.ssim,
                     sound_reference_overlap=None
@@ -869,7 +1042,7 @@ class EvolutionManager:
             seed=int(seed),
             reconstruction=recon,
             metrics=metrics,
-            overlap_score=float(overlap),
+            overlap_score=float(combined_overlap),
             ai_score=float(ai_score),
             reward=float(reward),
             execution_backend=backend,
@@ -892,6 +1065,10 @@ class EvolutionManager:
             waveform_readability_score=waveform_readability_score,
             waveform_alignment_score=waveform_alignment_score,
             team_score=team_score_value,
+            reference_overlap=float(reference_overlap),
+            sound_bootstrap_overlap=None
+            if bootstrap_overlap is None
+            else float(bootstrap_overlap),
         )
 
     # ------------------------------------------------------------------ difficulty management
@@ -1077,6 +1254,13 @@ class EvolutionManager:
         with profiler.track("seed_selection"):
             seeds = self._select_seed_pool(parent_selection, mutation_extra)
 
+        bootstrap_candidate: CandidateResult | None = None
+        bootstrap_payload = self._get_sound_reference_payload()
+        if generation_index == 0:
+            bootstrap_candidate = self._build_waveform_bootstrap_candidate(bootstrap_payload)
+            if bootstrap_candidate is not None and len(seeds) > 1:
+                seeds = list(seeds[:-1])
+
         record = GenerationRecord(index=generation_index)
         record.difficulty_raw = difficulty
         start = time.time()
@@ -1088,9 +1272,9 @@ class EvolutionManager:
         worker_count = min(len(seeds), self._parallel_workers)
         batch_size = max(1, min(self._active_batch_size, len(seeds)))
 
-        def _ingest(candidate: CandidateResult) -> None:
+        def _ingest(candidate: CandidateResult, *, apply_warmup: bool = True) -> None:
             nonlocal best_overlap
-            if warmup_penalty:
+            if warmup_penalty and apply_warmup:
                 candidate.overlap_score = max(
                     0.0, candidate.overlap_score - warmup_penalty
                 )
@@ -1106,6 +1290,9 @@ class EvolutionManager:
                 candidate.overlap_score,
                 candidate.reward,
             )
+
+        if bootstrap_candidate is not None:
+            _ingest(bootstrap_candidate, apply_warmup=False)
 
         with profiler.track("candidate_evaluation"):
             if worker_count > 1:
