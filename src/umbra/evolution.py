@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
+import itertools
 import logging
 import os
 import pickle
+import threading
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -17,7 +20,11 @@ import numpy as np
 from .codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
-from .gpu_runtime import cp, ensure_nvrtc_configured
+from .gpu_runtime import (
+    configure_device_memory_pool,
+    cp,
+    ensure_nvrtc_configured,
+)
 from .metrics import (
     ReconstructionMetrics,
     audio_fidelity_score,
@@ -348,8 +355,29 @@ class EvolutionManager:
         self._mutation_boost = 0
         self._difficulty_bias = 0.5
         self._gpu_warning_emitted = False
+        self._state_lock = threading.Lock()
+        self._reward_lock = threading.Lock()
+        self._parallel_workers = max(
+            1,
+            min(
+                _env_int("UMBRA_EVOLUTION_WORKERS", os.cpu_count() or 1),
+                32,
+            ),
+        )
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._duration_ema = 0.0
         self._throughput_ema = 0.0
+
+        if cp is not None:
+            try:
+                configured = configure_device_memory_pool()
+                if configured:
+                    logger.debug(
+                        "Configured GPU memory pool target to %.2f GiB",
+                        configured / (1024 ** 3),
+                    )
+            except Exception:  # pragma: no cover - diagnostic path for GPU hosts
+                logger.debug("Failed to configure GPU memory pool", exc_info=True)
 
     # ------------------------------------------------------------------ basic properties
     @property
@@ -523,6 +551,34 @@ class EvolutionManager:
         entry.peak_reward = max(entry.peak_reward, reward)
         entry.last_generation = generation_index
 
+    def _mark_gpu_warning(self) -> bool:
+        """Mark that the GPU warning has been emitted, returning ``True`` once."""
+
+        with self._state_lock:
+            if self._gpu_warning_emitted:
+                return False
+            self._gpu_warning_emitted = True
+            return True
+
+    def _ensure_parallel_executor(
+        self, workers: int
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        """Return a thread pool sized for *workers* using daemon worker threads."""
+
+        with self._state_lock:
+            current = self._executor
+            if current is not None and getattr(current, "_max_workers", None) == workers:
+                return current
+            if current is not None:
+                current.shutdown(wait=False, cancel_futures=True)
+            # ThreadPoolExecutor already spawns daemon threads; we simply reuse it with a
+            # descriptive prefix so diagnostics stay readable.
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="umbra-evo",
+            )
+            return self._executor
+
     # ------------------------------------------------------------------ candidate evaluation
     def _evaluate_candidate(self, seed: int, difficulty: float) -> CandidateResult:
         reference = self.original
@@ -533,11 +589,10 @@ class EvolutionManager:
         packet: NoisePacket | None = None
         backend = "cpu"
 
-        if not prefer_gpu and not self._gpu_warning_emitted:
+        if not prefer_gpu and self._mark_gpu_warning():
             logger.warning(
                 "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
             )
-            self._gpu_warning_emitted = True
 
         if prefer_gpu:
             try:
@@ -559,11 +614,10 @@ class EvolutionManager:
                         prefer_gpu=attempt_gpu,
                     )
                     backend = getattr(packet, "encoded_backend", "gpu" if attempt_gpu else "cpu")
-                    if attempt_gpu and backend != "gpu" and not self._gpu_warning_emitted:
+                    if attempt_gpu and backend != "gpu" and self._mark_gpu_warning():
                         logger.warning(
                             "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
                         )
-                        self._gpu_warning_emitted = True
                     reconstruction = self.decoder.decode(
                         packet,
                         seed,
@@ -581,10 +635,10 @@ class EvolutionManager:
                     raise
                 except Exception as exc:  # pragma: no cover - GPU fallback path
                     if attempt_gpu and allow_cpu_fallback:
-                        logger.warning(
-                            "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
-                        )
-                        self._gpu_warning_emitted = True
+                        if self._mark_gpu_warning():
+                            logger.warning(
+                                "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
+                            )
                         attempt_gpu = False
                         continue
                     raise exc
@@ -612,10 +666,11 @@ class EvolutionManager:
         if self._reward_model is not None:
             try:
                 feature_array = np.asarray(feature_vector, dtype=np.float32)
-                predicted_reward = float(self._reward_model.predict(feature_array))
-                self._reward_model.update(
-                    feature_array.reshape(1, -1), np.array([reward], dtype=np.float32)
-                )
+                with self._reward_lock:
+                    predicted_reward = float(self._reward_model.predict(feature_array))
+                    self._reward_model.update(
+                        feature_array.reshape(1, -1), np.array([reward], dtype=np.float32)
+                    )
             except Exception:  # pragma: no cover - advisory failure should not abort evolution
                 logger.debug("Neural advisor update failed", exc_info=True)
                 predicted_reward = None
@@ -831,19 +886,39 @@ class EvolutionManager:
         start = time.time()
         best_overlap = 0.0
 
-        for seed in seeds:
-            candidate = self._evaluate_candidate(seed, difficulty)
-            record.candidates.append(candidate)
-            record.reward_summary += candidate.reward
-            record.reward_peak = max(record.reward_peak, candidate.reward)
-            best_overlap = max(best_overlap, candidate.overlap_score)
-            self._update_parent_lineage(
-                candidate.seed,
-                generation_index,
-                candidate.metrics,
-                candidate.overlap_score,
-                candidate.reward,
-            )
+        worker_count = min(len(seeds), self._parallel_workers)
+        if worker_count > 1:
+            executor = self._ensure_parallel_executor(worker_count)
+            for candidate in executor.map(
+                self._evaluate_candidate,
+                seeds,
+                itertools.repeat(difficulty),
+            ):
+                record.candidates.append(candidate)
+                record.reward_summary += candidate.reward
+                record.reward_peak = max(record.reward_peak, candidate.reward)
+                best_overlap = max(best_overlap, candidate.overlap_score)
+                self._update_parent_lineage(
+                    candidate.seed,
+                    generation_index,
+                    candidate.metrics,
+                    candidate.overlap_score,
+                    candidate.reward,
+                )
+        else:
+            for seed in seeds:
+                candidate = self._evaluate_candidate(seed, difficulty)
+                record.candidates.append(candidate)
+                record.reward_summary += candidate.reward
+                record.reward_peak = max(record.reward_peak, candidate.reward)
+                best_overlap = max(best_overlap, candidate.overlap_score)
+                self._update_parent_lineage(
+                    candidate.seed,
+                    generation_index,
+                    candidate.metrics,
+                    candidate.overlap_score,
+                    candidate.reward,
+                )
 
         if not record.candidates:
             raise RuntimeError("No candidates evaluated; population size may be zero")

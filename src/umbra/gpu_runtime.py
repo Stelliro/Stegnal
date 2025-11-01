@@ -31,6 +31,9 @@ class GPUAccelerationRequiredError(RuntimeError):
 logger = logging.getLogger(__name__)
 
 _HYBRID_PINNED_BUFFERS: list[object] = []
+_GPU_MEMORY_POOL: Any | None = None
+_PINNED_MEMORY_POOL: Any | None = None
+_GPU_MEMORY_LIMIT_BYTES: int = 0
 
 _NVRTC_CHECKED = False
 _NVRTC_AVAILABLE = False
@@ -74,6 +77,81 @@ def _retain_hybrid_buffer(buffer: object) -> None:
     """Keep a strong reference to pinned buffers to avoid premature GC."""
 
     _HYBRID_PINNED_BUFFERS.append(buffer)
+
+
+def _memory_target_bytes(total_bytes: int, fraction: float | None) -> int:
+    """Compute a desired GPU memory budget based on configuration."""
+
+    explicit = os.getenv("UMBRA_GPU_MEMORY_TARGET_BYTES")
+    if explicit:
+        try:
+            target = int(explicit)
+        except ValueError:
+            target = 0
+    else:
+        target = 0
+
+    if target <= 0 and fraction is not None:
+        target = int(total_bytes * max(0.0, min(fraction, 1.0)))
+
+    if target <= 0:
+        default = 12 * 1024**3  # 12 GiB default target for desktop GPUs
+        target = default if total_bytes >= default else int(total_bytes * 0.9)
+
+    return max(0, min(int(total_bytes), int(target)))
+
+
+def configure_device_memory_pool(
+    target_bytes: int | None = None,
+    *,
+    fraction: float | None = None,
+) -> int:
+    """Configure CuPy's memory pools to aggressively reserve GPU VRAM.
+
+    The function returns the configured budget in bytes so callers can log the
+    expected utilisation.  When CuPy is unavailable the function returns ``0``.
+    """
+
+    if cp is None:
+        return 0
+
+    device = cp.cuda.Device()  # type: ignore[attr-defined]
+    free_mem, total_mem = device.mem_info  # type: ignore[attr-defined]
+
+    budget = int(target_bytes) if target_bytes is not None else 0
+    if budget <= 0:
+        env_fraction = os.getenv("UMBRA_GPU_MEMORY_TARGET_FRACTION")
+        if env_fraction is not None:
+            try:
+                fraction = float(env_fraction)
+            except ValueError:
+                fraction = None
+        budget = _memory_target_bytes(int(total_mem), fraction)
+
+    if budget <= 0:
+        return 0
+
+    budget = min(int(total_mem), max(int(free_mem), budget))
+
+    pool = cp.cuda.MemoryPool()  # type: ignore[attr-defined]
+    pool.set_limit(budget)
+    cp.cuda.set_allocator(pool.malloc)  # type: ignore[attr-defined]
+
+    pinned_pool = cp.cuda.PinnedMemoryPool()  # type: ignore[attr-defined]
+    pinned_pool.set_limit(budget)
+    cp.cuda.set_pinned_memory_allocator(pinned_pool.malloc)  # type: ignore[attr-defined]
+
+    global _GPU_MEMORY_POOL, _PINNED_MEMORY_POOL, _GPU_MEMORY_LIMIT_BYTES
+    _GPU_MEMORY_POOL = pool
+    _PINNED_MEMORY_POOL = pinned_pool
+    _GPU_MEMORY_LIMIT_BYTES = budget
+
+    # Trigger lazy initialisation so the pools are ready for the first kernel.
+    if budget > 0:
+        pool.malloc(1)
+        pinned_pool.malloc(1)
+
+    return budget
 
 
 def allocate_pinned_array(
