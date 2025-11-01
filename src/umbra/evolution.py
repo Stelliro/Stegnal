@@ -1,5 +1,3 @@
-# evolution.py
-
 """Evolutionary search utilities for Project Umbra."""
 
 from __future__ import annotations
@@ -9,22 +7,18 @@ import logging
 import os
 import pickle
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .codec import (
-    decode_wav_bytes_to_image,
-    encode_image_to_wav_bytes,
-)
+from .codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
 from .decoding import NoiseStreamDecoder
-from .encoding import NoiseStreamEncoder
+from .encoding import NoisePacket, NoiseStreamEncoder
 from .gpu_runtime import cp, ensure_nvrtc_configured
 from .metrics import (
-    AI_PSNR_BASELINE,
     ReconstructionMetrics,
     audio_fidelity_score,
     composite_score,
@@ -40,7 +34,7 @@ from .reconstruction import (
     suggest_sample_rate,
     suggest_transmission_profile,
 )
-from .runs import append_history, get_run_paths, load_history, new_run
+from .runs import append_history, get_run_paths, new_run
 from .visualization import multiplicative_overlap
 
 if TYPE_CHECKING:  # pragma: no cover - optional neural advisor import
@@ -67,7 +61,6 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(value)
     except ValueError:
-        logger.warning(f"Invalid int for {name}: {value}; using default {default}")
         return default
 
 
@@ -78,39 +71,12 @@ def _env_float(name: str, default: float) -> float:
     try:
         return float(value)
     except ValueError:
-        logger.warning(f"Invalid float for {name}: {value}; using default {default}")
         return default
 
 
-def _ensure_three_channel(image: np.ndarray) -> np.ndarray:
-    """Return ``image`` as a clipped three-channel float array."""
-
-    array = np.asarray(image, dtype=np.float32)
-    if array.ndim == 2:
-        array = np.repeat(array[..., None], 3, axis=2)
-    elif array.ndim == 3 and array.shape[2] == 1:
-        array = np.repeat(array, 3, axis=2)
-    elif array.ndim == 3 and array.shape[2] > 3:
-        array = array[..., :3]
-    if array.ndim != 3 or array.shape[2] != 3:
-        raise ValueError("expected image with shape (H, W, 3)")
-    return np.clip(array, 0.0, 1.0)
-
-
-def _chaotic_seed_mix(values: Sequence[int], noise: int, logistic: float) -> int:
-    """Blend ``values`` with ``noise`` via a keyed hash for seed diversity."""
-
-    buffer = bytearray()
-    buffer.extend(int(noise & 0xFFFFFFFF).to_bytes(4, "little", signed=False))
-    logistic_bits = int(abs(logistic) * (1 << 32)) & 0xFFFFFFFF
-    buffer.extend(logistic_bits.to_bytes(4, "little", signed=False))
-    for value in values:
-        buffer.extend(int(value & 0x7FFFFFFF).to_bytes(8, "little", signed=False))
-    digest = hashlib.blake2s(buffer, person=b"umbChaos").hexdigest()
-    return int.from_bytes(digest[:8], "little") & 0x7FFFFFFF
-
-
-_LINEAGE_RETENTION_FACTOR = 3
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name, "0")
+    return value.lower() not in {"0", "false", "off", "no"}
 
 
 PLATEAU_CFG_DEFAULTS = {
@@ -134,11 +100,6 @@ PLATEAU_CFG = {
 }
 
 
-def _env_flag(name: str) -> bool:
-    value = os.getenv(name, "0")
-    return value.lower() not in {"0", "false", "off", "no"}
-
-
 DIFFICULTY_LADDER_DEFAULTS = {
     "enabled": False,
     "base": 0.48,
@@ -152,274 +113,861 @@ DIFFICULTY_LADDER = {
     "base": _env_float("UMBRA_DIFFICULTY_BASE", DIFFICULTY_LADDER_DEFAULTS["base"]),
     "spike": _env_float("UMBRA_DIFFICULTY_SPIKE", DIFFICULTY_LADDER_DEFAULTS["spike"]),
     "period_gens": _env_int("UMBRA_DIFFICULTY_PERIOD_GENS", DIFFICULTY_LADDER_DEFAULTS["period_gens"]),
-    "spike_len_gens": _env_int("UMBRA_DIFFICULTY_SPIKE_LEN_GENS", DIFFICULTY_LADDER_DEFAULTS["spike_len_gens"]),
+    "spike_len_gens": _env_int(
+        "UMBRA_DIFFICULTY_SPIKE_LEN_GENS", DIFFICULTY_LADDER_DEFAULTS["spike_len_gens"]
+    ),
 }
-
-
-@dataclass(frozen=True)
-class CandidateResult:
-    """Outcome from evaluating a single candidate."""
-
-    seed: int
-    sigma: float
-    reconstruction: np.ndarray
-    metrics: ReconstructionMetrics
-    overlap: float
-    reward: float
-    waveform: bytes | None = None
-
-
-@dataclass(frozen=True)
-class GenerationRecord:
-    """Snapshot of a complete generation."""
-
-    generation: int
-    candidates: tuple[CandidateResult, ...]
-    best_candidate: CandidateResult
-    mean_reward: float
-    difficulty: float
-    duration: float
-
-
-@dataclass(frozen=True)
-class ParentLineage:
-    """Ancestor chain for a candidate seed."""
-
-    seed: int
-    parent_seed: int | None = None
-    generation: int | None = None
-    reward: float | None = None
 
 
 @dataclass
 class HyperPerformanceProfile:
-    """Tunable hyperparameters for evolution runs."""
+    """Lightweight hyper-performance recommendation snapshot."""
 
-    batch_size: int = 8
-    autosave_interval: int = 5
+    enabled: bool = False
+    target_subjects: int = 0
+    batch_size: int = 0
+    dwell_generations: int = 0
+    autosave_interval: int = 0
+    queue_generations: int = 0
     mean_duration: float = 0.0
     throughput: float = 0.0
+    last_update: int = -1
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "enabled": self.enabled,
+            "target_subjects": self.target_subjects,
             "batch_size": self.batch_size,
+            "dwell_generations": self.dwell_generations,
             "autosave_interval": self.autosave_interval,
+            "queue_generations": self.queue_generations,
             "mean_duration": self.mean_duration,
             "throughput": self.throughput,
+            "last_update": self.last_update,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> HyperPerformanceProfile:
-        return cls(
-            batch_size=int(data.get("batch_size", 8)),
-            autosave_interval=int(data.get("autosave_interval", 5)),
-            mean_duration=float(data.get("mean_duration", 0.0)),
-            throughput=float(data.get("throughput", 0.0)),
+    def from_dict(cls, payload: dict[str, Any]) -> HyperPerformanceProfile:
+        profile = cls(enabled=bool(payload.get("enabled", False)))
+        profile.target_subjects = int(payload.get("target_subjects", 0))
+        profile.batch_size = int(payload.get("batch_size", 0))
+        profile.dwell_generations = int(payload.get("dwell_generations", 0))
+        profile.autosave_interval = int(payload.get("autosave_interval", 0))
+        profile.queue_generations = int(payload.get("queue_generations", 0))
+        profile.mean_duration = float(payload.get("mean_duration", 0.0))
+        profile.throughput = float(payload.get("throughput", 0.0))
+        profile.last_update = int(payload.get("last_update", -1))
+        return profile
+
+
+@dataclass
+class CandidateResult:
+    """Summary of a single AI attempt within a generation."""
+
+    seed: int
+    reconstruction: np.ndarray
+    metrics: ReconstructionMetrics
+    overlap_score: float
+    ai_score: float
+    reward: float
+    execution_backend: str
+    sigma: float
+    frame_time_ms: float | None = None
+    predicted_reward: float | None = None
+    feature_vector: tuple[float, ...] = field(default_factory=tuple)
+    reward_components: dict[str, float] = field(default_factory=dict)
+    waveform_reconstruction: np.ndarray | None = None
+    waveform_reference_metrics: ReconstructionMetrics | None = None
+    waveform_reference_overlap: float | None = None
+    waveform_packet_metrics: ReconstructionMetrics | None = None
+    waveform_packet_overlap: float | None = None
+    waveform_reference_partial: float | None = None
+    waveform_alignment_partial: float | None = None
+    waveform_sample_rate: int | None = None
+    waveform_segments: int | None = None
+    waveform_marker_duration: float | None = None
+    waveform_sound_score: float | None = None
+    waveform_readability_score: float | None = None
+    waveform_alignment_score: float | None = None
+    team_score: float | None = None
+
+
+@dataclass
+class GenerationRecord:
+    """Collection of candidates evaluated for a specific generation."""
+
+    index: int
+    candidates: list[CandidateResult] = field(default_factory=list)
+    reward_summary: float = 0.0
+    reward_peak: float = 0.0
+    cumulative_reward: float = 0.0
+    difficulty_level: float = 0.0
+    difficulty_raw: float = 0.0
+    improvement: float = 0.0
+    checkpoint_tag: str | None = None
+
+    @property
+    def best_candidate(self) -> CandidateResult:
+        return max(
+            self.candidates,
+            key=lambda cand: (cand.reward, cand.overlap_score, cand.metrics.ssim),
         )
+
+    @property
+    def difficulty_normalized(self) -> float:
+        return float(np.clip(self.difficulty_level, 0.0, 1.0))
+
+
+@dataclass
+class ParentLineage:
+    """History entry tracking a candidate seed across generations."""
+
+    seed: int
+    origin_generation: int
+    metrics: ReconstructionMetrics
+    overlap_score: float
+    appearances: int = 1
+    cumulative_reward: float = 0.0
+    peak_reward: float = 0.0
+    last_generation: int = -1
 
 
 @dataclass
 class EvolutionSession:
-    """Serializable snapshot of an evolution run."""
+    """Serializable snapshot of an :class:`EvolutionManager`."""
 
+    image_signature: str
     original: np.ndarray
+    encoder_config: dict[str, Any]
+    decoder_config: dict[str, Any]
     population_size: int
     base_seed: int
     autosave_interval: int
     generations: list[GenerationRecord]
     rng_state: dict[str, Any]
+    run_id: str | None
+    next_generation_index: int
     parent_lineage: list[ParentLineage]
-    elite_seeds: list[int]
-    best_overlap: float
     lifetime_reward: float
     reward_trace: list[float]
     difficulty_trace: list[float]
+    elite_seeds: list[int]
+    advisor_state: dict[str, Any] | None
+    best_overlap: float
     plateau_generations: int
     mutation_boost: int
     hyper_profile: dict[str, Any]
-    run_id: str | None = None
-    next_generation_index: int | None = None
-    enable_waveform: bool = True
-    advisor_state: dict[str, Any] | None = None
+    enable_waveform: bool
+    max_generations: int | None
+
+
+def _ensure_three_channel(image: np.ndarray) -> np.ndarray:
+    array = np.asarray(image, dtype=np.float32)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
+    elif array.ndim == 3 and array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    if array.ndim != 3 or array.shape[2] < 3:
+        raise ValueError("expected image with shape (H, W, 3)")
+    return np.clip(array[..., :3], 0.0, 1.0)
+
+
+def _chaotic_seed_mix(values: Sequence[int], noise: int, logistic: float) -> int:
+    buffer = bytearray()
+    buffer.extend(int(noise & 0xFFFFFFFF).to_bytes(4, "little", signed=False))
+    logistic_bits = int(abs(logistic) * (1 << 32)) & 0xFFFFFFFF
+    buffer.extend(logistic_bits.to_bytes(4, "little", signed=False))
+    for value in values:
+        buffer.extend(int(value & 0x7FFFFFFF).to_bytes(8, "little", signed=False))
+    digest = hashlib.blake2s(buffer, person=b"umbChaos").hexdigest()
+    return int(digest[:16], 16) & 0x7FFFFFFF
+
+
+def compute_image_signature(array: np.ndarray) -> str:
+    arr = np.asarray(array, dtype=np.float32)
+    return hashlib.sha1(arr.tobytes()).hexdigest()
 
 
 class EvolutionManager:
-    """Manage evolutionary search for optimal noise parameters."""
+    """Manage an evolutionary search over encoder/decoder seeds."""
 
     def __init__(
         self,
         original: np.ndarray,
-        *,
-        encoder: NoiseStreamEncoder | None = None,
-        decoder: NoiseStreamDecoder | None = None,
-        population_size: int = 8,
-        base_seed: int | None = None,
+        encoder: NoiseStreamEncoder,
+        decoder: NoiseStreamDecoder,
+        population_size: int,
+        base_seed: int,
         autosave_interval: int = 5,
         advisor: NeuralRewardModel | None = None,
+        *,
         run_id: str | None = None,
         next_generation_index: int | None = None,
         enable_waveform: bool = True,
+        max_generations: int | None = None,
     ) -> None:
         self.original = _ensure_three_channel(original)
-        self.encoder = encoder or NoiseStreamEncoder()
-        self.decoder = decoder or NoiseStreamDecoder()
-        self.population_size = max(1, population_size)
-        self.base_seed = base_seed or int(time.time())
-        self.autosave_interval = max(1, autosave_interval)
-        self._reward_model = advisor
+        self.encoder = encoder
+        self.decoder = decoder
+        self.base_seed = int(base_seed)
+        self.enable_waveform = bool(enable_waveform)
+        self.max_generations = (
+            int(max_generations)
+            if max_generations is not None and int(max_generations) > 0
+            else None
+        )
+        self._hyper_enabled = self.hyper_mode_enabled()
+        self._hyper_profile = self.default_hyper_profile(population_size, autosave_interval)
+        if self._hyper_profile.enabled:
+            self.population_size = max(1, int(self._hyper_profile.batch_size or population_size))
+            self.autosave_interval = max(
+                1, int(self._hyper_profile.autosave_interval or autosave_interval)
+            )
+        else:
+            self.population_size = max(1, int(population_size))
+            self.autosave_interval = max(1, int(autosave_interval))
+        if run_id is None:
+            run_id, run_dir = new_run()
+        else:
+            run_id = str(run_id)
+            run_dir, _ = get_run_paths(run_id)
+        self.run_id = run_id
+        self._run_directory = run_dir
+        self._reward_model: NeuralRewardModel | None = advisor
         self.generations: list[GenerationRecord] = []
         self.rng = np.random.default_rng(self.base_seed)
-        self._parent_lineage: dict[int, ParentLineage] = {}
+        self.next_generation_index = int(next_generation_index or 0)
         self.lifetime_reward = 0.0
         self.reward_trace: list[float] = []
         self.difficulty_trace: list[float] = []
+        self._parent_lineage: dict[int, ParentLineage] = {}
         self._elite_pool: list[int] = []
+        self._overlap_history: list[float] = []
         self._best_overlap = 0.0
         self._plateau_generations = 0
         self._mutation_boost = 0
-        self._hyper_enabled = True
-        self._hyper_profile = self.default_hyper_profile()
+        self._difficulty_bias = 0.5
+        self._gpu_warning_emitted = False
         self._duration_ema = 0.0
         self._throughput_ema = 0.0
-        self.run_id = run_id or new_run()
-        self.next_generation_index = next_generation_index or 0
-        self.enable_waveform = enable_waveform
 
-    def default_hyper_profile(self) -> HyperPerformanceProfile:
+    # ------------------------------------------------------------------ basic properties
+    @property
+    def mutation_boost(self) -> int:
+        return self._mutation_boost
+
+    @property
+    def parent_lineage(self) -> list[ParentLineage]:
+        return list(self._parent_lineage.values())
+
+    @property
+    def image_signature(self) -> str:
+        return compute_image_signature(self.original)
+
+    @property
+    def reward_advisor(self) -> NeuralRewardModel | None:
+        return self._reward_model
+
+    def set_advisor(self, advisor: NeuralRewardModel | None) -> None:
+        self._reward_model = advisor
+
+    @property
+    def hyper_profile(self) -> HyperPerformanceProfile:
+        return self._hyper_profile
+
+    @property
+    def run_directory(self) -> Path:
+        return self._run_directory
+
+    # ------------------------------------------------------------------ configuration helpers
+    @staticmethod
+    def hyper_mode_enabled() -> bool:
+        return _env_flag("UMBRA_HYPER_MODE")
+
+    @staticmethod
+    def default_hyper_profile(population: int, autosave_interval: int) -> HyperPerformanceProfile:
+        if not EvolutionManager.hyper_mode_enabled():
+            return HyperPerformanceProfile(enabled=False, batch_size=population, autosave_interval=autosave_interval)
         return HyperPerformanceProfile(
-            batch_size=self.population_size,
-            autosave_interval=self.autosave_interval,
+            enabled=True,
+            target_subjects=150,
+            batch_size=max(5, int(population)),
+            dwell_generations=30,
+            autosave_interval=max(10, int(autosave_interval)),
+            queue_generations=30,
+            mean_duration=0.0,
+            throughput=0.0,
+            last_update=-1,
         )
 
-    def evolve_generation(self, difficulty: float = 0.5, max_iters: int = 10) -> GenerationRecord:
-        candidates = []
-        start_time = time.time()
+    def update_settings(
+        self,
+        *,
+        population_size: int | None = None,
+        autosave_interval: int | None = None,
+    ) -> None:
+        if population_size is not None:
+            self.population_size = max(1, int(population_size))
+        if autosave_interval is not None:
+            self.autosave_interval = max(1, int(autosave_interval))
 
-        for _ in range(self.population_size):
-            seed = self.rng.integers(0, 2**31)
-            sigma = np.clip(difficulty + self.rng.normal(0, 0.05), 0.1, 1.0)
-            packet = self.encoder.encode(self.original, seed, sigma=sigma)
-            recon = self.decoder.decode(packet, seed)
-            metrics = compute_metrics(self.original, recon)
-            overlap = multiplicative_overlap(self.original, recon)
-            reward = composite_score(metrics, overlap)
-            waveform = encode_image_to_wav_bytes(recon) if self.enable_waveform else None
-            candidates.append(CandidateResult(seed=seed, sigma=sigma, reconstruction=recon, metrics=metrics, overlap=overlap, reward=reward, waveform=waveform))
+    # ------------------------------------------------------------------ persistence helpers
+    def _history_payload(self, generation: GenerationRecord) -> dict[str, object]:
+        best_seed: int | None = None
+        best_overlap: float | None = None
+        best_ssim: float | None = None
+        if generation.candidates:
+            best = generation.best_candidate
+            best_seed = int(best.seed)
+            best_overlap = float(best.overlap_score)
+            best_ssim = float(best.metrics.ssim)
+        return {
+            "generation": int(generation.index),
+            "reward": float(generation.reward_summary),
+            "difficulty": float(generation.difficulty_level),
+            "best_seed": best_seed,
+            "best_overlap": best_overlap,
+            "best_ssim": best_ssim,
+        }
 
-        best = max(candidates, key=lambda c: c.reward)
-        mean_reward = float(np.mean([c.reward for c in candidates]))
-        duration = time.time() - start_time
-
-        record = GenerationRecord(
-            generation=self.next_generation_index,
-            candidates=tuple(candidates),
-            best_candidate=best,
-            mean_reward=mean_reward,
-            difficulty=difficulty,
-            duration=duration,
-        )
-
-        self.append_generation_record(record)
-        return record
-
-    def append_generation_record(self, record: GenerationRecord, persist: bool = True, use_next_index: bool = True) -> None:
-        if use_next_index:
-            record = GenerationRecord(generation=self.next_generation_index, **vars(record))
-            self.next_generation_index += 1
-        self.generations.append(record)
-        self.lifetime_reward += record.mean_reward
-        self.reward_trace.append(record.mean_reward)
-        self.difficulty_trace.append(record.difficulty)
-        if persist and self.run_id:
-            append_history(self.run_id, record)
+    def _persist_generation_history(self, generation: GenerationRecord) -> None:
+        if not self.run_id:
+            return
+        try:
+            append_history(self.run_id, self._history_payload(generation))
+        except Exception:  # pragma: no cover - defensive persistence
+            logger.debug("Failed to persist generation history", exc_info=True)
 
     def sync_history(self) -> None:
         if not self.run_id:
             return
-        for record in self.generations:
-            append_history(self.run_id, record)
+        rows = [self._history_payload(record) for record in self.generations]
+        if not rows:
+            return
+        try:
+            append_history(self.run_id, rows, replace=True)
+        except Exception:  # pragma: no cover - defensive persistence
+            logger.debug("Failed to rebuild generation history", exc_info=True)
+
+    # ------------------------------------------------------------------ parent/seed helpers
+    def _spawn_child_seed(self, anchors: Iterable[int]) -> int:
+        anchor_list = list(int(seed) & 0x7FFFFFFF for seed in anchors)
+        if not anchor_list:
+            return int(self.rng.integers(0, 2**31))
+        sample_size = min(3, len(anchor_list))
+        selected = np.array(self.rng.choice(anchor_list, size=sample_size, replace=False), dtype=np.int64)
+        logistic_source = float(self.rng.random())
+        logistic = 3.999 * logistic_source * (1.0 - logistic_source)
+        combined = 0
+        for idx, parent_seed in enumerate(selected):
+            shift = (idx * 17) % 31
+            combined ^= (int(parent_seed) << shift) & 0x7FFFFFFF
+        walsh = int(np.bitwise_xor.reduce(selected ^ np.roll(selected, 1))) & 0x7FFFFFFF
+        noise = int(self.rng.integers(0, 2**31))
+        chaotic = _chaotic_seed_mix(selected.tolist(), noise, logistic)
+        logistic_component = int(abs(logistic) * 0x7FFFFFFF) & 0x7FFFFFFF
+        mutation = int(self.rng.integers(0, 2**31))
+        return (combined ^ walsh ^ chaotic ^ logistic_component ^ mutation) & 0x7FFFFFFF
+
+    def _select_seed_pool(self, parent_selection: Sequence[int] | None, extra: int) -> list[int]:
+        anchors: list[int] = []
+        if parent_selection:
+            seen: set[int] = set()
+            for seed in parent_selection:
+                seed_int = int(seed) & 0x7FFFFFFF
+                if seed_int not in seen:
+                    seen.add(seed_int)
+                    anchors.append(seed_int)
+        elif self._elite_pool:
+            anchors.extend(self._elite_pool[-self.population_size :])
+
+        seeds: list[int] = []
+        total_needed = self.population_size + max(0, extra)
+        if anchors:
+            keep = min(len(anchors), max(self.population_size - 1, 1))
+            seeds.extend(anchors[:keep])
+            if len(seeds) < self.population_size:
+                seeds.append(self._spawn_child_seed(anchors))
+        while len(seeds) < total_needed:
+            if anchors:
+                seeds.append(self._spawn_child_seed(anchors))
+            else:
+                seeds.append(int(self.rng.integers(0, 2**31)))
+        return seeds[:total_needed]
+
+    def _update_parent_lineage(
+        self,
+        seed: int,
+        generation_index: int,
+        metrics: ReconstructionMetrics,
+        overlap: float,
+        reward: float,
+    ) -> None:
+        entry = self._parent_lineage.get(seed)
+        if entry is None:
+            entry = ParentLineage(
+                seed=seed,
+                origin_generation=generation_index,
+                metrics=metrics,
+                overlap_score=overlap,
+                cumulative_reward=reward,
+                peak_reward=reward,
+                last_generation=generation_index,
+            )
+            self._parent_lineage[seed] = entry
+            return
+        entry.metrics = metrics
+        entry.overlap_score = overlap
+        entry.appearances += 1
+        entry.cumulative_reward += reward
+        entry.peak_reward = max(entry.peak_reward, reward)
+        entry.last_generation = generation_index
+
+    # ------------------------------------------------------------------ candidate evaluation
+    def _evaluate_candidate(self, seed: int, difficulty: float) -> CandidateResult:
+        reference = self.original
+        start = time.time()
+        prefer_gpu = cp is not None
+        allow_cpu_fallback = True
+        reconstruction: np.ndarray
+        packet: NoisePacket | None = None
+        backend = "cpu"
+
+        if not prefer_gpu and not self._gpu_warning_emitted:
+            logger.warning(
+                "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
+            )
+            self._gpu_warning_emitted = True
+
+        if prefer_gpu:
+            try:
+                ensure_nvrtc_configured()
+            except Exception:  # pragma: no cover - optional diagnostics
+                logger.debug("NVRTC configuration failed; falling back to CPU", exc_info=True)
+                prefer_gpu = False
+
+        if self.encoder.sigma <= 0:
+            reconstruction = reference.copy()
+        else:
+            attempt_gpu = prefer_gpu
+            while True:
+                try:
+                    packet = self.encoder.encode(
+                        reference,
+                        seed,
+                        allow_cpu_fallback=allow_cpu_fallback,
+                        prefer_gpu=attempt_gpu,
+                    )
+                    backend = getattr(packet, "encoded_backend", "gpu" if attempt_gpu else "cpu")
+                    if attempt_gpu and backend != "gpu" and not self._gpu_warning_emitted:
+                        logger.warning(
+                            "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
+                        )
+                        self._gpu_warning_emitted = True
+                    reconstruction = self.decoder.decode(
+                        packet,
+                        seed,
+                        allow_cpu_fallback=allow_cpu_fallback,
+                    )
+                    break
+                except GPUAccelerationRequiredError:
+                    raise
+                except ValueError as exc:
+                    if "Sigma must be positive" in str(exc):
+                        reconstruction = reference.copy()
+                        packet = None
+                        backend = "cpu"
+                        break
+                    raise
+                except Exception as exc:  # pragma: no cover - GPU fallback path
+                    if attempt_gpu and allow_cpu_fallback:
+                        logger.warning(
+                            "GPU acceleration unavailable; falling back to CPU execution for evolution runs."
+                        )
+                        self._gpu_warning_emitted = True
+                        attempt_gpu = False
+                        continue
+                    raise exc
+
+        recon = np.clip(np.asarray(reconstruction, dtype=np.float32), 0.0, 1.0)
+        metrics = compute_metrics(reference, recon)
+        _, overlap = multiplicative_overlap(reference, recon)
+        reward = composite_score(overlap, metrics.psnr, metrics.ssim)
+        ai_score = reward
+        predicted_reward: float | None = None
+        channel_axis = -1 if reference.ndim == 3 else None
+        feature_vector: tuple[float, ...] = (
+            float(overlap),
+            metrics.psnr,
+            metrics.ssim,
+            compute_ms_ssim(reference, recon, channel_axis),
+            dct_band_correlation(reference, recon),
+        )
+        reward_components = {
+            "overlap": float(overlap),
+            "psnr": metrics.psnr,
+            "ssim": metrics.ssim,
+        }
+
+        if self._reward_model is not None:
+            try:
+                feature_array = np.asarray(feature_vector, dtype=np.float32)
+                predicted_reward = float(self._reward_model.predict(feature_array))
+                self._reward_model.update(
+                    feature_array.reshape(1, -1), np.array([reward], dtype=np.float32)
+                )
+            except Exception:  # pragma: no cover - advisory failure should not abort evolution
+                logger.debug("Neural advisor update failed", exc_info=True)
+                predicted_reward = None
+
+        waveform_image: np.ndarray | None = None
+        waveform_reference_metrics: ReconstructionMetrics | None = None
+        waveform_reference_overlap: float | None = None
+        waveform_packet_metrics: ReconstructionMetrics | None = None
+        waveform_packet_overlap: float | None = None
+        waveform_reference_partial: float | None = None
+        waveform_alignment_partial: float | None = None
+        waveform_sound_score: float | None = None
+        waveform_readability_score: float | None = None
+        waveform_alignment_score: float | None = None
+        waveform_sample_rate: int | None = None
+        waveform_segments: int | None = None
+        waveform_marker_duration: float | None = None
+        team_score_value: float | None = None
+
+        if self.enable_waveform:
+            try:
+                waveform_sample_rate = suggest_sample_rate(reference)
+                waveform_segments, waveform_marker_duration = suggest_transmission_profile(reference)
+                wav_bytes = encode_image_to_wav_bytes(
+                    recon,
+                    sample_rate=waveform_sample_rate,
+                    segments=waveform_segments,
+                    marker_duration=waveform_marker_duration,
+                )
+                waveform_image, metadata = decode_wav_bytes_to_image(
+                    wav_bytes,
+                    resolution=recon.shape[:2],
+                    sample_rate=waveform_sample_rate,
+                    segments=waveform_segments,
+                    marker_duration=waveform_marker_duration,
+                    return_metadata=True,
+                )
+                waveform_sample_rate = metadata.sample_rate or waveform_sample_rate
+                waveform_segments = metadata.segments or waveform_segments
+                waveform_marker_duration = metadata.marker_duration or waveform_marker_duration
+                waveform_image = _ensure_three_channel(waveform_image)
+                waveform_reference_metrics = compute_metrics(reference, waveform_image)
+                _, waveform_reference_overlap = multiplicative_overlap(reference, waveform_image)
+                waveform_packet_metrics = compute_metrics(recon, waveform_image)
+                _, waveform_packet_overlap = multiplicative_overlap(recon, waveform_image)
+                try:
+                    waveform_reference_partial = partial_alignment_fraction(reference, waveform_image)
+                except ValueError:
+                    waveform_reference_partial = None
+                try:
+                    waveform_alignment_partial = partial_alignment_fraction(recon, waveform_image)
+                except ValueError:
+                    waveform_alignment_partial = None
+                if waveform_packet_metrics is not None and waveform_packet_overlap is not None:
+                    waveform_alignment_score = audio_fidelity_score(
+                        float(waveform_packet_overlap),
+                        waveform_packet_metrics.psnr,
+                        waveform_packet_metrics.ssim,
+                        partial_credit=waveform_alignment_partial,
+                    )
+                if waveform_reference_metrics is not None and waveform_reference_overlap is not None:
+                    waveform_sound_score = audio_fidelity_score(
+                        float(waveform_reference_overlap),
+                        waveform_reference_metrics.psnr,
+                        waveform_reference_metrics.ssim,
+                        partial_credit=waveform_reference_partial,
+                    )
+                    waveform_readability_score = readability_score(
+                        float(waveform_reference_overlap),
+                        waveform_reference_metrics.psnr,
+                        waveform_reference_metrics.ssim,
+                    )
+                team_score_value = team_cohesion_score(
+                    float(overlap),
+                    metrics.psnr,
+                    metrics.ssim,
+                    sound_reference_overlap=None
+                    if waveform_reference_overlap is None
+                    else float(waveform_reference_overlap),
+                    sound_reference_psnr=None
+                    if waveform_reference_metrics is None
+                    else waveform_reference_metrics.psnr,
+                    sound_reference_ssim=None
+                    if waveform_reference_metrics is None
+                    else waveform_reference_metrics.ssim,
+                    sound_alignment_overlap=None
+                    if waveform_packet_overlap is None
+                    else float(waveform_packet_overlap),
+                    sound_alignment_psnr=None
+                    if waveform_packet_metrics is None
+                    else waveform_packet_metrics.psnr,
+                    sound_alignment_ssim=None
+                    if waveform_packet_metrics is None
+                    else waveform_packet_metrics.ssim,
+                    sound_reference_partial=waveform_reference_partial,
+                    sound_alignment_partial=waveform_alignment_partial,
+                    readability=waveform_readability_score,
+                )
+            except GPUAccelerationRequiredError:
+                raise
+            except Exception:  # pragma: no cover - waveform diagnostics
+                logger.debug("Waveform reconstruction failed", exc_info=True)
+                waveform_image = None
+
+        duration_ms = (time.time() - start) * 1000.0
+        return CandidateResult(
+            seed=int(seed),
+            reconstruction=recon,
+            metrics=metrics,
+            overlap_score=float(overlap),
+            ai_score=float(ai_score),
+            reward=float(reward),
+            execution_backend=backend,
+            sigma=float(self.encoder.sigma),
+            frame_time_ms=duration_ms,
+            predicted_reward=predicted_reward,
+            feature_vector=feature_vector,
+            reward_components=reward_components,
+            waveform_reconstruction=waveform_image,
+            waveform_reference_metrics=waveform_reference_metrics,
+            waveform_reference_overlap=waveform_reference_overlap,
+            waveform_packet_metrics=waveform_packet_metrics,
+            waveform_packet_overlap=waveform_packet_overlap,
+            waveform_reference_partial=waveform_reference_partial,
+            waveform_alignment_partial=waveform_alignment_partial,
+            waveform_sample_rate=waveform_sample_rate,
+            waveform_segments=waveform_segments,
+            waveform_marker_duration=waveform_marker_duration,
+            waveform_sound_score=waveform_sound_score,
+            waveform_readability_score=waveform_readability_score,
+            waveform_alignment_score=waveform_alignment_score,
+            team_score=team_score_value,
+        )
+
+    # ------------------------------------------------------------------ difficulty management
+    def _current_difficulty(self, generation_index: int) -> float:
+        if not DIFFICULTY_LADDER["enabled"]:
+            return self._difficulty_bias
+        period = max(1, int(DIFFICULTY_LADDER["period_gens"]))
+        spike_len = max(1, int(DIFFICULTY_LADDER["spike_len_gens"]))
+        base = float(DIFFICULTY_LADDER["base"])
+        spike = float(DIFFICULTY_LADDER["spike"])
+        cycle_pos = generation_index % period
+        if cycle_pos < spike_len:
+            return float(np.clip(spike, 0.1, 1.0))
+        return float(np.clip(base, 0.1, 1.0))
+
+    def _update_plateau(self, best_overlap: float) -> None:
+        self._overlap_history.append(best_overlap)
+        window = max(1, int(PLATEAU_CFG["window"]))
+        if len(self._overlap_history) < window:
+            return
+        recent = self._overlap_history[-window:]
+        improvement = float(max(recent) - min(recent))
+        threshold = float(PLATEAU_CFG["delta_threshold"]) * 100.0
+        if improvement < threshold:
+            self._plateau_generations += 1
+            if self.encoder.sigma > 0.05:
+                old_sigma = float(self.encoder.sigma)
+                self.encoder.sigma = max(0.01, self.encoder.sigma * 0.9)
+                if PLATEAU_CFG["log"]:
+                    logger.debug(
+                        "Plateau detected; reducing sigma from %.3f to %.3f", old_sigma, self.encoder.sigma
+                    )
+            boost_cap = max(1, int(PLATEAU_CFG["boost_cap_factor"]))
+            boost_step = max(1, int(PLATEAU_CFG["boost_step"]))
+            self._mutation_boost = min(self._mutation_boost + boost_step, boost_cap)
+        else:
+            self._plateau_generations = 0
+            self._mutation_boost = max(0, self._mutation_boost - 1)
+
+    def _apply_hyper_feedback(self, generation: GenerationRecord, duration: float) -> None:
+        if not self._hyper_profile.enabled:
+            return
+        profile = self._hyper_profile
+        previous_capacity = profile.batch_size * max(profile.dwell_generations, 1)
+        profile.batch_size = max(profile.batch_size, self.population_size)
+        profile.batch_size = max(5, profile.batch_size + (1 if generation.reward_peak > 0 else 0))
+        profile.dwell_generations = max(profile.dwell_generations, 10)
+        profile.dwell_generations += 1
+        profile.autosave_interval = max(profile.autosave_interval, self.autosave_interval)
+        if duration > 0 and generation.candidates:
+            throughput = len(generation.candidates) / duration
+            profile.mean_duration = (
+                0.8 * profile.mean_duration + 0.2 * duration
+                if profile.mean_duration
+                else duration
+            )
+            profile.throughput = (
+                0.8 * profile.throughput + 0.2 * throughput
+                if profile.throughput
+                else throughput
+            )
+        profile.last_update = generation.index
+        current_capacity = profile.batch_size * profile.dwell_generations
+        if current_capacity < previous_capacity:
+            profile.dwell_generations = max(profile.dwell_generations, previous_capacity // max(profile.batch_size, 1))
+        self.population_size = max(self.population_size, profile.batch_size)
+        self.autosave_interval = max(self.autosave_interval, profile.autosave_interval)
+
+    # ------------------------------------------------------------------ main evolution loop
+    def run_generation(self, parent_selection: Sequence[int] | None = None) -> GenerationRecord:
+        if self.max_generations is not None and self.next_generation_index >= self.max_generations:
+            raise EvolutionLimitReached(self.next_generation_index, self.max_generations)
+
+        generation_index = self.next_generation_index
+        difficulty = self._current_difficulty(generation_index)
+        mutation_extra = self._mutation_boost if self._mutation_boost > 0 else 0
+        seeds = self._select_seed_pool(parent_selection, mutation_extra)
+
+        record = GenerationRecord(index=generation_index)
+        record.difficulty_raw = difficulty
+        start = time.time()
+        best_overlap = 0.0
+
+        for seed in seeds:
+            candidate = self._evaluate_candidate(seed, difficulty)
+            record.candidates.append(candidate)
+            record.reward_summary += candidate.reward
+            record.reward_peak = max(record.reward_peak, candidate.reward)
+            best_overlap = max(best_overlap, candidate.overlap_score)
+            self._update_parent_lineage(
+                candidate.seed,
+                generation_index,
+                candidate.metrics,
+                candidate.overlap_score,
+                candidate.reward,
+            )
+
+        if not record.candidates:
+            raise RuntimeError("No candidates evaluated; population size may be zero")
+
+        best_candidate = record.best_candidate
+        record.improvement = max(best_candidate.overlap_score - self._best_overlap, 0.0)
+        self._best_overlap = max(self._best_overlap, best_candidate.overlap_score)
+        record.difficulty_level = float(np.clip(best_candidate.overlap_score / 100.0, 0.0, 1.0))
+        record.cumulative_reward = self.lifetime_reward + record.reward_summary
+
+        duration = time.time() - start
+        self._apply_hyper_feedback(record, duration)
+        self._update_plateau(best_overlap)
+
+        self.generations.append(record)
+        self.next_generation_index += 1
+        self.lifetime_reward += record.reward_summary
+        self.reward_trace.append(record.reward_summary)
+        self.difficulty_trace.append(record.difficulty_level)
+
+        if best_candidate.seed not in self._elite_pool:
+            self._elite_pool.append(best_candidate.seed)
+            if len(self._elite_pool) > self.population_size * 4:
+                self._elite_pool = self._elite_pool[-self.population_size * 4 :]
+
+        self._persist_generation_history(record)
+        return record
+
+    # ------------------------------------------------------------------ persistence API
+    def save(self, directory: str | Path) -> Path:
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        session = EvolutionSession(
+            image_signature=self.image_signature,
+            original=self.original,
+            encoder_config={
+                "sigma": getattr(self.encoder, "sigma", 0.2),
+                "waveform_plugin": getattr(getattr(self.encoder, "_plugin", None), "name", "dsss"),
+            },
+            decoder_config={
+                "denoise_sigma": getattr(self.decoder, "denoise_sigma", None),
+            },
+            population_size=self.population_size,
+            base_seed=self.base_seed,
+            autosave_interval=self.autosave_interval,
+            generations=self.generations,
+            rng_state=self.rng.bit_generator.state,
+            run_id=self.run_id,
+            next_generation_index=self.next_generation_index,
+            parent_lineage=self.parent_lineage,
+            lifetime_reward=self.lifetime_reward,
+            reward_trace=self.reward_trace,
+            difficulty_trace=self.difficulty_trace,
+            elite_seeds=self._elite_pool,
+            advisor_state=self._reward_model.to_state() if self._reward_model else None,
+            best_overlap=self._best_overlap,
+            plateau_generations=self._plateau_generations,
+            mutation_boost=self._mutation_boost,
+            hyper_profile=self._hyper_profile.to_dict(),
+            enable_waveform=self.enable_waveform,
+            max_generations=self.max_generations,
+        )
+        target = path / "evolution_session.pkl"
+        with target.open("wb") as handle:
+            pickle.dump(session, handle)
+        return target
 
     @classmethod
-    def from_checkpoint(cls, path: str | Path) -> EvolutionManager:
-        with open(path, "rb") as f:
-            session = pickle.load(f)
-        restored_generations = session.generations
-        original = session.original
-
-        logger.info(
-            "Loaded evolution session from %s with %d generations",
-            path,
-            len(restored_generations),
+    def load(cls, directory: str | Path) -> EvolutionManager:
+        path = Path(directory)
+        if path.is_dir():
+            file_path = path / "evolution_session.pkl"
+        else:
+            file_path = path
+        with file_path.open("rb") as handle:
+            session: EvolutionSession = pickle.load(handle)
+        encoder = NoiseStreamEncoder(
+            sigma=float(session.encoder_config.get("sigma", 0.2)),
+            waveform_plugin=session.encoder_config.get("waveform_plugin", "dsss"),
         )
-        advisor_state = getattr(session, "advisor_state", None)
-        advisor: NeuralRewardModel | None = None
-        if advisor_state is not None:
-            try:
-                from .neural import NeuralRewardModel
-
-                advisor = NeuralRewardModel.from_state(advisor_state)
-            except Exception:  # pragma: no cover - advisor restoration is optional
-                logger.debug("Failed to restore neural advisor", exc_info=True)
-
+        decoder = NoiseStreamDecoder(
+            denoise_sigma=session.decoder_config.get("denoise_sigma", None)
+        )
         manager = cls(
-            original=original,
+            original=session.original,
+            encoder=encoder,
+            decoder=decoder,
             population_size=session.population_size,
             base_seed=session.base_seed,
             autosave_interval=session.autosave_interval,
-            advisor=advisor,
-            run_id=getattr(session, "run_id", None),
-            next_generation_index=getattr(session, "next_generation_index", None),
-            enable_waveform=getattr(session, "enable_waveform", True),
+            run_id=session.run_id,
+            next_generation_index=session.next_generation_index,
+            enable_waveform=session.enable_waveform,
+            max_generations=session.max_generations,
         )
-        for record in restored_generations:
-            manager.append_generation_record(record, persist=False, use_next_index=False)
+        manager.generations = session.generations
         manager.rng.bit_generator.state = session.rng_state
-        lineage = getattr(session, "parent_lineage", [])
-        manager._parent_lineage = {entry.seed: entry for entry in lineage}
-        manager.lifetime_reward = float(getattr(session, "lifetime_reward", 0.0))
-        manager.reward_trace = list(getattr(session, "reward_trace", []))
-        manager.difficulty_trace = list(getattr(session, "difficulty_trace", []))
-        manager._elite_pool = list(getattr(session, "elite_seeds", []))
-        manager._best_overlap = float(getattr(session, "best_overlap", 0.0))
-        manager._plateau_generations = int(getattr(session, "plateau_generations", 0))
-        manager._mutation_boost = int(getattr(session, "mutation_boost", 0))
-        saved_profile = getattr(session, "hyper_profile", None)
-        if saved_profile and manager._hyper_enabled:
+        manager._parent_lineage = {entry.seed: entry for entry in session.parent_lineage}
+        manager.lifetime_reward = session.lifetime_reward
+        manager.reward_trace = list(session.reward_trace)
+        manager.difficulty_trace = list(session.difficulty_trace)
+        manager._elite_pool = list(session.elite_seeds)
+        manager._best_overlap = float(session.best_overlap)
+        manager._plateau_generations = int(session.plateau_generations)
+        manager._mutation_boost = int(session.mutation_boost)
+        if session.hyper_profile:
             try:
-                profile = HyperPerformanceProfile.from_dict(dict(saved_profile))
-            except Exception:  # pragma: no cover - corrupted saves fall back to defaults
+                manager._hyper_profile = HyperPerformanceProfile.from_dict(dict(session.hyper_profile))
+            except Exception:  # pragma: no cover - corrupted save fallback
                 logger.debug("Failed to restore hyper profile", exc_info=True)
-                profile = manager.default_hyper_profile()
-            manager._hyper_profile = profile
-            if profile.batch_size > 0:
-                manager.population_size = max(1, profile.batch_size)
-            if profile.autosave_interval > 0:
-                manager.autosave_interval = max(1, profile.autosave_interval)
-        manager._duration_ema = float(getattr(manager._hyper_profile, "mean_duration", 0.0))
-        manager._throughput_ema = float(getattr(manager._hyper_profile, "throughput", 0.0))
-        if advisor is None and advisor_state is None:
-            manager._reward_model = None
-        stored_next = getattr(session, "next_generation_index", None)
-        if stored_next is not None:
-            manager.next_generation_index = max(
-                manager.next_generation_index, int(stored_next)
-            )
-        if manager.run_id:
+                manager._hyper_profile = manager.default_hyper_profile(
+                    session.population_size, session.autosave_interval
+                )
+        if session.advisor_state is not None:
             try:
-                history_frame = load_history(manager.run_id)
-            except Exception:  # pragma: no cover - defensive
-                logger.debug("Failed to load history for run %s", manager.run_id, exc_info=True)
-                history_frame = None
-            if history_frame is not None and not history_frame.empty:
-                try:
-                    last_index = int(max(history_frame["generation"]))
-                except Exception:  # pragma: no cover - defensive
-                    last_index = None
-                if last_index is not None:
-                    manager.next_generation_index = max(
-                        manager.next_generation_index, last_index + 1
-                    )
-        manager.sync_history()
+                from .neural import NeuralRewardModel
+
+                manager._reward_model = NeuralRewardModel.from_state(session.advisor_state)
+            except Exception:  # pragma: no cover - advisor restoration optional
+                logger.debug("Failed to restore neural advisor", exc_info=True)
+                manager._reward_model = None
+        manager.next_generation_index = max(
+            manager.next_generation_index, int(session.next_generation_index)
+        )
         return manager
 
 
@@ -427,7 +975,9 @@ __all__ = [
     "CandidateResult",
     "EvolutionManager",
     "EvolutionSession",
+    "EvolutionLimitReached",
     "GenerationRecord",
     "ParentLineage",
     "HyperPerformanceProfile",
+    "_chaotic_seed_mix",
 ]

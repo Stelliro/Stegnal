@@ -5,24 +5,16 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .gpu_runtime import (
-    GPUAccelerationRequiredError,
-    allocate_pinned_array,
-    cp,
-    is_cupy_out_of_memory_error,
-    require_gpu,
-)
+from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
 
 if TYPE_CHECKING:
-    from .decoding import NoiseStreamDecoder
-    from .encoding import NoisePacket
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -225,8 +217,13 @@ def image_to_waveform(image: np.ndarray, sample_rate: int) -> np.ndarray:
     height, width = array.shape[:2]
     flat = array.mean(axis=2).reshape(-1)
 
-    t = np.linspace(0, height / sample_rate, height, endpoint=False)
-    waveform = np.sin(2 * np.pi * 1200 * t) * flat
+    total_samples = flat.size
+    duration = height / sample_rate if height > 0 else 0.0
+    t = np.linspace(0, duration, total_samples, endpoint=False)
+    carrier = np.sin(2 * np.pi * 1200 * t)
+    if carrier.size != flat.size:
+        carrier = np.resize(carrier, flat.size)
+    waveform = carrier * flat
 
     return np.clip(waveform, -1.0, 1.0).astype(np.float32)
 
@@ -287,7 +284,13 @@ def reconstruct_from_waveform(
     spectrum = np.abs(np.fft.rfft(waveform))
 
     marker_idx = np.argmin(np.abs(freqs - _MARKER_BASE_FREQUENCY))
-    image_data = spectrum[marker_idx : marker_idx + np.prod(resolution)]
+    required = int(np.prod(resolution))
+    image_data = spectrum[marker_idx : marker_idx + required]
+    if image_data.size < required:
+        repeats = int(np.ceil(required / max(image_data.size, 1)))
+        image_data = np.tile(image_data, repeats)[:required]
+    else:
+        image_data = image_data[:required]
 
     reconstructed = image_data.reshape(resolution)
     reconstructed /= np.max(reconstructed) + 1e-6
@@ -390,6 +393,7 @@ def run_reconstruction_cycle(
 
 
 __all__ = [
+    "GPUAccelerationRequiredError",
     "GeneratedShape",
     "ReconstructionResult",
     "blend_predictions",

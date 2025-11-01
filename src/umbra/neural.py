@@ -120,36 +120,26 @@ class NeuralRewardModel:
         return activations[-1].squeeze(-1).astype(np.float32)
 
     def update(self, features: np.ndarray, rewards: np.ndarray) -> None:
+        if features.ndim != 2:
+            raise ValueError("Expected features with shape (N, D)")
         if features.shape[0] != rewards.shape[0] or features.shape[0] < 2:
-            return  # Need at least two samples for contrastive loss
+            return
 
         normalized = self._normalise_features(features)
-        rewards = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
+        targets = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
 
-        for epoch in range(self.max_epochs):
-            # Forward pass
+        for _ in range(self.max_epochs):
             activations, pre_acts = self._forward(normalized)
-
-            # Pairwise contrastive loss
             preds = activations[-1]
-            diff = preds - preds.T
-            label_diff = rewards - rewards.T > 0
-            loss = -np.mean(diff * label_diff)
-
-            # Add L2 regularization
-            reg_loss = 0.0
-            for layer in self._layers:
-                reg_loss += np.sum(layer.weight ** 2)
-            loss += self.weight_decay * reg_loss
-
-            if np.isnan(loss) or np.isinf(loss):
-                logger.warning("NaN/Inf loss detected; skipping update")
+            error = preds - targets
+            loss = float(np.mean(error ** 2))
+            if not np.isfinite(loss):
+                logger.warning("Invalid loss detected in neural reward model; aborting update")
                 return
 
-            # Backward pass
-            upstream = np.ones_like(preds) / preds.size  # Simplified gradient for contrastive
-            grads_w = []
-            grads_b = []
+            upstream = 2.0 * error / error.shape[0]
+            grads_w: list[np.ndarray] = []
+            grads_b: list[np.ndarray] = []
 
             for layer_index in range(len(self._layers) - 1, -1, -1):
                 layer = self._layers[layer_index]
@@ -163,31 +153,19 @@ class NeuralRewardModel:
 
                 if layer_index > 0:
                     upstream = np.dot(upstream, layer.weight.T)
-                    upstream = np.clip(
-                        upstream, -self._grad_clip, self._grad_clip
-                    )
                     relu_grad = (pre_acts[layer_index - 1] > 0).astype(np.float32)
                     upstream = upstream * relu_grad
                     upstream = np.clip(upstream, -self._grad_clip, self._grad_clip)
 
-            # Update weights with momentum
             for idx, layer in enumerate(self._layers):
-                layer.velocity_w = (
-                    self.momentum * layer.velocity_w
-                    - self.learning_rate * grads_w[idx].astype(np.float32)
-                )
-                layer.velocity_b = (
-                    self.momentum * layer.velocity_b
-                    - self.learning_rate * grads_b[idx].astype(np.float32)
-                )
+                grad_w = grads_w[idx].astype(np.float32) + self.weight_decay * layer.weight
+                grad_b = grads_b[idx].astype(np.float32)
+                layer.velocity_w = self.momentum * layer.velocity_w - self.learning_rate * grad_w
+                layer.velocity_b = self.momentum * layer.velocity_b - self.learning_rate * grad_b
                 layer.weight += layer.velocity_w
                 layer.bias += layer.velocity_b
-                layer.weight = np.clip(
-                    layer.weight, -self._weight_clip, self._weight_clip
-                ).astype(np.float32)
-                layer.bias = np.clip(
-                    layer.bias, -self._weight_clip, self._weight_clip
-                ).astype(np.float32)
+                layer.weight = np.clip(layer.weight, -self._weight_clip, self._weight_clip)
+                layer.bias = np.clip(layer.bias, -self._weight_clip, self._weight_clip)
 
     # ------------------------------------------------------------------
     def to_state(self) -> dict[str, object]:
