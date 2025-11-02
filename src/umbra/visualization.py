@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,33 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OverlapCache:
+    """Reusable weights and baselines for overlap scoring."""
+
+    reference_shape: tuple[int, ...]
+    weights: np.ndarray
+    baseline: float
+    denominator: float
+
+
+def build_overlap_cache(reference: np.ndarray) -> OverlapCache:
+    """Return cached weights and normalization factors for ``reference``."""
+
+    ref = np.clip(np.asarray(reference, dtype=np.float32), 0.0, 1.0)
+    weights = _feature_weight_map(ref)
+    baseline_zero = _weighted_overlap_score(_overlap_against_constant(ref, 0.0), weights)
+    baseline_one = _weighted_overlap_score(_overlap_against_constant(ref, 1.0), weights)
+    baseline = float(max(baseline_zero, baseline_one))
+    denominator = float(max(1.0 - baseline, 1e-6))
+    return OverlapCache(
+        reference_shape=tuple(ref.shape),
+        weights=np.asarray(weights, dtype=np.float32),
+        baseline=baseline,
+        denominator=denominator,
+    )
 
 
 def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
@@ -132,7 +160,9 @@ def _weighted_overlap_score(overlap_map: Any, weights: Any, xp_module: Any | Non
 
 
 def multiplicative_overlap(
-    original: np.ndarray, reconstructed: np.ndarray
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    cache: OverlapCache | None = None,
 ) -> tuple[np.ndarray, float]:
     """Compute an agreement map and a baseline-adjusted percentage score.
 
@@ -146,6 +176,19 @@ def multiplicative_overlap(
 
     if original.shape != reconstructed.shape:
         raise ValueError("Images must share the same shape to compute overlap")
+
+    if cache is not None and cache.reference_shape != original.shape:
+        cache = None
+
+    if cache is not None:
+        orig_cpu = np.asarray(original, dtype=np.float32)
+        recon_cpu = np.asarray(reconstructed, dtype=np.float32)
+        diff = np.abs(orig_cpu - recon_cpu)
+        overlap = np.clip(1.0 - diff, 0.0, 1.0).astype(np.float32)
+        raw_score = _weighted_overlap_score(overlap, cache.weights, np)
+        adjusted = max(raw_score - cache.baseline, 0.0)
+        score = float(np.clip(adjusted / cache.denominator, 0.0, 1.0) * 100.0)
+        return overlap, score
 
     if cp is not None and original.size >= 65_536:  # pragma: no branch - runtime check
         try:
@@ -247,8 +290,10 @@ def colorize_comparison(
 
 
 __all__ = [
+    "build_overlap_cache",
     "colorize_comparison",
     "normalize_for_display",
     "multiplicative_overlap",
+    "OverlapCache",
     "to_uint8_image",
 ]

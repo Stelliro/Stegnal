@@ -43,7 +43,7 @@ from .reconstruction import (
     suggest_transmission_profile,
 )
 from .runs import append_history, get_run_paths, new_run
-from .visualization import multiplicative_overlap
+from .visualization import OverlapCache, build_overlap_cache, multiplicative_overlap
 
 if TYPE_CHECKING:  # pragma: no cover - optional neural advisor import
     from .neural import NeuralRewardModel
@@ -445,6 +445,9 @@ class EvolutionManager:
         self._throughput_ema = 0.0
         self._sound_reference_cache: dict[str, Any] | None = None
         self._sound_reference_ready = False
+        self._reference_overlap_cache: OverlapCache = build_overlap_cache(self.original)
+        self._sound_overlap_cache: OverlapCache | None = None
+        self._waveform_profile: tuple[int, int, float] | None = None
         self._set_population_size(self.population_size)
 
         if cp is not None:
@@ -508,9 +511,12 @@ class EvolutionManager:
                 return self._sound_reference_cache
 
         reference = self.original
+        sample_rate = suggest_sample_rate(reference)
+        segments, marker_duration = suggest_transmission_profile(reference)
+        resolved_sample_rate = sample_rate
+        resolved_segments = segments
+        resolved_marker = marker_duration
         try:
-            sample_rate = suggest_sample_rate(reference)
-            segments, marker_duration = suggest_transmission_profile(reference)
             wav_bytes = encode_image_to_wav_bytes(
                 reference,
                 sample_rate=sample_rate,
@@ -530,7 +536,11 @@ class EvolutionManager:
             resolved_segments = metadata.segments or segments
             resolved_marker = metadata.marker_duration or marker_duration
             metrics = compute_metrics(reference, waveform_image)
-            _, overlap = multiplicative_overlap(reference, waveform_image)
+            _, overlap = multiplicative_overlap(
+                reference,
+                waveform_image,
+                cache=self._reference_overlap_cache,
+            )
             channel_axis = -1 if reference.ndim == 3 else None
             ms_ssim = compute_ms_ssim(reference, waveform_image, channel_axis)
             dct_corr = dct_band_correlation(reference, waveform_image)
@@ -580,6 +590,13 @@ class EvolutionManager:
         with self._state_lock:
             self._sound_reference_cache = payload or None
             self._sound_reference_ready = True
+            if payload and "image" in payload:
+                self._sound_overlap_cache = build_overlap_cache(payload["image"])
+            self._waveform_profile = (
+                int(payload.get("sample_rate", resolved_sample_rate)),
+                int(payload.get("segments", resolved_segments)),
+                float(payload.get("marker_duration", resolved_marker)),
+            )
             return self._sound_reference_cache
 
     def _build_waveform_bootstrap_candidate(
@@ -890,17 +907,34 @@ class EvolutionManager:
 
         recon = np.clip(np.asarray(reconstruction, dtype=np.float32), 0.0, 1.0)
         metrics = compute_metrics(reference, recon)
-        _, overlap_ref = multiplicative_overlap(reference, recon)
+        _, overlap_ref = multiplicative_overlap(
+            reference,
+            recon,
+            cache=self._reference_overlap_cache,
+        )
         reference_overlap = float(overlap_ref)
         bootstrap_overlap: float | None = None
         combined_overlap = reference_overlap
         bootstrap_payload = self._get_sound_reference_payload()
         if bootstrap_payload and "image" in bootstrap_payload:
             baseline_image = np.asarray(bootstrap_payload["image"], dtype=np.float32)
-            _, overlap_bootstrap = multiplicative_overlap(baseline_image, recon)
+            if (
+                self._sound_overlap_cache is None
+                or self._sound_overlap_cache.reference_shape != tuple(baseline_image.shape)
+            ):
+                self._sound_overlap_cache = build_overlap_cache(baseline_image)
+            _, overlap_bootstrap = multiplicative_overlap(
+                baseline_image,
+                recon,
+                cache=self._sound_overlap_cache,
+            )
             bootstrap_overlap = float(overlap_bootstrap)
             combined_overlap = float(
-                np.clip(min(reference_overlap, bootstrap_overlap), 0.0, 100.0)
+                np.clip(
+                    np.sqrt(max(reference_overlap, 0.0) * max(bootstrap_overlap, 0.0)),
+                    0.0,
+                    100.0,
+                )
             )
         reward = composite_score(combined_overlap, metrics.psnr, metrics.ssim)
         ai_score = reward
@@ -954,8 +988,27 @@ class EvolutionManager:
 
         if self.enable_waveform:
             try:
-                waveform_sample_rate = suggest_sample_rate(reference)
-                waveform_segments, waveform_marker_duration = suggest_transmission_profile(reference)
+                if self._waveform_profile is None:
+                    payload = bootstrap_payload or self._get_sound_reference_payload()
+                    if payload and {
+                        "sample_rate",
+                        "segments",
+                        "marker_duration",
+                    } <= payload.keys():
+                        self._waveform_profile = (
+                            int(payload["sample_rate"]),
+                            int(payload["segments"]),
+                            float(payload["marker_duration"]),
+                        )
+                    else:
+                        base_rate = suggest_sample_rate(reference)
+                        base_segments, base_marker = suggest_transmission_profile(reference)
+                        self._waveform_profile = (
+                            int(base_rate),
+                            int(base_segments),
+                            float(base_marker),
+                        )
+                waveform_sample_rate, waveform_segments, waveform_marker_duration = self._waveform_profile
                 wav_bytes = encode_image_to_wav_bytes(
                     recon,
                     sample_rate=waveform_sample_rate,

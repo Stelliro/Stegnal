@@ -157,7 +157,13 @@ def test_generation_metrics_track_sound_alignment() -> None:
             np.asarray(bootstrap_payload["image"], dtype=np.float32), 0.0, 1.0
         )
         _, bootstrap_overlap = multiplicative_overlap(baseline_image, reconstruction)
-        expected_overlap = min(float(packet_overlap), float(bootstrap_overlap))
+        expected_overlap = float(
+            np.clip(
+                np.sqrt(float(packet_overlap) * float(bootstrap_overlap)),
+                0.0,
+                100.0,
+            )
+        )
         assert candidate.sound_bootstrap_overlap == pytest.approx(
             float(bootstrap_overlap), rel=1e-5, abs=1e-5
         )

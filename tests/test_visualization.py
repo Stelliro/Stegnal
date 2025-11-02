@@ -5,6 +5,7 @@ from umbra.visualization import (
     _feature_weight_map,
     _overlap_against_constant,
     _weighted_overlap_score,
+    build_overlap_cache,
     colorize_comparison,
     multiplicative_overlap,
     normalize_for_display,
@@ -38,6 +39,18 @@ def test_multiplicative_overlap_returns_map_and_score():
     baseline = max(baseline_zero, baseline_one)
     expected_score = max(raw_score - baseline, 0.0) / max(1.0 - baseline, 1e-6) * 100.0
     assert score == pytest.approx(expected_score)
+
+
+def test_multiplicative_overlap_with_cache_matches_direct_computation():
+    reference = np.random.default_rng(0).random((32, 32)).astype(np.float32)
+    candidate = np.random.default_rng(1).random((32, 32)).astype(np.float32)
+    cache = build_overlap_cache(reference)
+
+    overlap_cached, score_cached = multiplicative_overlap(reference, candidate, cache=cache)
+    overlap_direct, score_direct = multiplicative_overlap(reference, candidate)
+
+    np.testing.assert_allclose(overlap_cached, overlap_direct)
+    assert score_cached == pytest.approx(score_direct)
 
 
 def test_multiplicative_overlap_reaches_hundred_for_identical_images():
