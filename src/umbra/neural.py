@@ -104,11 +104,14 @@ class NeuralRewardModel:
     def _forward(self, features: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
         activations = [features]
         pre_acts = []
-        for layer in self._layers:
+        for i, layer in enumerate(self._layers):
             z = np.dot(activations[-1], layer.weight) + layer.bias
             pre_acts.append(z)
-            a = np.maximum(z, 0.0)  # ReLU
-            a = np.clip(a, -self._activation_clip, self._activation_clip)
+            if i < len(self._layers) - 1:
+                a = np.maximum(z, 0.0)  # ReLU for hidden layers
+                a = np.clip(a, -self._activation_clip, self._activation_clip)
+            else:
+                a = z  # Linear output layer
             activations.append(a)
         return activations, pre_acts
 
@@ -120,26 +123,41 @@ class NeuralRewardModel:
         return activations[-1].squeeze(-1).astype(np.float32)
 
     def update(self, features: np.ndarray, rewards: np.ndarray) -> None:
-        if features.ndim != 2:
-            raise ValueError("Expected features with shape (N, D)")
         if features.shape[0] != rewards.shape[0] or features.shape[0] < 2:
-            return
+            return  # Need at least two samples for contrastive loss
 
         normalized = self._normalise_features(features)
-        targets = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
+        rewards = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
 
-        for _ in range(self.max_epochs):
+        for epoch in range(self.max_epochs):
+            # Forward pass
             activations, pre_acts = self._forward(normalized)
+
+            # Pairwise contrastive loss
             preds = activations[-1]
-            error = preds - targets
-            loss = float(np.mean(error ** 2))
-            if not np.isfinite(loss):
-                logger.warning("Invalid loss detected in neural reward model; aborting update")
+            n = preds.shape[0]
+            diff = preds - preds.T            # (n, n) pred differences
+            label_diff = (rewards - rewards.T > 0).astype(np.float32)  # (n, n) bool mask
+            loss = -np.mean(diff * label_diff)
+
+            # Add L2 regularization
+            reg_loss = 0.0
+            for layer in self._layers:
+                reg_loss += np.sum(layer.weight ** 2)
+            loss += self.weight_decay * reg_loss
+
+            if np.isnan(loss) or np.isinf(loss):
+                logger.warning("NaN/Inf loss detected; skipping update")
                 return
 
-            upstream = 2.0 * error / error.shape[0]
-            grads_w: list[np.ndarray] = []
-            grads_b: list[np.ndarray] = []
+            # Backward pass — proper contrastive gradient
+            # d(loss)/d(pred_k) = -1/n^2 * (sum_j label(k>j) - sum_j label(j>k))
+            # i.e. positive when k should rank higher, negative otherwise
+            grad_pred = -(label_diff.sum(axis=1, keepdims=True)
+                          - label_diff.sum(axis=0, keepdims=True).T) / (n * n)
+            upstream = grad_pred
+            grads_w = []
+            grads_b = []
 
             for layer_index in range(len(self._layers) - 1, -1, -1):
                 layer = self._layers[layer_index]
@@ -153,19 +171,31 @@ class NeuralRewardModel:
 
                 if layer_index > 0:
                     upstream = np.dot(upstream, layer.weight.T)
+                    upstream = np.clip(
+                        upstream, -self._grad_clip, self._grad_clip
+                    )
                     relu_grad = (pre_acts[layer_index - 1] > 0).astype(np.float32)
                     upstream = upstream * relu_grad
                     upstream = np.clip(upstream, -self._grad_clip, self._grad_clip)
 
+            # Update weights with momentum
             for idx, layer in enumerate(self._layers):
-                grad_w = grads_w[idx].astype(np.float32) + self.weight_decay * layer.weight
-                grad_b = grads_b[idx].astype(np.float32)
-                layer.velocity_w = self.momentum * layer.velocity_w - self.learning_rate * grad_w
-                layer.velocity_b = self.momentum * layer.velocity_b - self.learning_rate * grad_b
+                layer.velocity_w = (
+                    self.momentum * layer.velocity_w
+                    - self.learning_rate * grads_w[idx].astype(np.float32)
+                )
+                layer.velocity_b = (
+                    self.momentum * layer.velocity_b
+                    - self.learning_rate * grads_b[idx].astype(np.float32)
+                )
                 layer.weight += layer.velocity_w
                 layer.bias += layer.velocity_b
-                layer.weight = np.clip(layer.weight, -self._weight_clip, self._weight_clip)
-                layer.bias = np.clip(layer.bias, -self._weight_clip, self._weight_clip)
+                layer.weight = np.clip(
+                    layer.weight, -self._weight_clip, self._weight_clip
+                ).astype(np.float32)
+                layer.bias = np.clip(
+                    layer.bias, -self._weight_clip, self._weight_clip
+                ).astype(np.float32)
 
     # ------------------------------------------------------------------
     def to_state(self) -> dict[str, object]:

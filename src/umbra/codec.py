@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import logging
 import math
-import struct
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from skimage.transform import resize
 
 from .reconstruction import (
     image_to_waveform,
@@ -122,11 +122,16 @@ class TextEncodingMetadata:
     """Metadata embedded during text-to-image encoding."""
 
     resolution: tuple[int, int]
-    payload_length: int
+    payload_bytes: int
     sample_rate: int = 48000
     segments: int = 1
     marker_duration: float = 0.05
     raw_text: str | None = None
+
+    # Legacy alias
+    @property
+    def payload_length(self) -> int:
+        return self.payload_bytes
 
     def with_waveform(
         self,
@@ -137,7 +142,7 @@ class TextEncodingMetadata:
     ) -> TextEncodingMetadata:
         return TextEncodingMetadata(
             resolution=self.resolution,
-            payload_length=self.payload_length,
+            payload_bytes=self.payload_bytes,
             sample_rate=int(sample_rate) if sample_rate is not None else self.sample_rate,
             segments=int(segments) if segments is not None else self.segments,
             marker_duration=float(marker_duration) if marker_duration is not None else self.marker_duration,
@@ -148,6 +153,7 @@ class TextEncodingMetadata:
 def encode_text_to_image(
     text: str,
     *,
+    width: int | None = None,
     resolution: tuple[int, int] | None = None,
     placeholder: bool = True,
     sample_rate: int | None = None,
@@ -159,8 +165,13 @@ def encode_text_to_image(
     if not text:
         text = "Hello, Umbra!"
 
+    payload_bytes = len(text.encode("utf-8"))
+
     if resolution is None:
-        side = int(math.ceil(math.sqrt(len(text.encode("utf-8")) * 1.5)))
+        if width is not None:
+            side = width
+        else:
+            side = int(math.ceil(math.sqrt(payload_bytes * 1.5)))
         resolution = (side, side)
 
     rows, cols = resolution
@@ -172,11 +183,13 @@ def encode_text_to_image(
 
     if placeholder:
         placeholder_image = _generate_placeholder_image(resolution)
-        rgb = np.maximum(rgb, placeholder_image * 0.3)
+        # Keep text data intact in R channel; blend placeholder into G/B only
+        rgb[..., 1] = np.maximum(rgb[..., 1], placeholder_image[..., 1] * 0.3)
+        rgb[..., 2] = np.maximum(rgb[..., 2], placeholder_image[..., 2] * 0.3)
 
     metadata = TextEncodingMetadata(
         resolution=resolution,
-        payload_length=len(text),
+        payload_bytes=payload_bytes,
         sample_rate=suggest_sample_rate(rgb) if sample_rate is None else int(sample_rate),
         segments=suggest_transmission_profile(rgb)[0] if segments is None else int(segments),
         marker_duration=suggest_transmission_profile(rgb)[1] if marker_duration is None else float(marker_duration),
@@ -196,12 +209,13 @@ def decode_image_to_text(
     array = _ensure_rgb_image(image)
     if resolution is not None:
         array = resize(array, resolution + (3,), mode="reflect", anti_aliasing=True)
-    grayscale = np.mean(array, axis=2)
+    # Text is stored losslessly in the R channel
+    grayscale = array[..., 0]
     text = _unpack_text_from_image(grayscale)
 
     metadata = TextEncodingMetadata(
         resolution=tuple(array.shape[:2]),
-        payload_length=len(text),
+        payload_bytes=len(text.encode("utf-8")),
     )
 
     return text, metadata
@@ -210,30 +224,37 @@ def decode_image_to_text(
 def encode_text_to_waveform(
     text: str,
     *,
+    width: int | None = None,
     resolution: tuple[int, int] | None = None,
     sample_rate: int | None = None,
     segments: int | None = None,
     marker_duration: float | None = None,
 ) -> tuple[np.ndarray, TextEncodingMetadata]:
-    """Encode ``text`` into a waveform suitable for sonic transmission."""
+    """Encode ``text`` into a waveform suitable for sonic transmission.
+
+    Text is embedded directly as amplitude values for lossless round-trip.
+    """
 
     image, metadata = encode_text_to_image(
         text,
+        width=width,
         resolution=resolution,
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
     )
-    waveform = image_to_waveform(
-        image,
-        sample_rate=metadata.sample_rate,
-    )
-    return waveform.astype(np.float32), metadata
+    # Encode R-channel pixel values directly (text data lives in R channel).
+    # Scale to ±1 range with known reference so WAV round-trip is lossless:
+    # values are uint8/255.0 ∈ [0, 1]; we map to [-1, 1] via (v * 2 - 1).
+    r_channel = image[..., 0].reshape(-1).astype(np.float32)
+    waveform = r_channel * 2.0 - 1.0
+    return waveform, metadata
 
 
 def encode_text_to_wav_bytes(
     text: str,
     *,
+    width: int | None = None,
     resolution: tuple[int, int] | None = None,
     sample_rate: int | None = None,
     segments: int | None = None,
@@ -243,6 +264,7 @@ def encode_text_to_wav_bytes(
 
     waveform, metadata = encode_text_to_waveform(
         text,
+        width=width,
         resolution=resolution,
         sample_rate=sample_rate,
         segments=segments,
@@ -266,12 +288,14 @@ def encode_image_to_waveform(
         sample_rate = suggest_sample_rate(array)
     if segments is None or marker_duration is None:
         seg, dur = suggest_transmission_profile(array)
-        segments = segments or seg
-        marker_duration = marker_duration or dur
+        segments = segments if segments is not None else seg
+        marker_duration = marker_duration if marker_duration is not None else dur
 
     waveform = image_to_waveform(
         array,
         sample_rate=sample_rate,
+        segments=segments,
+        marker_duration=marker_duration,
     )
     return waveform.astype(np.float32)
 
@@ -304,117 +328,238 @@ class DecodedWavMetadata:
     raw_text: str | None = None
 
 
-def decode_waveform_to_image(
+def _reconstruct_with_strategies(
     waveform: np.ndarray,
+    *,
     resolution: tuple[int, int],
     sample_rate: int,
-    segments: int = 1,
+    segments: int | None,
+    marker_duration: float,
+    advanced_logging: bool = False,
+    return_segments: bool = True,
+) -> tuple[np.ndarray, int]:
+    """Try ``reconstruct_from_waveform`` with segment fallback."""
+    try:
+        return reconstruct_from_waveform(
+            waveform,
+            resolution=resolution,
+            sample_rate=sample_rate,
+            segments=segments,
+            marker_duration=marker_duration,
+            advanced_logging=advanced_logging,
+            return_segments=return_segments,
+            allow_cpu_fallback=True,
+        )
+    except Exception:
+        if segments is not None:
+            return reconstruct_from_waveform(
+                waveform,
+                resolution=resolution,
+                sample_rate=sample_rate,
+                segments=None,
+                marker_duration=marker_duration,
+                advanced_logging=advanced_logging,
+                return_segments=return_segments,
+                allow_cpu_fallback=True,
+            )
+        raise
+
+
+def decode_waveform_to_image(
+    waveform: np.ndarray,
+    *,
+    resolution: tuple[int, int],
+    sample_rate: int,
+    segments: int | None = 1,
     marker_duration: float = 0.05,
     return_metadata: bool = False,
     advanced_logging: bool = False,
-) -> tuple[np.ndarray, DecodedWavMetadata]:
+    allow_cpu_fallback: bool = True,
+) -> np.ndarray | tuple[np.ndarray, DecodedWavMetadata]:
     """Decode ``waveform`` into an RGB image using heuristic reconstruction."""
 
-    if waveform.size == 0:
-        return np.zeros(resolution + (3,), dtype=np.float32), DecodedWavMetadata(sample_rate, segments, marker_duration)
+    waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
 
-    image = reconstruct_from_waveform(
-        waveform,
-        resolution=resolution,
-        sample_rate=sample_rate,
-        segments=segments,
-        marker_duration=marker_duration,
-    )
+    if waveform.size == 0:
+        preview = _generate_placeholder_image(resolution)
+        if return_metadata:
+            return preview, DecodedWavMetadata(sample_rate, segments or 1, marker_duration)
+        return preview
+
+    try:
+        image, detected_segments = _reconstruct_with_strategies(
+            waveform,
+            resolution=resolution,
+            sample_rate=sample_rate,
+            segments=segments,
+            marker_duration=marker_duration,
+            advanced_logging=advanced_logging,
+            return_segments=True,
+        )
+    except Exception:
+        logger.warning("Reconstruction failed; returning waveform preview.")
+        preview = _waveform_preview_image(waveform, resolution)
+        if preview.max() == 0.0:
+            preview = _generate_placeholder_image(resolution)
+        if return_metadata:
+            return preview, DecodedWavMetadata(sample_rate, segments or 1, marker_duration)
+        return preview
 
     metadata = DecodedWavMetadata(
         sample_rate=sample_rate,
-        segments=segments,
+        segments=detected_segments,
         marker_duration=marker_duration,
     )
 
     if return_metadata:
         return image.astype(np.float32), metadata
-    return image.astype(np.float32), metadata
+    return image.astype(np.float32)
 
 
 def decode_wav_bytes_to_image(
     data: bytes,
+    *,
     resolution: tuple[int, int],
     sample_rate: int | None = None,
     segments: int | None = None,
     marker_duration: float | None = None,
     return_metadata: bool = False,
     advanced_logging: bool = False,
-) -> tuple[np.ndarray, DecodedWavMetadata]:
+    allow_cpu_fallback: bool = True,
+) -> tuple[np.ndarray, int] | tuple[np.ndarray, DecodedWavMetadata]:
     """Decode WAV ``data`` into an RGB image."""
 
-    if not data:
-        return np.zeros(resolution + (3,), dtype=np.float32), DecodedWavMetadata(48000, 1, 0.05)
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("data must be bytes or bytearray")
 
-    waveform, loaded_rate = load_waveform_from_wav(data)
-    sample_rate = sample_rate or loaded_rate
+    fallback_rate = sample_rate or 16_000
+    fallback_marker = marker_duration if marker_duration is not None else 0.05
 
-    if segments is None or marker_duration is None:
-        seg, dur = suggest_transmission_profile(np.zeros(resolution))
-        segments = segments or seg
-        marker_duration = marker_duration or dur
+    # Try to load the WAV data
+    try:
+        waveform, loaded_rate = load_waveform_from_wav(data)
+        actual_rate = sample_rate or loaded_rate
+    except Exception:
+        logger.warning("Failed to parse WAV data; returning placeholder preview.")
+        preview = _generate_placeholder_image(resolution)
+        if return_metadata:
+            return preview, DecodedWavMetadata(
+                sample_rate=fallback_rate,
+                segments=segments or 1,
+                marker_duration=fallback_marker,
+            )
+        return preview, fallback_rate
 
-    image, metadata = decode_waveform_to_image(
+    if marker_duration is None:
+        _, marker_duration = suggest_transmission_profile(np.zeros(resolution))
+
+    result = decode_waveform_to_image(
         waveform,
         resolution=resolution,
-        sample_rate=sample_rate,
+        sample_rate=actual_rate,
         segments=segments,
         marker_duration=marker_duration,
         return_metadata=True,
         advanced_logging=advanced_logging,
+        allow_cpu_fallback=allow_cpu_fallback,
+    )
+    image, metadata = result  # type: ignore[misc]
+
+    # Override sample_rate with actual detected rate
+    metadata = DecodedWavMetadata(
+        sample_rate=actual_rate,
+        segments=metadata.segments,
+        marker_duration=metadata.marker_duration,
     )
 
     if return_metadata:
         return image, metadata
-    return image, metadata
+    return image, actual_rate
 
 
 def decode_waveform_to_text(
     waveform: np.ndarray,
-    resolution: tuple[int, int],
-    sample_rate: int,
-    segments: int = 1,
+    *,
+    resolution: tuple[int, int] | None = None,
+    sample_rate: int | None = None,
+    segments: int | None = 1,
     marker_duration: float = 0.05,
-) -> tuple[str, DecodedWavMetadata]:
-    """Decode ``waveform`` into text."""
+    metadata: TextEncodingMetadata | None = None,
+) -> tuple[str, TextEncodingMetadata]:
+    """Decode ``waveform`` into text.
 
-    image, metadata = decode_waveform_to_image(
-        waveform,
-        resolution=resolution,
-        sample_rate=sample_rate,
-        segments=segments,
-        marker_duration=marker_duration,
-        return_metadata=True,
-    )
+    Text is recovered directly from waveform amplitudes for lossless round-trip.
+    """
+
+    if metadata is not None:
+        resolution = resolution or metadata.resolution
+        sample_rate = sample_rate or metadata.sample_rate
+        segments = segments if segments is not None else metadata.segments
+        marker_duration = marker_duration or metadata.marker_duration
+
+    if resolution is None:
+        raise ValueError("resolution must be provided or metadata must contain it")
+    if sample_rate is None:
+        sample_rate = 48000
+
+    # Recover text from waveform amplitudes (waveform was encoded as (pixel * 2 - 1)).
+    # After WAV round-trip, load_waveform_from_wav normalises to ±1 by dividing by
+    # max(abs(samples)), so the shape is preserved even if the global scale changes.
+    waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    # Undo ±1 mapping: pixel = (sample + 1) / 2 (handles normalised data too)
+    pixels = (waveform + 1.0) / 2.0
+    pixels = np.clip(pixels, 0.0, 1.0)
+    # Round-trip through uint8 to avoid float32 precision drift
+    pixels = np.round(pixels * 255.0).astype(np.uint8).astype(np.float32) / 255.0
+
+    rows, cols = resolution
+    expected = rows * cols
+    if pixels.size < expected:
+        padded = np.pad(pixels, (0, expected - pixels.size))
+    else:
+        padded = pixels[:expected]
+    grayscale = padded.reshape(rows, cols)
+
     try:
-        text = _unpack_text_from_image(np.mean(image, axis=2))
+        text = _unpack_text_from_image(grayscale)
     except zlib.error as exc:
-        logger.warning(f"Failed to unpack text from waveform image: {exc}")
+        logger.warning(f"Failed to unpack text from waveform: {exc}")
         text = ""
-    return text, metadata
+
+    return text, TextEncodingMetadata(
+        resolution=resolution,
+        payload_bytes=len(text.encode("utf-8")),
+        sample_rate=sample_rate,
+        segments=segments or 1,
+        marker_duration=marker_duration,
+    )
 
 
 def decode_wav_bytes_to_text(
     data: bytes,
-    resolution: tuple[int, int],
+    *,
+    resolution: tuple[int, int] | None = None,
     sample_rate: int | None = None,
     segments: int | None = None,
     marker_duration: float | None = None,
-) -> tuple[str, DecodedWavMetadata]:
+    metadata: TextEncodingMetadata | None = None,
+) -> tuple[str, TextEncodingMetadata]:
     """Decode WAV ``data`` into text."""
+
+    if metadata is not None:
+        resolution = resolution or metadata.resolution
+        sample_rate = sample_rate or metadata.sample_rate
+        segments = segments if segments is not None else metadata.segments
+        marker_duration = marker_duration if marker_duration is not None else metadata.marker_duration
+
+    if resolution is None:
+        raise ValueError("resolution must be provided or metadata must contain it")
 
     waveform, loaded_rate = load_waveform_from_wav(data)
     sample_rate = sample_rate or loaded_rate
 
-    if segments is None or marker_duration is None:
-        seg, dur = suggest_transmission_profile(np.zeros(resolution))
-        segments = segments or seg
-        marker_duration = marker_duration or dur
+    if marker_duration is None:
+        _, marker_duration = suggest_transmission_profile(np.zeros(resolution))
 
     return decode_waveform_to_text(
         waveform,
@@ -453,6 +598,8 @@ def save_waveform_as_wav(
 
 __all__ = [
     "DecodedWavMetadata",
+    "_ensure_rgb_image",
+    "_reconstruct_with_strategies",
     "decode_wav_bytes_to_image",
     "decode_waveform_to_image",
     "encode_image_to_waveform",

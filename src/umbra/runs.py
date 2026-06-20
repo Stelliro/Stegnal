@@ -1,3 +1,5 @@
+# runs.py
+
 """Helpers for managing persistent evolution run directories."""
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from uuid import uuid4
 
 try:  # pragma: no cover - optional dependency
     import pandas as pd
-except Exception:  # pragma: no cover - defensive
+except ImportError:  # pragma: no cover - defensive
     pd = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
@@ -77,34 +79,34 @@ def _load_history_json(path: Path) -> _HistoryRecords:
     if not path.exists():
         return _HistoryRecords()
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("Failed to parse history payload from %s", path, exc_info=True)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return _HistoryRecords(data)
+        return _HistoryRecords([data])
+    except Exception as exc:
+        logger.debug("Failed to load JSON history from %s: %s", path, exc)
         return _HistoryRecords()
-    rows: list[dict[str, object]] = []
-    for entry in payload:
-        if isinstance(entry, Mapping):
-            rows.append({str(key): value for key, value in entry.items()})
-    return _HistoryRecords(rows)
 
 
-def _write_history_json(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_history_json(path: Path, data: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(rows, handle)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def append_history(
     run_id: str,
     records: Iterable[Mapping[str, object]] | Mapping[str, object],
     *,
-    base_dir: str | Path | None = None,
     replace: bool = False,
+    base_dir: str | Path | None = None,
 ) -> Path:
-    """Append ``records`` to the run history, replacing it when ``replace`` is ``True``."""
+    """Persist ``records`` to the history file for ``run_id``."""
 
-    run_dir, history_path = get_run_paths(run_id, base_dir=base_dir)
     rows = _normalise_records(records)
+    if not rows:
+        return Path()
+
+    _, history_path = get_run_paths(run_id, base_dir=base_dir)
 
     if pd is None:
         existing = [] if replace else list(_load_history_json(history_path))
@@ -171,4 +173,3 @@ def load_history(
 
 
 __all__ = ["append_history", "get_run_paths", "load_history", "new_run"]
-

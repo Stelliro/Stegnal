@@ -444,4 +444,3 @@ def prepare_metrics_chart(
 
 
 __all__ = ["sanitize_progress_rows", "prepare_trend_chart", "prepare_metrics_chart"]
-

@@ -196,14 +196,46 @@ def _synthesise_sound_image(
         center = tuple(rng.integers(size // 2, dim - size // 2) for dim in resolution)
         rotation = float(rng.uniform(0, 360))
         channel = list(colors[color_name]).index(1)
-        prototypes[shape_type](canvas[..., channel], center, size, vol, rotation)
+        if shape_type == "circle":
+            prototypes[shape_type](canvas[..., channel], center, size, vol)
+        else:
+            prototypes[shape_type](canvas[..., channel], center, size, vol, rotation)
         specs.append(ShapeSpec(color=color_name, shape=shape_type, volume=vol, center=center, rotation=rotation, size=size))
 
     return np.clip(canvas, 0.0, 1.0), tuple(specs), np.mean(canvas, axis=2)
 
 
-def generate_sound_art(sound: SyntheticSound, resolution: tuple[int, int] = (128, 128)) -> tuple[np.ndarray, tuple[ShapeSpec, ...], np.ndarray]:
-    """Generate an image inspired by ``sound``."""
+def generate_sound_art(
+    sound: SyntheticSound | None = None,
+    resolution: tuple[int, int] = (128, 128),
+    *,
+    seed: int | None = None,
+    image_size: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, tuple[ShapeSpec, ...], np.ndarray] | tuple[np.ndarray, np.ndarray, SyntheticSound, tuple[ShapeSpec, ...]]:
+    """Generate an image inspired by sound.
+
+    Two calling conventions are supported:
+
+    * ``generate_sound_art(sound)`` → ``(color, shapes, gray)``  (legacy)
+    * ``generate_sound_art(seed=N, image_size=HW)`` → ``(color, gray, sound, shapes)``
+    """
+
+    if seed is not None:
+        res = image_size or resolution
+        rng = np.random.default_rng(seed)
+        sr = 22050
+        samples = rng.standard_normal(sr).astype(np.float32)
+        synth = SyntheticSound(
+            seed=seed,
+            sample_rate=sr,
+            samples=samples,
+            band_volumes=_normalized_band_volumes(np.abs(np.fft.rfft(samples))),
+        )
+        color, shapes, gray = _synthesise_sound_image(rng, synth.band_volumes, res)
+        return color, gray, synth, shapes
+
+    if sound is None:
+        return np.zeros(resolution + (3,)), (), np.zeros(resolution)
 
     if sound.samples.size == 0:
         return np.zeros(resolution + (3,)), (), np.zeros(resolution)

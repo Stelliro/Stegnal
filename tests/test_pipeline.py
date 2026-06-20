@@ -29,6 +29,8 @@ def test_encode_decode_round_trip(tmp_path):
     assert np.allclose(loaded.encoded, packet.encoded)
 
     decoded = decoder.decode(loaded, seed=42)
+    if image.ndim == 2 and decoded.ndim == 3:
+        image = np.stack([image] * 3, axis=-1)
     metrics = compute_metrics(image, decoded)
 
     assert metrics.psnr > 18

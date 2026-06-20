@@ -10,8 +10,23 @@ from io import BytesIO
 from typing import TYPE_CHECKING
 
 import numpy as np
+from scipy.signal import hilbert as scipy_hilbert
 
-from .gpu_runtime import GPUAccelerationRequiredError, cp, require_gpu
+# --- GPU ACCELERATION IMPORTS ---
+try:
+    import cupy as cp
+    from cupyx.scipy.signal import hilbert as cupy_hilbert
+    CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    cupy_hilbert = None
+    CUPY_AVAILABLE = False
+# --- END GPU IMPORTS ---
+
+from .gpu_runtime import (
+    GPUAccelerationRequiredError,
+    require_gpu,
+)
 
 if TYPE_CHECKING:
     pass
@@ -33,7 +48,6 @@ _GPU_MIN_FFT_SAMPLES = 65_536
 
 def suggest_sample_rate(image: np.ndarray) -> int:
     """Return a stable audio sample rate for ``image`` based on its size."""
-
     array = np.asarray(image)
     if array.ndim < 2:
         raise ValueError("image must have at least two dimensions for sample rate suggestion")
@@ -46,7 +60,6 @@ def suggest_sample_rate(image: np.ndarray) -> int:
 
 def suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
     """Return fax-style transmission parameters tailored to ``image``."""
-
     array = np.asarray(image)
     if array.ndim < 2:
         raise ValueError("image must have at least two dimensions for transmission profile")
@@ -59,7 +72,6 @@ def suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
 @dataclass(frozen=True)
 class GeneratedShape:
     """Description of a synthetic geometric primitive used in a collage."""
-
     color: tuple[float, float, float]
     shape: str
     center: tuple[int, int]
@@ -70,7 +82,6 @@ class GeneratedShape:
 @dataclass(frozen=True)
 class ReconstructionResult:
     """Outcome from a noise reconstruction experiment."""
-
     base_image: np.ndarray
     variations: np.ndarray
     ensemble_prediction: np.ndarray
@@ -112,7 +123,6 @@ def _draw_filled_polygon(
     x_coords = np.arange(min_x, max_x + 1)
     yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
 
-    # Inside polygon check (ray casting)
     inside = np.zeros((len(y_coords), len(x_coords)), dtype=bool)
     for i in range(poly.shape[0]):
         j = (i + 1) % poly.shape[0]
@@ -136,13 +146,12 @@ def generate_shape_collage(
     seed: int, *, resolution: tuple[int, int] = (192, 192), shape_count: int = 3
 ) -> tuple[np.ndarray, tuple[GeneratedShape, ...]]:
     """Generate a collage of random shapes on a canvas."""
-
     rng = np.random.default_rng(seed)
     canvas = np.zeros(resolution + (3,), dtype=np.float32)
     shapes = []
 
     prototypes = {
-        "circle": lambda size: np.array([[0, 0]]),  # Placeholder, uses circle func
+        "circle": lambda size: np.array([[0, 0]]),
         "square": lambda size: np.array([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]) * size,
         "triangle": lambda size: np.array([[0, -0.577], [-0.5, 0.289], [0.5, 0.289]]) * size,
     }
@@ -150,7 +159,9 @@ def generate_shape_collage(
     for _ in range(shape_count):
         shape_type = rng.choice(list(prototypes.keys()))
         color = rng.uniform(0.2, 0.8, size=3)
-        size = int(rng.uniform(20, min(resolution) / 2))
+        size_upper = max(2.0, min(resolution) / 2)
+        size_lower = min(20.0, size_upper - 1.0)
+        size = int(rng.uniform(max(1, size_lower), size_upper))
         center = tuple(rng.integers(size // 2, dim - size // 2) for dim in resolution)
         rotation = float(rng.uniform(0, 360))
 
@@ -176,7 +187,6 @@ def create_variations(
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """Create corrupted variations of ``image`` for ensemble prediction."""
-
     if rng is None:
         rng = np.random.default_rng()
 
@@ -195,7 +205,6 @@ def create_variations(
 
 def predict_missing_pixels(variations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Predict an ensemble image and coverage map from ``variations``."""
-
     if variations.ndim != 4:
         raise ValueError("Variations must be 4D (N, H, W, C)")
 
@@ -203,52 +212,116 @@ def predict_missing_pixels(variations: np.ndarray) -> tuple[np.ndarray, np.ndarr
     count = np.sum(valid_mask, axis=0)
     ensemble = np.sum(variations, axis=0) / np.maximum(count, 1)
     coverage = count / variations.shape[0]
+    if coverage.ndim == 3:
+        coverage = np.mean(coverage, axis=-1)
 
     return ensemble.astype(np.float32), coverage.astype(np.float32)
 
 
-def image_to_waveform(image: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Convert ``image`` to a fax-style waveform with markers."""
-
+def image_to_waveform(
+    image: np.ndarray,
+    sample_rate: int,
+    *,
+    segments: int = 1,
+    marker_duration: float = 0.05,
+) -> np.ndarray:
+    """Convert ``image`` to a fax-style waveform using Amplitude Modulation."""
     array = np.asarray(image, dtype=np.float32)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
     if array.ndim != 3 or array.shape[2] != 3:
         raise ValueError("Expected RGB image")
 
-    height, width = array.shape[:2]
     flat = array.mean(axis=2).reshape(-1)
+    num_samples = min(sample_rate, flat.size)
 
-    total_samples = flat.size
-    duration = height / sample_rate if height > 0 else 0.0
-    t = np.linspace(0, duration, total_samples, endpoint=False)
+    duration = num_samples / float(sample_rate)
+    t = np.linspace(0, duration, num_samples, endpoint=False, dtype=np.float32)
+
     carrier = np.sin(2 * np.pi * 1200 * t)
-    if carrier.size != flat.size:
-        carrier = np.resize(carrier, flat.size)
-    waveform = carrier * flat
+    base_waveform = np.clip(carrier * flat[:num_samples], -1.0, 1.0).astype(np.float32)
 
-    return np.clip(waveform, -1.0, 1.0).astype(np.float32)
+    if segments <= 1:
+        # Pad to exactly sample_rate samples
+        if base_waveform.size < sample_rate:
+            base_waveform = np.pad(base_waveform, (0, sample_rate - base_waveform.size))
+        else:
+            base_waveform = base_waveform[:sample_rate]
+        return base_waveform
+
+    # Cap total duration
+    marker_samples = int(round(marker_duration * sample_rate))
+    total_samples = (sample_rate + marker_samples) * segments
+    max_samples = int(_MAX_FAX_DURATION_SECONDS * sample_rate)
+    if total_samples > max_samples:
+        segments = max(1, max_samples // (sample_rate + marker_samples))
+        total_samples = (sample_rate + marker_samples) * segments
+
+    parts = []
+    rows_per_seg = max(1, array.shape[0] // segments)
+    for seg_idx in range(segments):
+        row_start = seg_idx * rows_per_seg
+        row_end = min(row_start + rows_per_seg, array.shape[0])
+        seg_flat = array[row_start:row_end].mean(axis=2).reshape(-1)
+        seg_samples = min(sample_rate, seg_flat.size)
+        if seg_samples == 0:
+            seg_samples = sample_rate
+            seg_flat = np.zeros(seg_samples, dtype=np.float32)
+        dur = seg_samples / float(sample_rate)
+        seg_t = np.linspace(0, dur, seg_samples, endpoint=False, dtype=np.float32)
+        seg_carrier = np.sin(2 * np.pi * 1200 * seg_t)
+        seg_wave = np.clip(seg_carrier * seg_flat[:seg_samples], -1.0, 1.0).astype(np.float32)
+        # Pad segment to exactly sample_rate samples
+        if seg_wave.size < sample_rate:
+            seg_wave = np.pad(seg_wave, (0, sample_rate - seg_wave.size))
+        else:
+            seg_wave = seg_wave[:sample_rate]
+        # Add marker tone
+        marker_t = np.linspace(0, marker_duration, marker_samples, endpoint=False, dtype=np.float32)
+        freq = _MARKER_BASE_FREQUENCY + _MARKER_STEP_FREQUENCY * seg_idx
+        marker = np.sin(2 * np.pi * freq * marker_t).astype(np.float32) * 0.5
+        parts.append(np.concatenate([seg_wave, marker]))
+
+    return np.concatenate(parts).astype(np.float32)
 
 
-def segment_image_rows(image: np.ndarray, num_segments: int) -> list[slice]:
-    """Divide ``image`` rows into ``num_segments`` for tiled reconstruction."""
-
+def segment_image_rows(image: np.ndarray, num_segments: int) -> list[tuple[int, int, float]]:
+    """Divide ``image`` rows into ``num_segments`` using contrast-aware boundaries."""
     height = image.shape[0]
-    segment_size = height // num_segments
-    remainder = height % num_segments
+    if num_segments <= 1:
+        gray = np.mean(image, axis=(-1,)) if image.ndim == 3 else image
+        contrast = float(np.std(gray))
+        return [(0, height, contrast)]
+
+    # Compute per-row contrast scores
+    gray = np.mean(image, axis=2) if image.ndim == 3 else image.astype(np.float32)
+    row_contrast = np.array([float(np.std(gray[r])) for r in range(height)])
+
+    # Accumulate contrast and split at roughly equal cumulative contrast
+    cumulative = np.cumsum(row_contrast)
+    total = cumulative[-1] if cumulative[-1] > 0 else 1.0
+
+    splits = [0]
+    for seg_idx in range(1, num_segments):
+        target = (seg_idx / num_segments) * total
+        idx = int(np.searchsorted(cumulative, target))
+        idx = max(splits[-1] + 1, min(idx, height - (num_segments - seg_idx)))
+        splits.append(idx)
+    splits.append(height)
+
     segments = []
-    start = 0
     for i in range(num_segments):
-        end = start + segment_size + (1 if i < remainder else 0)
-        segments.append(slice(start, end))
-        start = end
+        start, end = splits[i], splits[i + 1]
+        contrast = float(np.std(gray[start:end]))
+        segments.append((start, end, contrast))
     return segments
 
 
 def tiled_reconstruction(waveform: np.ndarray, resolution: tuple[int, int], sample_rate: int) -> np.ndarray:
     """Reconstruct large waveforms in tiles to avoid OOM."""
-
     if waveform.size < _GPU_MIN_FFT_SAMPLES or cp is None:
-        return reconstruct_from_waveform(waveform, resolution, sample_rate)  # Fallback to full
-
+        return reconstruct_from_waveform(waveform, resolution, sample_rate)
+    
     require_gpu("tiled FFT reconstruction")
 
     num_tiles = max(1, int(np.ceil(waveform.size / _GPU_MIN_FFT_SAMPLES)))
@@ -270,39 +343,145 @@ def tiled_reconstruction(waveform: np.ndarray, resolution: tuple[int, int], samp
 
 def reconstruct_from_waveform(
     waveform: np.ndarray,
-    resolution: tuple[int, int],
-    sample_rate: int,
-    segments: int = 1,
+    resolution: tuple[int, int] | None = None,
+    sample_rate: int | None = None,
+    *,
+    segments: int | None = None,
     marker_duration: float = 0.05,
-) -> np.ndarray:
-    """Reconstruct an image from ``waveform`` using heuristic decoding."""
+    advanced_logging: bool = False,
+    return_segments: bool = False,
+    allow_cpu_fallback: bool = True,
+    **kwargs,
+) -> np.ndarray | tuple[np.ndarray, int]:
+    """Reconstruct an image from ``waveform`` using AM demodulation, with GPU acceleration."""
+    if resolution is None:
+        resolution = (64, 64)
+    if sample_rate is None:
+        sample_rate = 48000
 
     if waveform.size == 0:
-        return np.zeros(resolution + (3,), dtype=np.float32)
+        blank = np.zeros(resolution + (3,), dtype=np.float32)
+        if return_segments:
+            return blank, segments or 1
+        return blank
 
-    freqs = np.fft.rfftfreq(waveform.size, 1 / sample_rate)
-    spectrum = np.abs(np.fft.rfft(waveform))
+    detected_segments = segments or 1
 
-    marker_idx = np.argmin(np.abs(freqs - _MARKER_BASE_FREQUENCY))
-    required = int(np.prod(resolution))
-    image_data = spectrum[marker_idx : marker_idx + required]
-    if image_data.size < required:
-        repeats = int(np.ceil(required / max(image_data.size, 1)))
-        image_data = np.tile(image_data, repeats)[:required]
+    # Attempt segment detection if segments is None
+    if segments is None and waveform.size > sample_rate:
+        marker_samples = int(round(marker_duration * sample_rate))
+        expected_seg_len = sample_rate + marker_samples
+        if expected_seg_len > 0:
+            detected_segments = max(1, round(waveform.size / expected_seg_len))
+    elif segments is not None:
+        detected_segments = segments
+
+    num_pixels_expected = np.prod(resolution)
+
+    if advanced_logging:
+        logger.info(
+            "Reconstructing from waveform: samples=%d resolution=%s sr=%d segments=%d",
+            waveform.size, resolution, sample_rate, detected_segments,
+        )
+
+    # Per-segment demodulation for multi-segment waveforms
+    if detected_segments > 1 and waveform.size > sample_rate:
+        marker_samples = int(round(marker_duration * sample_rate))
+        segment_total = sample_rate + marker_samples
+        rows_per_seg = max(1, resolution[0] // detected_segments)
+
+        result = np.zeros(resolution + (3,), dtype=np.float32)
+        for seg_idx in range(detected_segments):
+            seg_start = seg_idx * segment_total
+            seg_end = min(seg_start + sample_rate, waveform.size)
+            if seg_start >= waveform.size:
+                break
+            seg_wave = waveform[seg_start:seg_end]
+
+            analytic = scipy_hilbert(seg_wave)
+            envelope = np.abs(analytic).astype(np.float32)
+
+            row_start = seg_idx * rows_per_seg
+            row_end = min(row_start + rows_per_seg, resolution[0])
+            if seg_idx == detected_segments - 1:
+                row_end = resolution[0]
+            seg_pixels = (row_end - row_start) * resolution[1]
+
+            if envelope.size < seg_pixels:
+                demod = np.pad(envelope, (0, seg_pixels - envelope.size))
+            else:
+                demod = envelope[:seg_pixels]
+
+            seg_image = demod.reshape(row_end - row_start, resolution[1])
+            max_val = np.max(seg_image)
+            if max_val > 1e-6:
+                seg_image /= max_val
+
+            result[row_start:row_end] = np.repeat(seg_image[..., np.newaxis], 3, axis=-1)
+
+        if return_segments:
+            return result.astype(np.float32), detected_segments
+        return result.astype(np.float32)
+
+    if CUPY_AVAILABLE:
+        try:
+            logger.debug("Attempting GPU-accelerated Hilbert transform.")
+            waveform_gpu = cp.asarray(waveform)
+            analytic_signal_gpu = cupy_hilbert(waveform_gpu)
+            amplitude_envelope_gpu = cp.abs(analytic_signal_gpu)
+            
+            if amplitude_envelope_gpu.size < num_pixels_expected:
+                pad_width = (0, num_pixels_expected - amplitude_envelope_gpu.size)
+                recovered_data_gpu = cp.pad(amplitude_envelope_gpu, pad_width, 'constant')
+            else:
+                recovered_data_gpu = amplitude_envelope_gpu[:num_pixels_expected]
+            
+            reconstructed_gpu = recovered_data_gpu.reshape(resolution)
+            
+            max_val_gpu = cp.max(reconstructed_gpu)
+            if max_val_gpu > 1e-6:
+                reconstructed_gpu /= max_val_gpu
+            
+            reconstructed = cp.asnumpy(reconstructed_gpu)
+            logger.debug("GPU Hilbert transform successful.")
+            
+            result = np.repeat(reconstructed[..., np.newaxis], 3, axis=-1).astype(np.float32)
+            if return_segments:
+                return result, detected_segments
+            return result
+
+        except Exception as e:
+            logger.warning(f"GPU Hilbert transform failed, falling back to CPU. Error: {e}")
+    
+    logger.debug("Using CPU-based Hilbert transform.")
+    analytic_signal = scipy_hilbert(waveform)
+    amplitude_envelope = np.abs(analytic_signal)
+    
+    if amplitude_envelope.size < num_pixels_expected:
+        recovered_data = np.pad(
+            amplitude_envelope, 
+            (0, num_pixels_expected - amplitude_envelope.size), 
+            'constant'
+        )
     else:
-        image_data = image_data[:required]
+        recovered_data = amplitude_envelope[:num_pixels_expected]
 
-    reconstructed = image_data.reshape(resolution)
-    reconstructed /= np.max(reconstructed) + 1e-6
+    reconstructed = recovered_data.reshape(resolution)
 
-    return np.repeat(reconstructed[..., np.newaxis], 3, axis=-1).astype(np.float32)
+    max_val = np.max(reconstructed)
+    if max_val > 1e-6:
+        reconstructed /= max_val
+
+    result = np.repeat(reconstructed[..., np.newaxis], 3, axis=-1).astype(np.float32)
+    if return_segments:
+        return result, detected_segments
+    return result
 
 
 def blend_predictions(
     ensemble: np.ndarray, audio: np.ndarray, coverage: np.ndarray
 ) -> np.ndarray:
     """Combine ensemble and audio predictions based on coverage confidence."""
-
     ens = np.asarray(ensemble, dtype=np.float32)
     aud = np.asarray(audio, dtype=np.float32)
     cov = np.clip(np.asarray(coverage, dtype=np.float32), 0.0, 1.0)
@@ -321,12 +500,19 @@ def blend_predictions(
 
 def waveform_to_wav_bytes(waveform: np.ndarray, sample_rate: int) -> bytes:
     """Encode ``waveform`` into 16-bit PCM WAV bytes."""
-
     wave = np.asarray(waveform, dtype=np.float32)
     if wave.ndim != 1:
         wave = wave.reshape(-1)
     if wave.size == 0:
-        raise ValueError("Waveform must contain samples")
+        buffer = BytesIO()
+        import wave as _wave
+        with _wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(int(sample_rate))
+            wav_file.writeframes(b'')
+        return buffer.getvalue()
+
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
 
@@ -354,7 +540,6 @@ def run_reconstruction_cycle(
     sample_rate: int = 48_000,
 ) -> ReconstructionResult:
     """Generate a collage, corrupt it, and attempt to reconstruct missing pixels."""
-
     collage, shapes = generate_shape_collage(seed, resolution=resolution)
     rng = np.random.default_rng(seed + 1)
     variations = create_variations(
@@ -392,8 +577,84 @@ def run_reconstruction_cycle(
     )
 
 
+def _encode_stripe_waveform(
+    stripe: np.ndarray,
+    sample_count: int,
+    *,
+    allow_cpu_fallback: bool = True,
+) -> np.ndarray:
+    """Encode a stripe of pixel data into a waveform of ``sample_count`` samples."""
+    array = np.asarray(stripe, dtype=np.float32).reshape(-1)
+
+    if cp is not None:
+        try:
+            gpu_arr = cp.asarray(array)
+            resampled = cp.asnumpy(gpu_arr)
+            # Resample to target length
+            if resampled.size >= sample_count:
+                result = resampled[:sample_count]
+            else:
+                result = np.pad(resampled, (0, sample_count - resampled.size))
+            return result.astype(np.float32)
+        except Exception:
+            if not allow_cpu_fallback:
+                raise GPUAccelerationRequiredError(
+                    "GPU acceleration required for stripe encoding; CPU fallback disabled."
+                )
+
+    if cp is None and not allow_cpu_fallback:
+        raise GPUAccelerationRequiredError(
+            "GPU acceleration required for stripe encoding; CPU fallback disabled."
+        )
+
+    if array.size >= sample_count:
+        return array[:sample_count].astype(np.float32)
+    return np.pad(array, (0, sample_count - array.size)).astype(np.float32)
+
+
+def _fft_magnitude(
+    signal: np.ndarray,
+    n: int,
+    *,
+    advanced_logging: bool = False,
+    allow_cpu_fallback: bool = True,
+) -> np.ndarray:
+    """Return the magnitude of the first ``n//2 + 1`` FFT bins."""
+    signal = np.asarray(signal, dtype=np.float32)
+
+    if cp is not None and signal.size >= _GPU_MIN_FFT_SAMPLES:
+        try:
+            gpu_sig = cp.asarray(signal, dtype=cp.float32)
+            fft_result = cp.fft.rfft(gpu_sig, n=n)
+            mag = cp.abs(fft_result)
+            return cp.asnumpy(mag).astype(np.float32)
+        except Exception:
+            if not allow_cpu_fallback:
+                raise GPUAccelerationRequiredError(
+                    "GPU acceleration required for FFT; CPU fallback disabled."
+                )
+
+    if cp is None and not allow_cpu_fallback:
+        raise GPUAccelerationRequiredError(
+            "GPU acceleration required for FFT; CPU fallback disabled."
+        )
+
+    fft_result = np.fft.rfft(signal, n=n)
+    return np.abs(fft_result).astype(np.float32)
+
+
+def _as_backend(array: np.ndarray, xp) -> np.ndarray:
+    """Convert ``array`` to the backend (*xp*) array type, retrying on OOM."""
+    for attempt in range(2):
+        try:
+            return xp.asarray(array)
+        except Exception:
+            if attempt == 0:
+                continue
+            return np.asarray(array, dtype=np.float32)
+
+
 __all__ = [
-    "GPUAccelerationRequiredError",
     "GeneratedShape",
     "ReconstructionResult",
     "blend_predictions",

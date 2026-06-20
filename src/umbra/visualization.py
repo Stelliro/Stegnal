@@ -1,47 +1,19 @@
+# visualization.py
+
 """Visualization helpers for the Project Umbra UI."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
 try:  # pragma: no cover - optional acceleration
     import cupy as cp  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover - optional dependency
     cp = None
 
-
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class OverlapCache:
-    """Reusable weights and baselines for overlap scoring."""
-
-    reference_shape: tuple[int, ...]
-    weights: np.ndarray
-    baseline: float
-    denominator: float
-
-
-def build_overlap_cache(reference: np.ndarray) -> OverlapCache:
-    """Return cached weights and normalization factors for ``reference``."""
-
-    ref = np.clip(np.asarray(reference, dtype=np.float32), 0.0, 1.0)
-    weights = _feature_weight_map(ref)
-    baseline_zero = _weighted_overlap_score(_overlap_against_constant(ref, 0.0), weights)
-    baseline_one = _weighted_overlap_score(_overlap_against_constant(ref, 1.0), weights)
-    baseline = float(max(baseline_zero, baseline_one))
-    denominator = float(max(1.0 - baseline, 1e-6))
-    return OverlapCache(
-        reference_shape=tuple(ref.shape),
-        weights=np.asarray(weights, dtype=np.float32),
-        baseline=baseline,
-        denominator=denominator,
-    )
 
 
 def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
@@ -95,147 +67,135 @@ def _block_average(channel: np.ndarray, block_size: int) -> np.ndarray:
 def normalize_for_display(array: np.ndarray) -> np.ndarray:
     """Normalize an arbitrary float array to the [0, 1] range for visualization."""
     arr = np.asarray(array, dtype=np.float32)
-    min_val = float(arr.min())
-    max_val = float(arr.max())
-    if np.isclose(max_val - min_val, 0.0):
-        return np.zeros_like(arr)
-    return (arr - min_val) / (max_val - min_val)
+    if arr.size == 0:
+        return arr
+    min_val = float(np.min(arr))
+    ptp = float(np.ptp(arr)) or 1.0
+    normalized = (arr - min_val) / ptp
+    return np.clip(normalized, 0.0, 1.0).astype(np.float32)
 
 
-def _feature_weight_map(reference: np.ndarray, xp_module: Any | None = None) -> Any:
-    """Return a weight map that emphasises informative regions of ``reference``."""
+def _feature_weight_map(reference: np.ndarray) -> np.ndarray:
+    """Build a weight map that emphasizes high-contrast features."""
 
-    xp = np if xp_module is None else xp_module
-    ref = xp.asarray(reference, dtype=xp.float32)
+    ref = np.asarray(reference, dtype=np.float32)
+    if ref.ndim == 3 and ref.shape[2] == 3:
+        luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        ref = np.tensordot(ref, luma_weights, axes=([-1], [0]))
 
-    if ref.ndim == 3 and ref.shape[-1] >= 3:
-        luma_weights = xp.asarray([0.2126, 0.7152, 0.0722], dtype=ref.dtype)
-        luma = xp.tensordot(ref[..., :3], luma_weights, axes=([-1], [0]))
+    grad_x = np.abs(np.diff(ref, axis=1, prepend=ref[:, :1]))
+    grad_y = np.abs(np.diff(ref, axis=0, prepend=ref[:1, :]))
+    edge_strength = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    weights = 0.5 + 0.5 * edge_strength / (np.max(edge_strength) + 1e-8)
+    return weights.astype(np.float32)
+
+
+def _weighted_overlap_score(overlap: np.ndarray, weights: np.ndarray) -> float:
+    """Compute weighted mean of an overlap map."""
+
+    total_weight = float(np.sum(weights))
+    if total_weight < 1e-12:
+        return float(np.mean(overlap))
+    return float(np.sum(overlap * weights) / total_weight)
+
+
+def _overlap_against_constant(reference: np.ndarray, value: float) -> np.ndarray:
+    """Compute overlap map between reference and a constant image."""
+
+    ref = np.asarray(reference, dtype=np.float32)
+    if ref.ndim == 3 and ref.shape[2] == 3:
+        luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        ref = np.tensordot(ref, luma_weights, axes=([-1], [0]))
+    constant = np.full_like(ref, value)
+    return np.clip(1.0 - np.abs(ref - constant), 0.0, 1.0)
+
+
+def build_overlap_cache(reference: np.ndarray) -> dict:
+    """Pre-compute reusable data for repeated overlap calls against the same reference."""
+
+    ref = np.asarray(reference, dtype=np.float32)
+    if ref.ndim == 3 and ref.shape[2] == 3:
+        luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        ref_luma = np.tensordot(ref, luma_weights, axes=([-1], [0]))
+    elif ref.ndim == 2:
+        ref_luma = ref
     else:
-        luma = ref
+        raise ValueError("Expected 2D grayscale or 3-channel RGB inputs")
 
-    gradients = xp.gradient(luma)
-    gradient_energy = xp.zeros_like(luma)
-    for component in gradients:
-        gradient_energy = gradient_energy + component ** 2
-    gradient_magnitude = xp.sqrt(gradient_energy)
-
-    max_gradient = float(xp.max(gradient_magnitude))
-    if not np.isfinite(max_gradient) or max_gradient <= 1e-6:
-        gradient_norm = xp.zeros_like(gradient_magnitude)
-    else:
-        gradient_norm = gradient_magnitude / max_gradient
-
-    weights = 0.2 + 0.8 * gradient_norm
-    return xp.clip(weights, 0.05, 1.0)
-
-
-def _overlap_against_constant(reference: np.ndarray, value: float, xp_module: Any | None = None) -> Any:
-    """Compute the overlap map between ``reference`` and a constant image."""
-
-    xp = np if xp_module is None else xp_module
-    ref = xp.asarray(reference, dtype=xp.float32)
-    diff = xp.abs(ref - value)
-    return xp.clip(1.0 - diff, 0.0, 1.0)
-
-
-def _weighted_overlap_score(overlap_map: Any, weights: Any, xp_module: Any | None = None) -> float:
-    """Return the weighted mean of ``overlap_map`` using ``weights``."""
-
-    xp = np if xp_module is None else xp_module
-
-    weight_map = weights
-    if overlap_map.ndim == weight_map.ndim + 1:
-        weight_map = weight_map[..., None]
-
-    weighted_sum = xp.sum(overlap_map * weight_map)
-    total_weight = xp.sum(weight_map)
-
-    total_weight_value = float(total_weight)
-    if not np.isfinite(total_weight_value) or total_weight_value <= 1e-6:
-        return 0.0
-
-    weighted_value = float(weighted_sum) if xp is np else float(weighted_sum.get())
-    return weighted_value / total_weight_value
+    weights = _feature_weight_map(ref_luma)
+    baseline_zero = _weighted_overlap_score(
+        _overlap_against_constant(ref_luma, 0.0), weights,
+    )
+    baseline_one = _weighted_overlap_score(
+        _overlap_against_constant(ref_luma, 1.0), weights,
+    )
+    return {
+        "ref_luma": ref_luma,
+        "weights": weights,
+        "baseline": max(baseline_zero, baseline_one),
+    }
 
 
 def multiplicative_overlap(
-    original: np.ndarray,
-    reconstructed: np.ndarray,
-    cache: OverlapCache | None = None,
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    cache: dict | None = None,
 ) -> tuple[np.ndarray, float]:
-    """Compute an agreement map and a baseline-adjusted percentage score.
+    """Return the pixel-wise overlap map and a baseline-adjusted score in [0, 100]."""
 
-    The raw overlap map is still defined as ``1 - |original - reconstructed|`` so
-    perfect reconstructions yield ones everywhere.  However, we now discount the
-    score by subtracting the best overlap achievable by a blank image (all black
-    or all white).  This prevents large uniform regions from dominating the
-    result and artificially inflating the reward of early generations that only
-    reproduce the background.
-    """
+    ref = np.clip(np.asarray(reference, dtype=np.float32), 0.0, 1.0)
+    cand = np.clip(np.asarray(candidate, dtype=np.float32), 0.0, 1.0)
 
-    if original.shape != reconstructed.shape:
-        raise ValueError("Images must share the same shape to compute overlap")
+    if ref.shape != cand.shape:
+        raise ValueError("Reference and candidate images must share the same shape")
 
-    if cache is not None and cache.reference_shape != original.shape:
-        cache = None
+    if ref.ndim == 2:
+        ref_luma = ref
+    elif ref.ndim == 3 and ref.shape[2] == 3:
+        luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        ref_luma = np.tensordot(ref, luma_weights, axes=([-1], [0]))
+    else:
+        raise ValueError("Expected 2D grayscale or 3-channel RGB inputs for reference")
+
+    if cand.ndim == 2:
+        cand_luma = cand
+    elif cand.ndim == 3 and cand.shape[2] == 3:
+        luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        cand_luma = np.tensordot(cand, luma_weights, axes=([-1], [0]))
+    else:
+        raise ValueError("Expected 2D grayscale or 3-channel RGB inputs for candidate")
+
+    overlap_map = np.clip(1.0 - np.abs(ref_luma - cand_luma), 0.0, 1.0)
 
     if cache is not None:
-        orig_cpu = np.asarray(original, dtype=np.float32)
-        recon_cpu = np.asarray(reconstructed, dtype=np.float32)
-        diff = np.abs(orig_cpu - recon_cpu)
-        overlap = np.clip(1.0 - diff, 0.0, 1.0).astype(np.float32)
-        raw_score = _weighted_overlap_score(overlap, cache.weights, np)
-        adjusted = max(raw_score - cache.baseline, 0.0)
-        score = float(np.clip(adjusted / cache.denominator, 0.0, 1.0) * 100.0)
-        return overlap, score
+        weights = cache["weights"]
+        baseline = cache["baseline"]
+    else:
+        weights = _feature_weight_map(ref_luma)
+        baseline_zero = _weighted_overlap_score(
+            _overlap_against_constant(ref_luma, 0.0), weights,
+        )
+        baseline_one = _weighted_overlap_score(
+            _overlap_against_constant(ref_luma, 1.0), weights,
+        )
+        baseline = max(baseline_zero, baseline_one)
 
-    if cp is not None and original.size >= 65_536:  # pragma: no branch - runtime check
-        try:
-            xp = cp
-            orig_gpu = xp.asarray(original, dtype=xp.float32)
-            recon_gpu = xp.asarray(reconstructed, dtype=xp.float32)
-            diff_gpu = xp.abs(orig_gpu - recon_gpu)
-            overlap_gpu = xp.clip(1.0 - diff_gpu, 0.0, 1.0)
-            weights_gpu = _feature_weight_map(orig_gpu, xp)
-            raw_score = _weighted_overlap_score(overlap_gpu, weights_gpu, xp)
-            baseline_zero = _weighted_overlap_score(
-                _overlap_against_constant(orig_gpu, 0.0, xp), weights_gpu, xp
-            )
-            baseline_one = _weighted_overlap_score(
-                _overlap_against_constant(orig_gpu, 1.0, xp), weights_gpu, xp
-            )
-            baseline = max(baseline_zero, baseline_one)
-            adjusted = max(raw_score - baseline, 0.0)
-            denominator = max(1.0 - baseline, 1e-6)
-            score = float(np.clip(adjusted / denominator, 0.0, 1.0) * 100.0)
-            overlap = xp.asnumpy(overlap_gpu)
-            return overlap.astype(np.float32), score
-        except Exception:  # pragma: no cover - GPU fallback
-            logger.debug("Falling back to NumPy overlap after CuPy failure", exc_info=True)
+    raw_score = _weighted_overlap_score(overlap_map, weights)
+    adjusted = max(raw_score - baseline, 0.0) / max(1.0 - baseline, 1e-6) * 100.0
+    score = float(np.clip(adjusted, 0.0, 100.0))
 
-    xp = np
-    orig_cpu = xp.asarray(original, dtype=xp.float32)
-    recon_cpu = xp.asarray(reconstructed, dtype=xp.float32)
-    diff = xp.abs(orig_cpu - recon_cpu)
-    overlap = xp.clip(1.0 - diff, 0.0, 1.0)
-    weights = _feature_weight_map(orig_cpu, xp)
-    raw_score = _weighted_overlap_score(overlap, weights, xp)
-    baseline_zero = _weighted_overlap_score(_overlap_against_constant(orig_cpu, 0.0, xp), weights, xp)
-    baseline_one = _weighted_overlap_score(_overlap_against_constant(orig_cpu, 1.0, xp), weights, xp)
-    baseline = max(baseline_zero, baseline_one)
-    adjusted = max(raw_score - baseline, 0.0)
-    denominator = max(1.0 - baseline, 1e-6)
-    score = float(np.clip(adjusted / denominator, 0.0, 1.0) * 100.0)
-    return overlap.astype(np.float32), score
+    return overlap_map.astype(np.float32), score
 
 
 def to_uint8_image(array: np.ndarray) -> np.ndarray:
-    """Convert a normalized float image to uint8 grayscale."""
+    """Convert a float array in [0, 1] to a uint8 image suitable for display."""
+
     arr = np.clip(np.asarray(array, dtype=np.float32), 0.0, 1.0)
     if arr.ndim == 2:
         return (arr * 255.0).round().astype(np.uint8)
-    if arr.ndim == 3 and arr.shape[2] in (3, 4):
+    if arr.ndim == 3 and arr.shape[2] == 3:
         return (arr * 255.0).round().astype(np.uint8)
     raise ValueError("Expected 2D grayscale or 3-channel color array for conversion")
 
@@ -267,13 +227,19 @@ def colorize_comparison(
 
     if ref.ndim == 2:
         ref_luma = ref
-        cand_luma = cand
     elif ref.ndim == 3 and ref.shape[2] == 3:
         luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
         ref_luma = np.tensordot(ref, luma_weights, axes=([-1], [0]))
+    else:
+        raise ValueError("Expected 2D grayscale or 3-channel RGB inputs for reference")
+
+    if cand.ndim == 2:
+        cand_luma = cand
+    elif cand.ndim == 3 and cand.shape[2] == 3:
+        luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
         cand_luma = np.tensordot(cand, luma_weights, axes=([-1], [0]))
     else:
-        raise ValueError("Expected 2D grayscale or 3-channel RGB inputs")
+        raise ValueError("Expected 2D grayscale or 3-channel RGB inputs for candidate")
 
     overlap = np.minimum(ref_luma, cand_luma)
     ref_only = np.clip(ref_luma - overlap, 0.0, 1.0)
@@ -290,10 +256,12 @@ def colorize_comparison(
 
 
 __all__ = [
+    "_feature_weight_map",
+    "_overlap_against_constant",
+    "_weighted_overlap_score",
     "build_overlap_cache",
     "colorize_comparison",
     "normalize_for_display",
     "multiplicative_overlap",
-    "OverlapCache",
     "to_uint8_image",
 ]

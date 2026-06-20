@@ -34,6 +34,138 @@ def test_evolution_manager_runs_multiple_generations() -> None:
     assert all(record.reward_summary >= 0.0 for record in manager.generations)
 
 
+def test_legacy_evolution_improves_and_reports_real_metrics() -> None:
+    """The UI's evolve_generation path must (a) reconstruct sanely through the
+    sim channel and (b) actually raise the score across generations."""
+    import random
+
+    random.seed(0)
+    np.random.seed(0)
+
+    # A smooth, structured RGB image the channel can plausibly recover.
+    yy, xx = np.mgrid[0:64, 0:64].astype(np.float32) / 64.0
+    image = np.stack([xx, yy, (xx + yy) * 0.5], axis=-1).astype(np.float32)
+
+    manager = EvolutionManager(
+        image, simulation_mode=True, population_size=20, compute_mode="cpu",
+    )
+
+    rewards = []
+    for _ in range(12):
+        manager.evolve_generation(difficulty=0.1)
+        rewards.append(manager.population[0].reward)
+
+    best = manager.population[0]
+    # Unit-bug regression guard: before the int16/float fix this was ~6 dB.
+    assert best.metrics.psnr > 12.0
+    assert 0.0 <= best.metrics.ssim <= 1.0
+    # Reward is the structure-gated composite (0-100), and the search improved it.
+    assert best.reward > 0.0
+    assert max(rewards) > rewards[0]
+
+
+def test_gene_unlock_toggle_controls_color_genes() -> None:
+    """Purist (default) keeps colors neutral; unlocked perturbs them."""
+    import random
+
+    image = np.random.default_rng(0).random((16, 16, 3)).astype(np.float32)
+
+    random.seed(1)
+    purist = EvolutionManager(image, simulation_mode=True, population_size=8)
+    assert purist.unlock_genes is False
+    g = purist._random_gene()
+    assert (g.contrast_scale, g.gamma, g.brightness_shift) == (1.0, 1.0, 0.0)
+    assert (g.r_gain, g.g_gain, g.b_gain) == (1.0, 1.0, 1.0)
+
+    random.seed(1)
+    unlocked = EvolutionManager(image, simulation_mode=True, population_size=8,
+                                unlock_genes=True)
+    assert unlocked.unlock_genes is True
+    genes = [unlocked._random_gene() for _ in range(8)]
+    # at least one gene differs from neutral across the sample
+    assert any(abs(g.gamma - 1.0) > 1e-6 or abs(g.contrast_scale - 1.0) > 1e-6
+               for g in genes)
+
+    unlocked.update_settings(unlock_genes=False)
+    assert unlocked.unlock_genes is False
+
+
+def test_recommend_difficulty_gates_on_ssim() -> None:
+    image = np.random.default_rng(0).random((16, 16, 3)).astype(np.float32)
+    mgr = EvolutionManager(image, simulation_mode=True, population_size=4,
+                           difficulty_min_ssim=0.5, difficulty_step=0.02)
+    # below the SSIM threshold difficulty must NOT rise (it eases off)
+    assert mgr.recommend_difficulty(0.3, best_ssim=0.4) < 0.3
+    # at/above the threshold it ratchets up — harder is the reward for doing well
+    assert mgr.recommend_difficulty(0.3, best_ssim=0.6) > 0.3
+    # bounds are respected
+    assert mgr.recommend_difficulty(0.999, 0.9) <= 1.0
+    assert mgr.recommend_difficulty(0.01, 0.0) >= 0.01
+
+
+def test_difficulty_credits_reward_when_recognizable() -> None:
+    from umbra.audio import image_data_to_audio
+    from umbra.evolution import Candidate, ProxyPacket
+
+    yy, xx = np.mgrid[0:48, 0:48].astype(np.float32) / 48.0
+    image = np.stack([xx, yy, (xx + yy) * 0.5], axis=-1).astype(np.float32)
+    packet = NoiseStreamEncoder(sigma=0.0).encode(image, seed=123)  # clean channel
+    wav, _ = image_data_to_audio(packet.encoded, 48000)
+    proxy = ProxyPacket(packet, wav.astype(np.float32) / 32767.0)
+
+    mgr = EvolutionManager(image, simulation_mode=True, population_size=1,
+                           difficulty_min_ssim=0.3, difficulty_reward_weight=1.0)
+    cand = Candidate(genes=mgr._random_gene())
+    cand.genes.start_sample = 0
+    cand.genes.denoise_sigma = 0.2
+
+    mgr._current_difficulty = 0.1
+    r_lo = mgr._evaluate_single_candidate(cand, proxy, packet.permutation_seed)
+    ssim = cand.metrics.ssim
+    mgr._current_difficulty = 0.8
+    r_hi = mgr._evaluate_single_candidate(cand, proxy, packet.permutation_seed)
+
+    assert ssim >= mgr.difficulty_min_ssim       # recognizable -> bonus applies
+    assert r_hi > r_lo                            # harder is rewarded, not punished
+    # reward scales exactly by the difficulty-bonus ratio (1 + w*difficulty)
+    assert abs(r_hi / r_lo - (1.0 + 0.8) / (1.0 + 0.1)) < 1e-3
+
+
+def test_heritage_child_inherits_stronger_competence() -> None:
+    from umbra.evolution import Heritage
+
+    a = Heritage(competence=0.3, depth=2)
+    b = Heritage(competence=0.5, depth=1)
+    child = a.child(b, generation=5, parent_seeds=[11, 22])
+    assert child.competence == 0.5      # the stronger lineage's competence
+    assert child.depth == 3             # max(2, 1) + 1
+    assert child.parents == [11, 22]
+    assert child.birth_generation == 5
+
+
+def test_per_lineage_competence_ratchets_up() -> None:
+    import random
+
+    random.seed(0)
+    np.random.seed(0)
+    yy, xx = np.mgrid[0:48, 0:48].astype(np.float32) / 48.0
+    image = np.stack([xx, yy, (xx + yy) * 0.5], axis=-1).astype(np.float32)
+    mgr = EvolutionManager(image, simulation_mode=True, population_size=20,
+                           difficulty_min_ssim=0.4)
+
+    max_competence = []
+    for _ in range(15):
+        mgr.evolve_generation(0.1)
+        # every candidate carries a heritage record
+        assert all(c.heritage is not None for c in mgr.population)
+        max_competence.append(max(c.heritage.competence for c in mgr.population))
+
+    # As lineages clear the SSIM bar at harder channels, competence ratchets up.
+    assert max_competence[-1] > max_competence[0] + 0.01
+    # the learned controller accumulated experience
+    assert mgr.difficulty_controller.samples > 0
+
+
 def test_generation_limit_enforced() -> None:
     rng = np.random.default_rng(1234)
     image = rng.random((16, 16), dtype=np.float32)
@@ -101,9 +233,10 @@ def test_neural_reward_model_learns_signal() -> None:
     # Reward emphasises first and third feature components
     rewards = 0.7 * features[:, 0] + 0.3 * features[:, 2]
     model.update(features, rewards)
-    prediction = model.predict(features[0])
-    assert np.isfinite(prediction)
-    assert prediction != 0.0
+    predictions = model.predict(features)
+    assert all(np.isfinite(predictions))
+    # After training, predictions should show variance (model learned something)
+    assert predictions.std() > 1e-6
 
 
 def test_plateau_ramp_reduces_sigma_and_improves_overlap() -> None:

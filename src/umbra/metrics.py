@@ -1,4 +1,9 @@
-"""Evaluation utilities for Project Umbra."""
+# metrics.py
+
+"""
+Evaluation utilities for Project Umbra.
+Using Sigmoid gating to encourage climbing out of local minima.
+"""
 
 from __future__ import annotations
 
@@ -6,470 +11,238 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
+from skimage.color import rgb2gray
+from skimage.filters import sobel
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-from skimage.transform import resize
-from skimage.util import img_as_float32
 
 logger = logging.getLogger(__name__)
 
-# Baseline PSNR thresholds shared by the UI and evolution subsystems when
-# converting perceptual metrics into aggregate scores. The baseline reflects a
-# "barely acceptable" reconstruction while the target approximates the
-# high-quality regime we expect the evolution process to seek.
-AI_PSNR_BASELINE = 20.0
-AI_PSNR_TARGET = 60.0
-
-
-def _validate_shapes(reference: np.ndarray, candidate: np.ndarray) -> None:
-    if reference.shape != candidate.shape:
-        raise ValueError("Input images must share the same shape")
-
-
-def _ensure_channel_axis(array: np.ndarray, channel_axis: int | None) -> int | None:
-    if channel_axis is None:
-        return None
-    if channel_axis not in (-1, array.ndim - 1):
-        raise ValueError("channel_axis must be None or the last axis")
-    return array.ndim - 1
-
-def _dct_basis(size: int) -> np.ndarray:
-    indices = np.arange(size, dtype=np.float32)
-    basis = np.cos(np.pi / (2 * size) * (2 * indices[:, None] + 1) * indices[None, :])
-    basis[0, :] *= np.sqrt(1.0 / size)
-    basis[1:, :] *= np.sqrt(2.0 / size)
-    return basis
-
-
-def _dct2(image: np.ndarray) -> np.ndarray:
-    basis_row = _dct_basis(image.shape[0])
-    basis_col = _dct_basis(image.shape[1])
-    return basis_row @ image @ basis_col.T
-
+# --- CONSTANTS ---
+AI_PSNR_BASELINE = 15.0
+AI_PSNR_TARGET = 40.0
 
 @dataclass
 class ReconstructionMetrics:
     psnr: float
     ssim: float
+    fft_score: float = 0.0
+    edge_score: float = 0.0
 
     def as_dict(self) -> dict[str, float]:
-        return {"psnr": self.psnr, "ssim": self.ssim}
+        return {
+            "psnr": self.psnr,
+            "ssim": self.ssim,
+            "fft": self.fft_score,
+            "edge": self.edge_score
+        }
 
+def compute_fft_score(reference: np.ndarray, candidate: np.ndarray) -> float:
+    ref_gray = rgb2gray(reference) if reference.ndim == 3 else reference
+    cand_gray = rgb2gray(candidate) if candidate.ndim == 3 else candidate
+    
+    fft_ref = np.fft.fft2(ref_gray)
+    fft_cand = np.fft.fft2(cand_gray)
+    
+    spec_ref = np.log(np.abs(np.fft.fftshift(fft_ref)) + 1e-8)
+    spec_cand = np.log(np.abs(np.fft.fftshift(fft_cand)) + 1e-8)
+    
+    spec_ref = spec_ref / (np.max(spec_ref) + 1e-6)
+    spec_cand = spec_cand / (np.max(spec_cand) + 1e-6)
+    
+    diff = np.mean(np.abs(spec_ref - spec_cand))
+    return float(np.clip(1.0 - (diff * 2.0), 0.0, 1.0))
+
+def compute_edge_score(reference: np.ndarray, candidate: np.ndarray) -> float:
+    ref_gray = rgb2gray(reference) if reference.ndim == 3 else reference
+    cand_gray = rgb2gray(candidate) if candidate.ndim == 3 else candidate
+    
+    edge_ref = sobel(ref_gray)
+    edge_cand = sobel(cand_gray)
+    
+    diff = np.mean(np.abs(edge_ref - edge_cand))
+    return float(np.clip(1.0 - (diff * 6.0), 0.0, 1.0))
 
 def compute_metrics(reference: np.ndarray, candidate: np.ndarray) -> ReconstructionMetrics:
-    """Compute PSNR and SSIM between two images in [0, 1]."""
-    _validate_shapes(reference, candidate)
+    if reference.ndim < 2 or candidate.ndim < 2:
+        raise ValueError("Reference and candidate must be at least 2-dimensional arrays")
+    if reference.shape != candidate.shape:
+        # Auto-resize candidate if needed (defensive)
+        from skimage.transform import resize
+        candidate = resize(candidate, reference.shape, anti_aliasing=True)
 
     channel_axis = -1 if reference.ndim == 3 else None
+    
     psnr = float(peak_signal_noise_ratio(reference, candidate, data_range=1.0))
-    ssim = float(
-        structural_similarity(
-            reference,
-            candidate,
-            data_range=1.0,
-            channel_axis=channel_axis,
-        )
-    )
-    logger.debug("Computed metrics: PSNR=%.2f SSIM=%.3f", psnr, ssim)
-    return ReconstructionMetrics(psnr=psnr, ssim=ssim)
+    ssim = float(structural_similarity(reference, candidate, channel_axis=channel_axis, data_range=1.0))
+    
+    fft = compute_fft_score(reference, candidate)
+    edge = compute_edge_score(reference, candidate)
+    
+    return ReconstructionMetrics(psnr=psnr, ssim=ssim, fft_score=fft, edge_score=edge)
 
+def _sigmoid_gate(value: float, threshold: float, steepness: float = 20.0) -> float:
+    """Soft gating function. Returns 0.0 to 1.0."""
+    return 1.0 / (1.0 + np.exp(-steepness * (value - threshold)))
 
-def composite_score(overlap_pct: float, psnr: float, ssim: float) -> float:
-    """Combine overlap, PSNR, and SSIM into a 0–100 aggregate score."""
+def composite_score(overlap: float, psnr: float, ssim: float) -> float:
+    """Compute a weighted composite score from overlap, PSNR, and SSIM."""
 
-    overlap_value = float(np.nan_to_num(overlap_pct, nan=0.0, posinf=0.0, neginf=0.0))
-    psnr_value = float(
-        np.nan_to_num(psnr, nan=AI_PSNR_BASELINE, posinf=AI_PSNR_BASELINE, neginf=AI_PSNR_BASELINE)
-    )
-    ssim_value = float(np.nan_to_num(ssim, nan=0.0, posinf=0.0, neginf=0.0))
+    psnr_score = float(np.clip(
+        (psnr - AI_PSNR_BASELINE) / (AI_PSNR_TARGET - AI_PSNR_BASELINE), 0.0, 1.0
+    ))
+    overlap_norm = float(np.clip(overlap / 100.0, 0.0, 1.0))
 
-    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
-    psnr_span = max(AI_PSNR_TARGET - AI_PSNR_BASELINE, 1e-6)
-    psnr_norm = float(np.clip((psnr_value - AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
-    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
+    w_overlap = 0.40
+    w_ssim = 0.35
+    w_psnr = 0.25
 
-    composite = float(np.clip(0.4 * overlap_norm + 0.3 * psnr_norm + 0.3 * ssim_norm, 0.0, 1.0))
-    return composite * 100.0
-
-
-def _as_grayscale(array: np.ndarray) -> np.ndarray:
-    image = img_as_float32(np.asarray(array, dtype=np.float32))
-    if image.ndim == 2:
-        return image
-    if image.ndim == 3 and image.shape[-1] >= 3:
-        weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
-        return np.tensordot(image[..., :3], weights, axes=([-1], [0])).astype(np.float32)
-    raise ValueError("Input must be a 2D array or an RGB/RGBA image")
-
-
-def _max_normalized_correlation(a: np.ndarray, b: np.ndarray) -> float:
-    a_centered = np.asarray(a, dtype=np.float32) - float(np.mean(a))
-    b_centered = np.asarray(b, dtype=np.float32) - float(np.mean(b))
-    denom = float(np.linalg.norm(a_centered) * np.linalg.norm(b_centered))
-    if denom <= 1e-12:
-        return 0.0
-    correlation = np.correlate(a_centered, b_centered, mode="full")
-    if correlation.size == 0:
-        return 0.0
-    peak = float(np.max(np.abs(correlation))) / denom
-    return float(np.clip(peak, 0.0, 1.0))
-
-
-def partial_alignment_fraction(reference: np.ndarray, candidate: np.ndarray) -> float:
-    """Estimate how much of the reference content appears somewhere in ``candidate``."""
-
-    reference_gray = _as_grayscale(reference)
-    candidate_gray = _as_grayscale(candidate)
-    _validate_shapes(reference_gray, candidate_gray)
-
-    energy = float(np.mean(candidate_gray ** 2))
-    if not np.isfinite(energy) or energy <= 1e-9:
-        return 0.0
-
-    vertical_ref = np.mean(reference_gray, axis=1)
-    vertical_cand = np.mean(candidate_gray, axis=1)
-    horizontal_ref = np.mean(reference_gray, axis=0)
-    horizontal_cand = np.mean(candidate_gray, axis=0)
-
-    vertical_corr = _max_normalized_correlation(vertical_ref, vertical_cand)
-    horizontal_corr = _max_normalized_correlation(horizontal_ref, horizontal_cand)
-
-    occupancy = float(np.mean(candidate_gray > 0.02))
-    occupancy = float(np.clip(occupancy, 0.0, 1.0))
-    occupancy = float(np.clip(occupancy ** 0.5, 0.0, 1.0))
-
-    combined = max(vertical_corr, horizontal_corr)
-    return float(np.clip(combined * occupancy, 0.0, 1.0))
-
-
-def audio_fidelity_score(
-    overlap_pct: float,
-    psnr: float,
-    ssim: float,
-    *,
-    partial_credit: float | None = None,
-) -> float:
-    """Return a conservative 0–100 score for sound-only reconstructions."""
-
-    overlap_value = float(np.nan_to_num(overlap_pct, nan=0.0, posinf=0.0, neginf=0.0))
-    psnr_value = float(
-        np.nan_to_num(psnr, nan=AI_PSNR_BASELINE, posinf=AI_PSNR_BASELINE, neginf=AI_PSNR_BASELINE)
-    )
-    ssim_value = float(np.nan_to_num(ssim, nan=0.0, posinf=0.0, neginf=0.0))
-
-    base_score = 0.0
-    if psnr_value > AI_PSNR_BASELINE and ssim_value > 0.05:
-        overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
-        psnr_span = max(AI_PSNR_TARGET - AI_PSNR_BASELINE, 1e-6)
-        psnr_norm = float(np.clip((psnr_value - AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
-        ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
-        combined = overlap_norm * (psnr_norm ** 1.25) * (ssim_norm ** 0.75)
-        base_score = float(np.clip(combined, 0.0, 1.0)) * 100.0
-
-    partial_score = 0.0
-    if partial_credit is not None:
-        partial_value = float(np.clip(partial_credit, 0.0, 1.0))
-        partial_score = float(np.clip((partial_value ** 1.5) * 60.0, 0.0, 100.0))
-
-    return float(max(base_score, partial_score))
-
-
-def team_cohesion_score(
-    ai_overlap_pct: float,
-    ai_psnr: float,
-    ai_ssim: float,
-    *,
-    sound_reference_overlap: float | None,
-    sound_reference_psnr: float | None,
-    sound_reference_ssim: float | None,
-    sound_alignment_overlap: float | None,
-    sound_alignment_psnr: float | None,
-    sound_alignment_ssim: float | None,
-    sound_reference_partial: float | None = None,
-    sound_alignment_partial: float | None = None,
-    readability: float | None = None,
-) -> float:
-    """Combine AI and audio metrics into a single cooperative score."""
-
-    ai_component = float(
-        np.clip(composite_score(ai_overlap_pct, ai_psnr, ai_ssim), 0.0, 100.0)
-    )
-
-    sound_component: float | None = None
-    if (
-        sound_reference_overlap is not None
-        and sound_reference_psnr is not None
-        and sound_reference_ssim is not None
-    ):
-        sound_component = float(
-            np.clip(
-                audio_fidelity_score(
-                    float(sound_reference_overlap),
-                    float(sound_reference_psnr),
-                    float(sound_reference_ssim),
-                    partial_credit=sound_reference_partial,
-                ),
-                0.0,
-                100.0,
-            )
-        )
-
-    alignment_component: float | None = None
-    if (
-        sound_alignment_overlap is not None
-        and sound_alignment_psnr is not None
-        and sound_alignment_ssim is not None
-    ):
-        alignment_component = float(
-            np.clip(
-                audio_fidelity_score(
-                    float(sound_alignment_overlap),
-                    float(sound_alignment_psnr),
-                    float(sound_alignment_ssim),
-                    partial_credit=sound_alignment_partial,
-                ),
-                0.0,
-                100.0,
-            )
-        )
-
-    readability_component: float | None = None
-    if readability is not None:
-        try:
-            readability_component = float(np.clip(readability, 0.0, 100.0))
-        except (TypeError, ValueError):
-            readability_component = None
-    if (
-        readability_component is None
-        and sound_reference_overlap is not None
-        and sound_reference_psnr is not None
-        and sound_reference_ssim is not None
-    ):
-        readability_component = float(
-            np.clip(
-                readability_score(
-                    float(sound_reference_overlap),
-                    float(sound_reference_psnr),
-                    float(sound_reference_ssim),
-                ),
-                0.0,
-                100.0,
-            )
-        )
-
-    components = [ai_component]
-    if sound_component is not None:
-        components.append(sound_component)
-    if alignment_component is not None:
-        components.append(alignment_component)
-    elif sound_component is not None:
-        components.append(sound_component)
-
-    if not components:
-        return 0.0
-
-    base_fraction = float(min(components) / 100.0)
-    base_fraction = float(np.clip(base_fraction, 0.0, 1.0))
-
-    readability_fraction = 1.0
-    if readability_component is not None:
-        readability_fraction = float(
-            np.clip((readability_component / 100.0) ** 2.0, 0.0, 1.0)
-        )
-
-    return float(np.clip(base_fraction * readability_fraction, 0.0, 1.0)) * 100.0
-
-
-def readability_score(overlap_pct: float, psnr: float, ssim: float) -> float:
-    """Derive a readability score emphasising consistency between reconstructions."""
-
-    overlap_value = float(np.nan_to_num(overlap_pct, nan=0.0, posinf=0.0, neginf=0.0))
-    psnr_value = float(
-        np.nan_to_num(psnr, nan=AI_PSNR_BASELINE, posinf=AI_PSNR_BASELINE, neginf=AI_PSNR_BASELINE)
-    )
-    ssim_value = float(np.nan_to_num(ssim, nan=0.0, posinf=0.0, neginf=0.0))
-
-    overlap_norm = float(np.clip(overlap_value / 100.0, 0.0, 1.0))
-    psnr_span = max(AI_PSNR_TARGET - AI_PSNR_BASELINE, 1e-6)
-    psnr_norm = float(np.clip((psnr_value - AI_PSNR_BASELINE) / psnr_span, 0.0, 1.0))
-    ssim_norm = float(np.clip(ssim_value, 0.0, 1.0))
-
-    readability = float(np.clip((overlap_norm + psnr_norm + ssim_norm) / 3.0, 0.0, 1.0))
-    return readability * 100.0
+    raw = overlap_norm * w_overlap + ssim * w_ssim + psnr_score * w_psnr
+    structure_gate = _sigmoid_gate(ssim, 0.35)
+    final = raw * (0.2 + 0.8 * structure_gate)
+    return float(np.clip(final, 0.0, 1.0))
 
 
 def compute_ms_ssim(
     reference: np.ndarray,
     candidate: np.ndarray,
-    channel_axis: int | None,
+    *,
+    channel_axis: int | None = None,
 ) -> float:
-    """Compute a lightweight multi-scale SSIM between two images."""
+    """Multi-scale SSIM approximation using Gaussian pyramid levels."""
 
-    reference_f = np.asarray(reference, dtype=np.float32)
-    candidate_f = np.asarray(candidate, dtype=np.float32)
-    _validate_shapes(reference_f, candidate_f)
-    axis = _ensure_channel_axis(reference_f, channel_axis)
+    ref = np.asarray(reference, dtype=np.float64)
+    cand = np.asarray(candidate, dtype=np.float64)
+    weights = np.array([0.0448, 0.2856, 0.3001, 0.2363, 0.1333], dtype=np.float64)
 
-    if axis is None:
-        spatial_dims = reference_f.shape[:2]
-    else:
-        spatial_dims = tuple(
-            reference_f.shape[idx] for idx in range(reference_f.ndim) if idx != axis
-        )
-    min_spatial = min(spatial_dims)
+    mssim = 1.0
+    for i, w in enumerate(weights):
+        s = float(structural_similarity(
+            ref, cand, data_range=1.0, channel_axis=channel_axis,
+        ))
+        mssim *= s ** w
+        if i < len(weights) - 1:
+            if channel_axis is None:
+                ref = 0.25 * (ref[::2, ::2] + ref[1::2, ::2] + ref[::2, 1::2] + ref[1::2, 1::2])
+                cand = 0.25 * (cand[::2, ::2] + cand[1::2, ::2] + cand[::2, 1::2] + cand[1::2, 1::2])
+            else:
+                ref = 0.25 * (ref[::2, ::2, :] + ref[1::2, ::2, :] + ref[::2, 1::2, :] + ref[1::2, 1::2, :])
+                cand = 0.25 * (cand[::2, ::2, :] + cand[1::2, ::2, :] + cand[::2, 1::2, :] + cand[1::2, 1::2, :])
+            if ref.shape[0] < 7 or ref.shape[1] < 7:
+                break
+    return float(mssim)
 
-    # The default Gaussian-weighted SSIM uses an 11x11 window. Guard against
-    # requesting that configuration on smaller tensors by falling back to a
-    # single-scale SSIM with an explicit window size.
-    MIN_GAUSSIAN_EXTENT = 11
-    if min_spatial < MIN_GAUSSIAN_EXTENT:
-        fallback_win = min_spatial
-        if fallback_win % 2 == 0:
-            fallback_win -= 1
-        if fallback_win < 3:
-            if np.allclose(reference_f, candidate_f):
-                return 1.0
-            diff = float(np.mean(np.abs(reference_f - candidate_f)))
-            return float(np.clip(1.0 - diff, 0.0, 1.0))
 
-        return float(
-            structural_similarity(
-                reference_f,
-                candidate_f,
-                data_range=1.0,
-                channel_axis=axis,
-                gaussian_weights=False,
-                win_size=fallback_win,
-            )
-        )
+def dct_band_correlation(reference: np.ndarray, candidate: np.ndarray) -> float:
+    """Compute DCT band correlation between two images."""
 
-    ref_scale = reference_f
-    cand_scale = candidate_f
-    scores: list[float] = []
-    for _ in range(3):
-        spatial_min = min(ref_scale.shape[0], ref_scale.shape[1])
-        if spatial_min < MIN_GAUSSIAN_EXTENT:
-            break
-        score = float(
-            structural_similarity(
-                ref_scale,
-                cand_scale,
-                data_range=1.0,
-                channel_axis=axis,
-                gaussian_weights=True,
-            )
-        )
-        scores.append(score)
+    from scipy.fft import dctn
 
-        if spatial_min <= MIN_GAUSSIAN_EXTENT:
-            break
+    ref_gray = rgb2gray(reference) if reference.ndim == 3 else np.asarray(reference, dtype=np.float64)
+    cand_gray = rgb2gray(candidate) if candidate.ndim == 3 else np.asarray(candidate, dtype=np.float64)
 
-        new_spatial = (
-            max(1, ref_scale.shape[0] // 2),
-            max(1, ref_scale.shape[1] // 2),
-        )
-        if axis is None:
-            ref_scale = resize(
-                ref_scale,
-                new_spatial,
-                order=1,
-                anti_aliasing=True,
-                preserve_range=True,
-                mode="reflect",
-            ).astype(np.float32)
-            cand_scale = resize(
-                cand_scale,
-                new_spatial,
-                order=1,
-                anti_aliasing=True,
-                preserve_range=True,
-                mode="reflect",
-            ).astype(np.float32)
-        else:
-            channel_count = ref_scale.shape[axis]
-            ref_channels: list[np.ndarray] = []
-            cand_channels: list[np.ndarray] = []
-            for idx in range(channel_count):
-                ref_channel = np.take(ref_scale, idx, axis=axis)
-                cand_channel = np.take(cand_scale, idx, axis=axis)
-                ref_resized = resize(
-                    ref_channel,
-                    new_spatial,
-                    order=1,
-                    anti_aliasing=True,
-                    preserve_range=True,
-                    mode="reflect",
-                ).astype(np.float32)
-                cand_resized = resize(
-                    cand_channel,
-                    new_spatial,
-                    order=1,
-                    anti_aliasing=True,
-                    preserve_range=True,
-                    mode="reflect",
-                ).astype(np.float32)
-                ref_channels.append(ref_resized)
-                cand_channels.append(cand_resized)
-            ref_scale = np.stack(ref_channels, axis=-1)
-            cand_scale = np.stack(cand_channels, axis=-1)
+    ref_dct = dctn(ref_gray, norm="ortho")
+    cand_dct = dctn(cand_gray, norm="ortho")
 
-    if not scores:
+    ref_flat = ref_dct.ravel()
+    cand_flat = cand_dct.ravel()
+
+    norm_ref = np.linalg.norm(ref_flat)
+    norm_cand = np.linalg.norm(cand_flat)
+    if norm_ref < 1e-12 or norm_cand < 1e-12:
         return 0.0
-    return float(np.clip(np.mean(scores), 0.0, 1.0))
+    corr = float(np.dot(ref_flat, cand_flat) / (norm_ref * norm_cand))
+    return float(np.clip(corr, 0.0, 1.0))
 
 
-def dct_band_correlation(
+def partial_alignment_fraction(
     reference: np.ndarray,
     candidate: np.ndarray,
-    bands: tuple[int, int] = (2, 12),
+    *,
+    threshold: float = 0.1,
 ) -> float:
-    """Correlate mid-frequency DCT magnitudes between two images."""
+    """Fraction of pixels where the candidate is aligned with the reference."""
 
-    if len(bands) != 2:
-        raise ValueError("bands must be a (start, end) tuple")
-    start, end = bands
-    if start < 0 or end <= start:
-        raise ValueError("bands must define a positive frequency range")
+    ref = np.asarray(reference, dtype=np.float32)
+    cand = np.asarray(candidate, dtype=np.float32)
+    if ref.ndim == 3:
+        ref = rgb2gray(ref)
+    if cand.ndim == 3:
+        cand = rgb2gray(cand)
 
-    reference_f = np.asarray(reference, dtype=np.float32)
-    candidate_f = np.asarray(candidate, dtype=np.float32)
-    _validate_shapes(reference_f, candidate_f)
+    diff = np.abs(ref - cand)
+    aligned = diff < threshold
+    return float(np.mean(aligned))
 
-    if reference_f.ndim == 2:
-        ref_channels = [reference_f]
-        cand_channels = [candidate_f]
-    elif reference_f.ndim == 3 and reference_f.shape[-1] <= 4:
-        ref_channels = [reference_f[..., idx] for idx in range(reference_f.shape[-1])]
-        cand_channels = [candidate_f[..., idx] for idx in range(candidate_f.shape[-1])]
-    else:
-        raise ValueError("Input images must be 2D or 3-channel")
 
-    correlations: list[float] = []
-    for ref_channel, cand_channel in zip(ref_channels, cand_channels):
-        ref_dct = _dct2(ref_channel)
-        cand_dct = _dct2(cand_channel)
-        ref_band = np.abs(ref_dct[start:end, start:end]).ravel()
-        cand_band = np.abs(cand_dct[start:end, start:end]).ravel()
-        if ref_band.size == 0:
-            continue
-        if np.allclose(ref_band, 0.0) and np.allclose(cand_band, 0.0):
-            correlations.append(1.0)
-            continue
-        if np.allclose(ref_band, 0.0) or np.allclose(cand_band, 0.0):
-            correlations.append(0.0)
-            continue
-        corr_matrix = np.corrcoef(ref_band, cand_band)
-        corr = float(corr_matrix[0, 1])
-        if np.isfinite(corr):
-            correlations.append(float(np.clip((corr + 1.0) / 2.0, 0.0, 1.0)))
+def audio_fidelity_score(
+    overlap: float,
+    psnr: float,
+    ssim: float,
+    partial_credit: float = 0.0,
+) -> float:
+    """Score audio-mediated reconstruction fidelity.
 
-    if not correlations:
+    Returns 0.0 when metrics are below baseline thresholds, unless
+    *partial_credit* is provided to boost borderline results.
+    """
+
+    psnr_ok = psnr >= 20.0
+    ssim_ok = ssim >= 0.05
+
+    if not (psnr_ok and ssim_ok):
+        if partial_credit > 0.0:
+            return float(np.clip(partial_credit * overlap * 0.01, 0.0, 100.0))
         return 0.0
-    return float(np.clip(np.mean(correlations), 0.0, 1.0))
+
+    psnr_norm = float(np.clip((psnr - AI_PSNR_BASELINE) / (AI_PSNR_TARGET - AI_PSNR_BASELINE), 0.0, 1.0))
+    overlap_norm = float(np.clip(overlap / 100.0, 0.0, 1.0))
+
+    raw = 0.4 * overlap_norm + 0.35 * ssim + 0.25 * psnr_norm
+    return float(np.clip(raw * 100.0, 0.0, 100.0))
 
 
-__all__ = [
-    "compute_metrics",
-    "ReconstructionMetrics",
-    "compute_ms_ssim",
-    "dct_band_correlation",
-]
+def readability_score(overlap: float, psnr: float, ssim: float) -> float:
+    """Score how readable the reconstruction is for a human observer."""
+
+    psnr_norm = float(np.clip((psnr - AI_PSNR_BASELINE) / (AI_PSNR_TARGET - AI_PSNR_BASELINE), 0.0, 1.0))
+    overlap_norm = float(np.clip(overlap / 100.0, 0.0, 1.0))
+
+    raw = 0.5 * overlap_norm + 0.3 * ssim + 0.2 * psnr_norm
+    return float(np.clip(raw * 100.0, 0.0, 100.0))
+
+
+def team_cohesion_score(
+    overlap: float,
+    psnr: float,
+    ssim: float,
+    *,
+    sound_reference_overlap: float = 0.0,
+    sound_reference_psnr: float = 0.0,
+    sound_reference_ssim: float = 0.0,
+    sound_alignment_overlap: float = 0.0,
+    sound_alignment_psnr: float = 0.0,
+    sound_alignment_ssim: float = 0.0,
+    sound_reference_partial: float = 0.0,
+    sound_alignment_partial: float = 0.0,
+    readability: float = 0.0,
+) -> float:
+    """Holistic team score that combines visual and audio-mediated metrics."""
+
+    visual = composite_score(overlap, psnr, ssim)
+    sound_ref = audio_fidelity_score(
+        sound_reference_overlap, sound_reference_psnr, sound_reference_ssim,
+        partial_credit=sound_reference_partial,
+    )
+    sound_align = audio_fidelity_score(
+        sound_alignment_overlap, sound_alignment_psnr, sound_alignment_ssim,
+        partial_credit=sound_alignment_partial,
+    )
+    read_norm = float(np.clip(readability / 100.0, 0.0, 1.0))
+
+    combined = (
+        0.35 * visual
+        + 0.25 * (sound_ref / 100.0)
+        + 0.20 * (sound_align / 100.0)
+        + 0.20 * read_norm
+    )
+    return float(np.clip(combined * 100.0, 0.0, 100.0))

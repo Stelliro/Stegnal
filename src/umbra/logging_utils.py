@@ -253,4 +253,3 @@ def collect_provenance(config_hash: str | None = None) -> dict[str, object]:
 
 
 __all__ = ["configure_logging", "collect_provenance", "DEFAULT_LOG_DIR", "JsonFormatter"]
-

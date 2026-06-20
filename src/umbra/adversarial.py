@@ -187,7 +187,7 @@ class AdversarialManager:
     def inject_burst_noise(self, image: np.ndarray, *, severity: float = 0.2) -> np.ndarray:
         """Simulate adversarial jamming by injecting burst noise."""
 
-        arr = np.asarray(image, dtype=np.float32)
+        arr = np.array(image, dtype=np.float32)  # always copy to avoid mutating input
         bursts = max(1, int(0.05 * arr.size))
         flat = arr.reshape(-1)
         indices = self.rng.integers(0, flat.size, size=bursts)

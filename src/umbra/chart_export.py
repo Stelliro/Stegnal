@@ -11,8 +11,10 @@ from typing import Any
 
 try:  # pragma: no cover - optional dependency
     import vl_convert as vlc
+    vl_convert = vlc
 except ImportError:  # pragma: no cover - optional dependency
     vlc = None
+    vl_convert = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - depends on optional symbol availability
     from vl_convert import VegaLite as _VegaLite

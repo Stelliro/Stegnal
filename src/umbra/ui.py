@@ -1,3565 +1,636 @@
-"""Desktop GUI for Project Umbra built with Tkinter."""
-
-from __future__ import annotations
-
-import base64
-import ctypes
-import datetime
-import html
+# ui.py - FIXED VERSION
 import json
 import logging
-import math
 import os
 import queue
-import random
-import re
 import secrets
-import shutil
 import string
-import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ET
-from collections import OrderedDict, deque
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from io import BytesIO
+import tkinter as tk
+import traceback
+from collections import deque
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+from urllib.parse import urlparse, urlunparse
 
 import numpy as np
-from PIL import Image, ImageOps, ImageTk
+from PIL import Image, ImageTk
 
-try:  # pragma: no cover - optional dependency during import on minimal envs
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-except Exception as exc:  # pragma: no cover - import is deferred until runtime
-    tk = None  # type: ignore[assignment]
-    filedialog = None  # type: ignore[assignment]
-    messagebox = None  # type: ignore[assignment]
-    ttk = None  # type: ignore[assignment]
-    _IMPORT_ERROR = exc
-else:
-    _IMPORT_ERROR = None
+# Internal Imports
+from .audio_mixer import AudioEngine
+from .config import load_config
+from .evolution import EvolutionManager
+from .metrics import composite_score as _composite_score
+from .payload import DataPayloadCodec
 
-try:  # pragma: no cover - optional dependency for memory accounting
-    import psutil  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    psutil = None
+logger = logging.getLogger("Umbra")
 
-from .codec import (
-    TextEncodingMetadata,
-    decode_image_to_text,
-    encode_image_to_wav_bytes,
-    encode_text_to_image,
-    encode_text_to_waveform,
-    save_waveform_as_wav,
-)
-from .decoding import NoiseStreamDecoder
-from .demo_packager import build_demo_executable
-from .encoding import NoiseStreamEncoder
-from .evolution import EvolutionLimitReached, EvolutionManager
-from .metrics import (
-    AI_PSNR_BASELINE,
-    ReconstructionMetrics,
-    audio_fidelity_score,
-    composite_score,
-    compute_metrics,
-    partial_alignment_fraction,
-    readability_score,
-)
-from .reconstruction import GPUAccelerationRequiredError
-from .visualization import multiplicative_overlap
+class QueueHandler(logging.Handler):
+    def __init__(self, log_queue):
+        super().__init__()
+        self.log_queue = log_queue
 
-logger = logging.getLogger(__name__)
+    def emit(self, record):
+        self.log_queue.put(self.format(record))
 
-_DISPLAY_MAX_EDGE = 720
-_GRAPH_WIDTH = 900
-_GRAPH_HEIGHT = 320
-_HISTORY_LIMIT = 600
-_PINTEREST_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
-)
-_PINTEREST_DEFAULT_FEEDS = (
-    "https://www.pinterest.com/ideas/pictures-of-the-universe/935563701058/",
-)
-_PINTEREST_THEME_FEEDS: dict[str, str] = {
-    "cosmos": "https://www.pinterest.com/ideas/pictures-of-the-universe/935563701058/",
-    "architecture": "https://www.pinterest.com/ideas/futuristic-architecture/929517069328/",
-    "wildlife": "https://www.pinterest.com/ideas/wildlife-photography/918017224616/",
-    "abstract": "https://www.pinterest.com/ideas/abstract-art/913507195182/",
-    "landscape": "https://www.pinterest.com/ideas/nature-photography/908094929974/",
-    "technology": "https://www.pinterest.com/ideas/technology-art/945348402094/",
-}
-_PINTEREST_SIZE_SEQUENCE: tuple[int, ...] = (
-    2048,
-    3072,
-    4096,
-    6144,
-    8192,
-    12_288,
-    16_384,
-    24_576,
-)
-_PINTEREST_DATASET_STATE_VERSION = 1
-_PINTEREST_IMAGE_PATTERN = re.compile(r"https://i\\.pinimg\\.com/[^'\"\\s>]+")
-_PINTEREST_IMAGE_TAG_PATTERN = re.compile(
-    r"<img[^>]+src=\"(?P<url>https://i\\.pinimg\\.com/[^\"]+)\"[^>]*alt=\"(?P<title>[^\"]*)\"",
-    flags=re.IGNORECASE,
-)
-_PINTEREST_JSON_SCRIPT_PATTERN = re.compile(
-    r"<script[^>]+type=\"application/json\"[^>]*>(?P<payload>.*?)</script>",
-    flags=re.IGNORECASE | re.DOTALL,
-)
+class UmbraDesktopApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("PROJECT UMBRA // NEURAL AIR GAP")
+        self.root.geometry("1600x1000")
+        self.config = load_config()
+        self.log_queue = queue.Queue()
+        
+        self.audio = AudioEngine()
+        self.payload_codec = DataPayloadCodec(redundancy=9)
+        
+        self.simulation_mode_var = tk.BooleanVar(value=True)
+        # Default auto-difficulty to True so it balances itself
+        self.auto_difficulty_var = tk.BooleanVar(value=True)
+        # CPU / GPU compute placement for candidate evaluation
+        self.compute_mode_var = tk.StringVar(value="cpu")
+        # Let the search tune color/gamma genes (off = purist; usually best)
+        self.unlock_genes_var = tk.BooleanVar(value=False)
+        # Reward model trained from each generation; persisted via Save/Load.
+        self.model = None
+        
+        self.state = type('obj', (object,), {'running':False, 'difficulty':0.1, 'reference_image':None, 'generation_history':deque(), 'evolution_manager':None})()
+        
+        self._style = ttk.Style()
+        self._apply_dark_mode()
+        self.tab_control = ttk.Notebook(self.root)
+        self.tab_control.pack(expand=1, fill="both")
+        self.tab_evo = ttk.Frame(self.tab_control)
+        self.tab_control.add(self.tab_evo, text="EVOLUTION")
+        
+        self._build_evolution_ui(self.tab_evo)
+        self._setup_logging()
+        self.root.after(100, self._poll_log_queue)
 
-_UI_GENERATION_LIMIT = 250
+    def _apply_dark_mode(self):
+        self.root.configure(bg="#1e1e1e")
+        self._style.theme_use("clam")
+        self._style.configure(".", background="#1e1e1e", foreground="#e0e0e0", font=("Consolas", 10))
+        self._style.configure("TButton", background="#333", foreground="#00ff41")
+
+    def _setup_logging(self):
+        if not any(isinstance(h, QueueHandler) for h in logging.getLogger().handlers):
+            h = QueueHandler(self.log_queue)
+            h.setFormatter(logging.Formatter('%(asctime)s | %(message)s', '%H:%M:%S'))
+            logging.getLogger().addHandler(h)
+            logging.getLogger('evolution').addHandler(h)
+
+    def _poll_log_queue(self):
+        while not self.log_queue.empty():
+            msg = self.log_queue.get_nowait()
+            if hasattr(self, 'console_log'):
+                self.console_log.configure(state='normal')
+                self.console_log.insert(tk.END, msg + "\n")
+                self.console_log.see(tk.END)
+                self.console_log.configure(state='disabled')
+        self.root.after(100, self._poll_log_queue)
+
+    def _build_evolution_ui(self, parent):
+        ctrl = ttk.Frame(parent, padding=10)
+        ctrl.pack(fill=tk.X)
+        ttk.Button(ctrl, text="[ LOAD TARGET ]", command=self._load_reference).pack(side=tk.LEFT, padx=5)
+        self.btn_start = ttk.Button(ctrl, text="INITIATE", command=self._start_evolution)
+        self.btn_start.pack(side=tk.LEFT, padx=5)
+        self.btn_stop = ttk.Button(ctrl, text="ABORT", command=self._stop_evolution)
+        self.btn_stop.pack(side=tk.LEFT, padx=5)
+        
+        # Difficulty Slider
+        self.diff_scale = ttk.Scale(ctrl, from_=0.01, to=1.0, orient=tk.HORIZONTAL, command=lambda v: setattr(self.state, 'difficulty', float(v)))
+        self.diff_scale.set(0.1)
+        self.diff_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+        
+        ttk.Checkbutton(ctrl, text="AUTO-DIFFICULTY", variable=self.auto_difficulty_var).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(ctrl, text="COMPUTE:").pack(side=tk.LEFT, padx=(10, 2))
+        self.cb_compute = ttk.Combobox(
+            ctrl, values=["cpu", "gpu", "hybrid"], state="readonly",
+            width=7, textvariable=self.compute_mode_var,
+        )
+        self.cb_compute.pack(side=tk.LEFT, padx=2)
+        self.cb_compute.bind("<<ComboboxSelected>>", self._on_compute_mode_change)
+
+        ttk.Checkbutton(ctrl, text="UNLOCK GENES", variable=self.unlock_genes_var,
+                        command=self._on_unlock_change).pack(side=tk.LEFT, padx=8)
+
+        ttk.Button(ctrl, text="EXPORT JSON", command=self._export_data).pack(side=tk.RIGHT)
+        ttk.Button(ctrl, text="LOAD MODEL", command=self._load_model).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(ctrl, text="SAVE MODEL", command=self._save_model).pack(side=tk.RIGHT, padx=2)
+
+        self.audio_panel = ttk.LabelFrame(parent, text="INTERFERENCE LAB", padding=10)
+        self.audio_panel.pack(fill=tk.X, padx=10)
+        f_aud = ttk.Frame(self.audio_panel)
+        f_aud.pack(fill=tk.X)
+        self.cb_speaker = ttk.Combobox(f_aud, values=self.audio.get_devices('output'), state="readonly", width=30)
+        self.cb_speaker.pack(side=tk.LEFT, padx=5)
+        self.cb_mic = ttk.Combobox(f_aud, values=self.audio.get_devices('input'), state="readonly", width=30)
+        self.cb_mic.pack(side=tk.LEFT, padx=5)
+        if self.cb_speaker['values']:
+            self.cb_speaker.current(0)
+        if self.cb_mic['values']:
+            self.cb_mic.current(0)
+        ttk.Checkbutton(f_aud, text="SILENT SIM", variable=self.simulation_mode_var).pack(side=tk.LEFT, padx=10)
+        self.btn_capture = ttk.Button(f_aud, text="CAPTURE x10 → TRAIN", command=self._capture_batch)
+        self.btn_capture.pack(side=tk.LEFT, padx=10)
+        self.lbl_status = ttk.Label(f_aud, text="READY", foreground="gray")
+        self.lbl_status.pack(side=tk.RIGHT)
+
+        img_f = ttk.Frame(parent)
+        img_f.pack(expand=True, fill="both", padx=10)
+        self.reference_canvas = self._mk_canvas(img_f, "SOURCE", 0)
+        self.recon_canvas = self._mk_canvas(img_f, "RECONSTRUCTION", 1)
+        self.air_canvas = self._mk_canvas(img_f, "AIR GAP RESULT", 2)
+        self.hof_canvas = self._mk_canvas(img_f, "BEST GENE", 3)
+
+        self.graph_canvas = tk.Canvas(parent, height=150, bg="#111", highlightthickness=0)
+        self.graph_canvas.pack(fill=tk.X, padx=10, pady=5)
+        self.metrics_label = ttk.Label(parent, text="READY.", foreground="#00ff41")
+        self.metrics_label.pack(padx=10, anchor="w")
+        self.console_log = scrolledtext.ScrolledText(parent, height=6, bg="#000", fg="#ccc", font=("Consolas", 9), state='disabled')
+        self.console_log.pack(fill=tk.X, padx=10, pady=5)
+
+    def _mk_canvas(self, p, title, col):
+        f = ttk.Frame(p)
+        f.grid(row=0, column=col, sticky="nsew", padx=2)
+        p.columnconfigure(col, weight=1)
+        ttk.Label(f, text=title, anchor="center").pack()
+        c = tk.Canvas(f, bg="#000", highlightthickness=1, highlightbackground="#444")
+        c.pack(expand=True, fill="both")
+        return c
+
+    def _load_reference(self):
+        path = filedialog.askopenfilename()
+        if not path:
+            return
+        try:
+            with Image.open(path) as img:
+                # --- FIX 1: FORCE RESIZE TO 256x256 ---
+                # This prevents the "cannot reshape" error
+                img = img.resize((256, 256), Image.Resampling.LANCZOS)
+                arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+                
+                self.state.reference_image = arr
+                self._display_image(self.reference_canvas, arr)
+                self.state.generation_history.clear()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load image: {e}")
+
+    def _display_image(self, canvas, array):
+        if array is None or array.size == 0:
+            return
+        try:
+            img_u8 = (np.clip(array, 0, 1) * 255).astype(np.uint8)
+            img = Image.fromarray(img_u8)
+            canvas.update_idletasks()
+            cw, ch = canvas.winfo_width(), canvas.winfo_height()
+            if cw < 10:
+                return
+            img = img.resize((cw, ch), Image.NEAREST)
+            photo = ImageTk.PhotoImage(img)
+            canvas.delete("all")
+            canvas.create_image(cw // 2, ch // 2, image=photo)
+            canvas.image = photo
+        except Exception:
+            pass
+
+    def _start_evolution(self):
+        if self.state.reference_image is None: 
+            messagebox.showwarning("Missing Input", "Please load a target image first.")
+            return
+
+        if not self.state.evolution_manager:
+            idx_out = int(self.cb_speaker.get().split(":")[0]) if self.cb_speaker.get() else 0
+            idx_in = int(self.cb_mic.get().split(":")[0]) if self.cb_mic.get() else 0
+            
+            self.state.evolution_manager = EvolutionManager(
+                self.state.reference_image,
+                audio_out_idx=idx_out,
+                audio_in_idx=idx_in,
+                simulation_mode=self.simulation_mode_var.get(),
+                compute_mode=self.compute_mode_var.get(),
+                unlock_genes=self.unlock_genes_var.get(),
+            )
+            self.state.generation_history.clear()
+            
+        self.state.running = True
+        if not hasattr(self, 'evo_thread') or not self.evo_thread.is_alive():
+            self.evo_thread = threading.Thread(target=self._evolution_loop, daemon=True)
+            self.evo_thread.start()
+
+    def _evolution_loop(self):
+        while self.state.running:
+            try:
+                if self.state.evolution_manager and self.state.evolution_manager.interference_cache:
+                    # --- FIX 2: SAFE VISUALIZATION PAD ---
+                    raw_wave = self.state.evolution_manager.interference_cache[0]
+                    target_len = 256 * 256 * 3
+                    
+                    if raw_wave.size < target_len:
+                        display_wave = np.pad(raw_wave, (0, target_len - raw_wave.size), constant_values=0)
+                    else:
+                        display_wave = raw_wave[:target_len]
+                        
+                    p = (display_wave.reshape(256, 256, 3) + 1.0) / 2.0
+                    self.root.after(0, lambda i=p: self._display_image(self.air_canvas, i))
+                
+                # --- AUTO DIFFICULTY (SSIM-gated) ---
+                # Only make the channel harder once the run is recognizable
+                # (best SSIM >= threshold); otherwise ease off. Harder is earned.
+                if self.auto_difficulty_var.get() and len(self.state.generation_history) > 0:
+                    best = self.state.generation_history[-1].best_candidate
+                    best_ssim = float(getattr(best.metrics, 'ssim', 0.0) or 0.0)
+                    self.state.difficulty = self.state.evolution_manager.recommend_difficulty(
+                        self.state.difficulty, best_ssim
+                    )
+                    self.root.after(0, lambda: self.diff_scale.set(self.state.difficulty))
+
+                rec = self.state.evolution_manager.evolve_generation(self.state.difficulty)
+                self.state.generation_history.append(rec)
+                try:
+                    self._ensure_model().train_from_generation(
+                        self.state.evolution_manager,
+                        source="simulation" if self.simulation_mode_var.get() else "acoustic",
+                    )
+                except Exception:
+                    logger.debug("model train_from_generation failed", exc_info=True)
+                self.root.after(0, self._update_ui_post_gen, rec)
+                time.sleep(0.01)
+            except Exception: 
+                traceback.print_exc()
+                time.sleep(1.0)
+
+    def _update_ui_post_gen(self, rec):
+        best = rec.best_candidate
+        hunt = f"ST: {int(best.genes.start_sample)}"
+        ncc_val = getattr(best.metrics, 'ssim', 0)
+        status = f"GEN: {rec.generation} | REWARD: {best.reward:.4f} | {hunt} | NCC: {ncc_val:.4f}"
+        self.metrics_label.config(text=status)
+        self._display_image(self.recon_canvas, best.reconstruction)
+        self._display_image(self.hof_canvas, best.reconstruction)
+        self._update_graph()
+
+    def _update_graph(self):
+        self.graph_canvas.delete("all")
+        hist = list(self.state.generation_history)[-100:]
+        if not hist:
+            return
+        w, h = self.graph_canvas.winfo_width(), self.graph_canvas.winfo_height()
+        data = [getattr(r.best_candidate.metrics, 'ssim', 0) for r in hist]
+        if len(data) < 2:
+            return
+        
+        pts = []
+        for i, v in enumerate(data): 
+            x = (i / (len(data) - 1)) * w
+            y = h - (np.clip(v, 0, 1) * h)
+            pts.extend([x, y])
+            
+        self.graph_canvas.create_line(pts, fill="#8be9fd", width=2)
+
+    def _stop_evolution(self):
+        self.state.running = False
+
+    def _on_compute_mode_change(self, _event=None):
+        """Apply the CPU/GPU compute mode live to a running manager."""
+        mode = self.compute_mode_var.get()
+        mgr = getattr(self.state, "evolution_manager", None)
+        if mgr is not None:
+            mgr.update_settings(compute_mode=mode)
+        logger.info(f"Compute mode set to {mode.upper()}")
+
+    def _on_unlock_change(self):
+        """Toggle color/gamma gene unlocking on a running manager."""
+        val = self.unlock_genes_var.get()
+        mgr = getattr(self.state, "evolution_manager", None)
+        if mgr is not None:
+            mgr.update_settings(unlock_genes=val)
+        logger.info(f"Gene unlock {'ON' if val else 'OFF (purist)'}")
+
+    def _ensure_model(self):
+        """Lazily create the reward model that accumulates across the session."""
+        if self.model is None:
+            from .checkpoint import UmbraModel
+            self.model = UmbraModel(name="umbra-session")
+        return self.model
+
+    def _save_model(self):
+        from tkinter import filedialog, messagebox
+        model = self._ensure_model()
+        path = filedialog.asksaveasfilename(
+            defaultextension=".umbra.json", filetypes=[("Umbra model", "*.umbra.json")],
+            initialfile=f"umbra_model_{int(time.time())}.umbra.json",
+        )
+        if not path:
+            return
+        try:
+            model.save(path)
+            self.lbl_status.config(text=f"Saved model ({model.generations_trained} steps)", foreground="green")
+            logger.info(model.summary())
+        except Exception as exc:
+            messagebox.showerror("Save Model", str(exc))
+
+    def _load_model(self):
+        from tkinter import filedialog, messagebox
+        from .checkpoint import UmbraModel
+        path = filedialog.askopenfilename(filetypes=[("Umbra model", "*.umbra.json"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            self.model = UmbraModel.load(path)
+            self.lbl_status.config(text=f"Loaded: {self.model.summary()}", foreground="green")
+            logger.info(self.model.summary())
+        except Exception as exc:
+            messagebox.showerror("Load Model", str(exc))
+
+    def _capture_batch(self):
+        """Record the current target's noise through speaker->mic, then train."""
+        from tkinter import messagebox
+        if self.state.reference_image is None:
+            messagebox.showwarning("Capture", "Load a target image first.")
+            return
+        if self.simulation_mode_var.get():
+            messagebox.showwarning("Capture", "Uncheck SILENT SIM to capture real audio.")
+            return
+        threading.Thread(target=self._capture_batch_worker, daemon=True).start()
+
+    def _capture_batch_worker(self, repeats: int = 10):
+        try:
+            from .capture import record_batch, score_recordings
+            from .encoding import NoiseStreamEncoder
+            import tempfile
+
+            idx_out = int(self.cb_speaker.get().split(":")[0]) if self.cb_speaker.get() else 0
+            idx_in = int(self.cb_mic.get().split(":")[0]) if self.cb_mic.get() else 0
+            self.root.after(0, lambda: self.lbl_status.config(text="Capturing...", foreground="orange"))
+
+            seed = secrets.randbelow(2**31)
+            ref = self.state.reference_image
+            packet = NoiseStreamEncoder(sigma=float(self.state.difficulty)).encode(ref, seed=seed)
+            out_dir = Path(tempfile.gettempdir()) / f"umbra_capture_{int(time.time())}"
+            manifest = record_batch(self.audio, packet.encoded, out_dir=out_dir,
+                                    repeats=repeats, idx_out=idx_out, idx_in=idx_in, label="air")
+            paths = sorted(out_dir.glob("air_*.wav"))
+            if not paths:
+                self.root.after(0, lambda: self.lbl_status.config(text="Capture failed (no audio)", foreground="red"))
+                return
+            feats, rewards = score_recordings(paths, ref, seed=seed)
+            self._ensure_model().train(feats, rewards, source="acoustic",
+                                       recordings=[p.name for p in paths],
+                                       notes=f"speaker->mic x{manifest['successful']}")
+            msg = f"Captured {manifest['successful']}/{repeats}, trained model ({self.model.total_samples} samples)"
+            self.root.after(0, lambda: self.lbl_status.config(text=msg, foreground="green"))
+            logger.info(msg)
+        except Exception as exc:
+            logger.error(f"Capture batch failed: {exc}", exc_info=True)
+            self.root.after(0, lambda e=exc: self.lbl_status.config(text=f"Capture error: {e}", foreground="red"))
+
+    def _export_data(self):
+        if not self.state.evolution_manager:
+            return
+
+        p = filedialog.asksaveasfilename(
+            defaultextension=".json", 
+            filetypes=[("JSON Data", "*.json")],
+            initialfile=f"umbra_run_{int(time.time())}.json"
+        )
+        if not p:
+            return
+        
+        success = self.state.evolution_manager.export_history_json(p)
+        
+        if success:
+            count = len(self.state.evolution_manager.history)
+            self.console_log.configure(state='normal')
+            self.console_log.insert(tk.END, f"Exported {count} gens to {os.path.basename(p)}\n")
+            self.console_log.configure(state='disabled')
+        else:
+            messagebox.showerror("Export Failed", "Could not write history file.")
+
+    def _on_close(self):
+        self.state.running = False
+        self.root.destroy()
 
 
-class PinterestDownloadError(RuntimeError):
-    """Raised when a Pinterest download fails."""
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
+def _normalize_pinterest_url(url: str) -> str:
+    """Strip query parameters and fragment from a Pinterest image URL."""
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def _generate_unique_model_path(directory: Path, generation_index: int) -> Path:
+    """Generate a unique JSON file path inside *directory*."""
+    alphabet = string.ascii_lowercase
+    while True:
+        tag = "".join(secrets.choice(alphabet) for _ in range(8))
+        candidate = directory / f"{tag}_{generation_index}.json"
+        if not candidate.exists():
+            return candidate
+
+
+# ---------------------------------------------------------------------------
+# App state tracker for generation history
+# ---------------------------------------------------------------------------
+
+_HISTORY_MAXLEN = 500
+
+
+class UmbraAppState:
+    """Tracks generation metrics across an evolution run."""
+
+    def __init__(self, maxlen: int = _HISTORY_MAXLEN) -> None:
+        self.history: deque[dict] = deque(maxlen=maxlen)
+        self.composite_scores: deque[float] = deque(maxlen=maxlen)
+        self.sound_scores: deque[float] = deque(maxlen=maxlen)
+        self.readability_scores: deque[float] = deque(maxlen=maxlen)
+
+    def record_generation(
+        self,
+        generation: int,
+        metrics,
+        overlap: float,
+        *,
+        sound_metrics=None,
+        sound_overlap: float = 0.0,
+        sound_reference_metrics=None,
+        sound_reference_overlap: float = 0.0,
+        sound_reference_partial: float = 0.0,
+        sound_alignment_partial: float = 0.0,
+        sound_score: float = 0.0,
+        sound_readability_score: float = 0.0,
+        sound_alignment_score: float = 0.0,
+        team_score: float = 0.0,
+        ai_score_value: float | None = None,
+        frame_time_ms: float = 0.0,
+        execution_backend: str = "cpu",
+    ) -> dict:
+        ai_score = ai_score_value if ai_score_value is not None else _composite_score(overlap, metrics.psnr, metrics.ssim)
+
+        sr_metrics = sound_reference_metrics or metrics
+
+        entry: dict = {
+            "generation": generation,
+            "overlap": overlap,
+            "psnr": metrics.psnr,
+            "ssim": metrics.ssim,
+            "ai_score": ai_score,
+            "sound_psnr": sr_metrics.psnr,
+            "sound_ssim": sr_metrics.ssim,
+            "sound_overlap": sound_reference_overlap,
+            "sound_score": sound_score,
+            "sound_readability_score": sound_readability_score,
+            "sound_alignment_score": sound_alignment_score,
+            "sound_reference_partial": sound_reference_partial * 100.0,
+            "sound_alignment_partial": sound_alignment_partial * 100.0,
+            "team_score": team_score,
+            "composite_score": team_score,
+            "frame_time_ms": frame_time_ms,
+            "frame_fps": 1000.0 / frame_time_ms if frame_time_ms > 0 else 0.0,
+            "execution_backend": execution_backend,
+        }
+
+        self.history.append(entry)
+        self.composite_scores.append(entry["composite_score"])
+        self.sound_scores.append(entry["sound_score"])
+        self.readability_scores.append(entry["sound_readability_score"])
+        return entry
+
+
+# ---------------------------------------------------------------------------
+# Pinterest dataset management
+# ---------------------------------------------------------------------------
 
 @dataclass
 class PinterestDatasetEntry:
-    """Metadata describing a cached Pinterest image on disk."""
-
     identifier: str
     url: str
     label: str
     theme: str
     filename: str
     size_bytes: int
-    uses: int = 0
-    size_index: int = 0
-    width: int = 0
-    height: int = 0
+    width: int
+    height: int
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "identifier": self.identifier,
-            "url": self.url,
-            "label": self.label,
-            "theme": self.theme,
-            "filename": self.filename,
-            "size_bytes": int(self.size_bytes),
-            "uses": int(self.uses),
-            "size_index": int(self.size_index),
-            "width": int(self.width),
-            "height": int(self.height),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> PinterestDatasetEntry:
-        return cls(
-            identifier=str(payload.get("identifier", "")),
-            url=str(payload.get("url", "")),
-            label=str(payload.get("label", "Pinterest inspiration")),
-            theme=str(payload.get("theme", "misc")),
-            filename=str(payload.get("filename", "")),
-            size_bytes=int(payload.get("size_bytes", 0)),
-            uses=int(payload.get("uses", 0)),
-            size_index=int(payload.get("size_index", 0)),
-            width=int(payload.get("width", 0)),
-            height=int(payload.get("height", 0)),
-        )
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
-@dataclass
-class PinterestAcquisition:
-    """Return value describing a dataset-provided Pinterest image."""
-
-    array: np.ndarray
-    label: str
-    theme: str
-    dataset_id: str
-    url: str
-    use_index: int
-    remaining_uses: int
-    declared_edge: int
-    actual_edge: int
-
-
-@dataclass
-class ReadingSample:
-    """Alphabet training sample used by the reading lab."""
-
-    token: str
-    image: np.ndarray
-    image_metadata: TextEncodingMetadata
-    waveform: np.ndarray
-    waveform_metadata: TextEncodingMetadata
-
-
-class PinterestDatasetManager:
-    """Manage rotating Pinterest datasets with deterministic reuse semantics."""
+class _Acquisition:
+    """Result of acquiring a single image from a dataset."""
 
     def __init__(
         self,
-        *,
-        root: Path,
-        feed_sources: Mapping[str, str] | None = None,
-        dataset_limit_bytes: int = 1_000_000_000,
-        uses_per_image: int | None = None,
-        size_sequence: Sequence[int] = _PINTEREST_SIZE_SEQUENCE,
-        max_preview_pixels: int = 16_000_000,
-        pool_size: int = 5,
-        cycles_per_image: int = 5,
-        min_edge: int = 2048,
+        dataset_id: str,
+        use_index: int,
+        remaining_uses: int,
+        declared_edge: int,
+        actual_edge: int,
+        image: Image.Image | None = None,
     ) -> None:
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.feed_sources: dict[str, str] = (
-            {key: value for key, value in (feed_sources or _PINTEREST_THEME_FEEDS).items() if value}
-            or dict(_PINTEREST_THEME_FEEDS)
-        )
-        self.dataset_limit_bytes = int(max(dataset_limit_bytes, 1))
-        self.pool_size = max(int(pool_size), 1)
-        self.cycles_per_image = max(int(cycles_per_image), 1)
-        resolved_uses = (
-            self.cycles_per_image if uses_per_image is None else max(int(uses_per_image), 1)
-        )
-        self.uses_per_image = resolved_uses
-        self.min_edge = max(int(min_edge), 1)
-        self.size_sequence: tuple[int, ...] = tuple(
-            max(int(size), self.min_edge)
-            for size in (size_sequence or _PINTEREST_SIZE_SEQUENCE)
-            if int(size) > 0
-        ) or tuple(max(size, self.min_edge) for size in _PINTEREST_SIZE_SEQUENCE)
-        self.max_preview_pixels = max(int(max_preview_pixels), 262_144)
-        self._lock = threading.Lock()
-        self._state_path = self.root / "state.json"
-        self._archive_path = self.root / "archive.json"
-        self._state = self._load_state()
-        self._archive = self._load_archive()
-        self._used_urls: set[str] = set(self._state.get("used_urls", []))
-        self._builder_thread: threading.Thread | None = None
-        self._first_entry_ready = threading.Event()
-        self._build_status: dict[str, Any] = {}
+        self.dataset_id = dataset_id
+        self.use_index = use_index
+        self.remaining_uses = remaining_uses
+        self.declared_edge = declared_edge
+        self.actual_edge = actual_edge
+        self.image = image
 
-    # ------------------------------------------------------------------ persistence helpers
-    def _load_state(self) -> dict[str, Any]:
-        if not self._state_path.exists():
-            return {
-                "version": _PINTEREST_DATASET_STATE_VERSION,
-                "dataset_id": None,
-                "entries": [],
-                "rotation": {"queue": [], "index": 0},
-                "used_urls": [],
-            }
-        try:
-            data = json.loads(self._state_path.read_text())
-        except Exception:
-            logger.debug("Failed to read Pinterest dataset state; starting fresh", exc_info=True)
-            return {
-                "version": _PINTEREST_DATASET_STATE_VERSION,
-                "dataset_id": None,
-                "entries": [],
-                "rotation": {"queue": [], "index": 0},
-                "used_urls": [],
-            }
-        if data.get("version") != _PINTEREST_DATASET_STATE_VERSION:
-            return {
-                "version": _PINTEREST_DATASET_STATE_VERSION,
-                "dataset_id": data.get("dataset_id"),
-                "entries": data.get("entries", []),
-                "rotation": data.get("rotation", {"queue": [], "index": 0}),
-                "used_urls": data.get("used_urls", []),
-            }
-        data.setdefault("rotation", {"queue": [], "index": 0})
-        data.setdefault("used_urls", [])
-        return data
+
+class PinterestDatasetManager:
+    """Lightweight dataset rotation manager."""
+
+    def __init__(
+        self,
+        root: Path,
+        feed_sources: dict,
+        size_sequence: tuple[int, ...] = (256,),
+        max_preview_pixels: int = 256 * 256,
+        pool_size: int = 5,
+        cycles_per_image: int = 10,
+        min_edge: int = 64,
+    ) -> None:
+        self._root = Path(root)
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._feed_sources = feed_sources
+        self._size_sequence = size_sequence
+        self._max_preview_pixels = max_preview_pixels
+        self._pool_size = pool_size
+        self._cycles_per_image = cycles_per_image
+        self._min_edge = min_edge
+
+        self._state: dict = {}
+        self._used_urls: set[str] = set()
+        self._archive: list[dict] = []
+        self._use_counter = 0
+        self._size_index = 0
 
     def _save_state(self) -> None:
-        payload = {
-            "version": _PINTEREST_DATASET_STATE_VERSION,
-            "dataset_id": self._state.get("dataset_id"),
-            "entries": [
-                PinterestDatasetEntry.from_dict(entry).to_dict()
-                if isinstance(entry, Mapping)
-                else entry.to_dict()
-                for entry in self._state.get("entries", [])
-            ],
-            "rotation": {
-                "queue": list(self._rotation_state().get("queue", [])),
-                "index": int(self._rotation_state().get("index", 0)),
-            },
-            "used_urls": sorted(self._used_urls),
-        }
-        self._state_path.write_text(json.dumps(payload, indent=2))
+        state_path = self._root / "state.json"
+        with open(state_path, "w") as f:
+            json.dump(self._state, f, indent=2)
 
-    def _rotation_state(self) -> dict[str, Any]:
-        rotation = self._state.get("rotation")
-        if not isinstance(rotation, Mapping):
-            rotation = {"queue": [], "index": 0}
-        queue = [str(identifier) for identifier in rotation.get("queue", [])]
-        index = int(rotation.get("index", 0)) if rotation else 0
-        normalised = {"queue": queue, "index": index}
-        self._state["rotation"] = normalised
-        return normalised
-
-    def _ensure_rotation_queue_locked(
-        self, entries: Sequence[PinterestDatasetEntry]
-    ) -> None:
-        rotation = self._rotation_state()
-        available = {
-            entry.identifier
-            for entry in entries
-            if entry.uses < self.cycles_per_image
-        }
-        queue = [identifier for identifier in rotation.get("queue", []) if identifier in available]
-
-        desired = min(len(available), self.pool_size)
-        if desired <= 0:
-            rotation["queue"] = []
-            rotation["index"] = 0
-            self._state["rotation"] = rotation
-            return
-
-        if len(queue) < desired:
-            candidates = [
-                entry
-                for entry in entries
-                if entry.identifier not in queue and entry.uses < self.cycles_per_image
-            ]
-            candidates.sort(key=lambda entry: (entry.uses, entry.identifier))
-            for entry in candidates:
-                if len(queue) >= desired:
-                    break
-                queue.append(entry.identifier)
-
-        rotation["queue"] = queue[:desired]
-        if rotation["queue"]:
-            rotation["index"] = rotation.get("index", 0) % len(rotation["queue"])
-        else:
-            rotation["index"] = 0
-        self._state["rotation"] = rotation
-
-    def _pop_rotation_entry_locked(self) -> tuple[str | None, PinterestDatasetEntry | None]:
+    def acquire_image(self) -> _Acquisition:
+        """Get the next image, cycling through uses and archiving when exhausted."""
         dataset_id = self._state.get("dataset_id")
-        if not dataset_id:
-            return None, None
-        entries = [
-            PinterestDatasetEntry.from_dict(entry)
-            for entry in self._state.get("entries", [])
-        ]
-        if not entries:
-            return dataset_id, None
-        self._ensure_rotation_queue_locked(entries)
-        rotation = self._rotation_state()
-        queue = rotation.get("queue", [])
-        if not queue:
-            rotation["index"] = 0
-            self._state["rotation"] = rotation
-            return dataset_id, None
-        index = int(rotation.get("index", 0)) % len(queue)
-        identifier = queue[index]
-        rotation["index"] = (index + 1) % len(queue) if queue else 0
-        self._state["rotation"] = rotation
-        entry = next((item for item in entries if item.identifier == identifier), None)
-        self._save_state()
-        return dataset_id, entry
-
-    def _load_archive(self) -> list[dict[str, Any]]:
-        if not self._archive_path.exists():
-            return []
-        try:
-            return json.loads(self._archive_path.read_text())
-        except Exception:
-            logger.debug("Failed to read Pinterest archive metadata", exc_info=True)
-            return []
-
-    def _save_archive(self) -> None:
-        self._archive_path.write_text(json.dumps(self._archive, indent=2))
-
-    def build_status(self) -> dict[str, Any] | None:
-        """Return the current dataset build status if a build is in progress."""
-
-        with self._lock:
-            if not self._build_status:
-                return None
-            return dict(self._build_status)
-
-    # ------------------------------------------------------------------ dataset lifecycle
-    def _ensure_dataset(self) -> None:
-        with self._lock:
-            dataset_id = self._state.get("dataset_id")
-            entries = list(self._state.get("entries", []))
-        if dataset_id and entries:
-            self._first_entry_ready.set()
-            return
-        if self._builder_thread is not None and self._builder_thread.is_alive():
-            self._first_entry_ready.wait(timeout=45.0)
-            return
-        self._first_entry_ready.clear()
-        self._builder_thread = threading.Thread(target=self._build_dataset, daemon=True)
-        self._builder_thread.start()
-        self._first_entry_ready.wait(timeout=45.0)
-
-    def _dataset_dir(self, dataset_id: str) -> Path:
-        directory = self.root / dataset_id
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory
-
-    def _build_dataset(self) -> None:
-        dataset_id = secrets.token_hex(6)
-        logger.info("Building Pinterest dataset %s", dataset_id)
-        directory = self._dataset_dir(dataset_id)
-        entries: list[PinterestDatasetEntry] = []
-        total_bytes = 0
-        themes = list(self.feed_sources.items())
-        random.shuffle(themes)
-        if not themes:
-            error = "No Pinterest feeds configured"
-            with self._lock:
-                self._build_status = {
-                    "dataset_id": dataset_id,
-                    "entries": 0,
-                    "bytes": 0,
-                    "complete": True,
-                    "error": error,
-                }
-                self._state = {
-                    "version": _PINTEREST_DATASET_STATE_VERSION,
-                    "dataset_id": None,
-                    "entries": [],
-                }
-                self._save_state()
-            self._first_entry_ready.set()
-            logger.warning("Pinterest dataset build aborted: %s", error)
-            return
-        with self._lock:
-            self._state = {
-                "version": _PINTEREST_DATASET_STATE_VERSION,
-                "dataset_id": dataset_id,
-                "entries": [],
-                "rotation": {"queue": [], "index": 0},
-                "used_urls": sorted(self._used_urls),
-            }
-            self._save_state()
-            self._build_status = {
-                "dataset_id": dataset_id,
-                "entries": 0,
-                "bytes": 0,
-                "complete": False,
-            }
-        theme_cycle = deque(themes)
-        attempts = 0
-        max_attempts = len(themes) * 60
-        try:
-            while total_bytes < self.dataset_limit_bytes and attempts < max_attempts:
-                theme_cycle.rotate(-1)
-                theme, feed_url = theme_cycle[0]
-                attempts += 1
-                try:
-                    feed_bytes = _download_bytes(feed_url, timeout=12.0)
-                    candidates = _parse_pinterest_feed(feed_bytes)
-                except PinterestDownloadError as exc:
-                    logger.debug("Pinterest feed %s failed: %s", feed_url, exc)
-                    continue
-                random.shuffle(candidates)
-                for image_url, label in candidates:
-                    normalized = _normalize_pinterest_url(image_url)
-                    if normalized in self._used_urls:
-                        continue
-                    if any(entry.url == normalized for entry in entries):
-                        continue
-                    try:
-                        image_bytes, (width, height) = self._download_image_variant(
-                            normalized, referer=feed_url
-                        )
-                    except PinterestDownloadError:
-                        continue
-                    if not image_bytes:
-                        continue
-                    file_size = len(image_bytes)
-                    if total_bytes + file_size > self.dataset_limit_bytes:
-                        logger.info(
-                            "Dataset %s reached size limit at %.2f MB",
-                            dataset_id,
-                            (total_bytes + file_size) / 1_048_576,
-                        )
-                        total_bytes = self.dataset_limit_bytes
-                        break
-                    suffix = Path(urllib.parse.urlparse(normalized).path).suffix or ".jpg"
-                    filename = f"{secrets.token_hex(8)}{suffix}"
-                    file_path = directory / filename
-                    try:
-                        file_path.write_bytes(image_bytes)
-                    except Exception:
-                        logger.debug("Failed to persist Pinterest image %s", filename, exc_info=True)
-                        continue
-                    entry = PinterestDatasetEntry(
-                        identifier=secrets.token_hex(5),
-                        url=normalized,
-                        label=label or "Pinterest inspiration",
-                        theme=theme,
-                        filename=filename,
-                        size_bytes=file_size,
-                        width=int(width),
-                        height=int(height),
-                    )
-                    entries.append(entry)
-                    total_bytes += file_size
-                    with self._lock:
-                        self._state["entries"] = [item.to_dict() for item in entries]
-                        self._save_state()
-                        self._build_status = {
-                            "dataset_id": dataset_id,
-                            "entries": len(entries),
-                            "bytes": total_bytes,
-                            "complete": False,
-                        }
-                    if not self._first_entry_ready.is_set():
-                        self._first_entry_ready.set()
-                    if len(entries) >= 32:
-                        break
-                if len(entries) >= 32 or total_bytes >= self.dataset_limit_bytes:
-                    break
-            if not entries:
-                raise PinterestDownloadError("Unable to populate Pinterest dataset")
-            logger.info(
-                "Prepared Pinterest dataset %s with %d images (%.2f MB)",
-                dataset_id,
-                len(entries),
-                total_bytes / 1_048_576,
-            )
-            with self._lock:
-                self._state = {
-                    "version": _PINTEREST_DATASET_STATE_VERSION,
-                    "dataset_id": dataset_id,
-                    "entries": [entry.to_dict() for entry in entries],
-                    "rotation": {"queue": [], "index": 0},
-                    "used_urls": sorted(self._used_urls),
-                }
-                self._save_state()
-                self._build_status = {
-                    "dataset_id": dataset_id,
-                    "entries": len(entries),
-                    "bytes": total_bytes,
-                    "complete": True,
-                }
-        except Exception as exc:
-            logger.warning("Pinterest dataset build failed: %s", exc, exc_info=True)
-            with self._lock:
-                self._build_status = {
-                    "dataset_id": dataset_id,
-                    "entries": len(entries),
-                    "bytes": total_bytes,
-                    "complete": True,
-                    "error": str(exc),
-                }
-                if entries:
-                    self._state = {
-                        "version": _PINTEREST_DATASET_STATE_VERSION,
-                        "dataset_id": dataset_id,
-                        "entries": [entry.to_dict() for entry in entries],
-                        "rotation": {"queue": [], "index": 0},
-                        "used_urls": sorted(self._used_urls),
-                    }
-                else:
-                    self._state = {
-                        "version": _PINTEREST_DATASET_STATE_VERSION,
-                        "dataset_id": None,
-                        "entries": [],
-                        "rotation": {"queue": [], "index": 0},
-                        "used_urls": sorted(self._used_urls),
-                    }
-                self._save_state()
-        finally:
-            if not self._first_entry_ready.is_set():
-                self._first_entry_ready.set()
-            with self._lock:
-                self._builder_thread = None
-
-    def _download_image_variant(
-        self, url: str, *, referer: str | None = None
-    ) -> tuple[bytes, tuple[int, int]]:
-        candidates = [url]
-        for replacement in ("/originals/", "/1200x/", "/736x/", "/564x/", "/474x/", "/236x/"):
-            if "/" in url:
-                candidates.append(url.replace("/736x/", replacement))
-                candidates.append(url.replace("/564x/", replacement))
-                candidates.append(url.replace("/474x/", replacement))
-                candidates.append(url.replace("/236x/", replacement))
-        referer_value = referer or "https://www.pinterest.com/"
-        for candidate in dict.fromkeys(candidates):
-            try:
-                data = _download_bytes(candidate, timeout=15.0, referer=referer_value)
-            except PinterestDownloadError:
-                continue
-            try:
-                with Image.open(BytesIO(data)) as image:
-                    width, height = image.size
-            except Exception:
-                continue
-            if min(width, height) < self.min_edge:
-                continue
-            return data, (int(width), int(height))
-        raise PinterestDownloadError(f"Unable to download image {url}")
-
-    def _update_entry(self, updated: PinterestDatasetEntry) -> None:
-        entries = [PinterestDatasetEntry.from_dict(entry) for entry in self._state.get("entries", [])]
-        for index, entry in enumerate(entries):
-            if entry.identifier == updated.identifier:
-                entries[index] = updated
-                break
-        self._state["entries"] = [entry.to_dict() for entry in entries]
-        if updated.uses >= self.cycles_per_image:
-            self._retire_entry_locked(updated)
-        else:
-            self._state["used_urls"] = sorted(self._used_urls)
-        self._save_state()
-
-    def _retire_entry_locked(self, entry: PinterestDatasetEntry) -> None:
-        rotation = self._rotation_state()
-        rotation["queue"] = [identifier for identifier in rotation.get("queue", []) if identifier != entry.identifier]
-        if rotation["queue"]:
-            rotation["index"] = rotation.get("index", 0) % len(rotation["queue"])
-        else:
-            rotation["index"] = 0
-        self._state["rotation"] = rotation
-        self._used_urls.add(entry.url)
-        self._state["used_urls"] = sorted(self._used_urls)
-
-    def _archive_current_dataset(self) -> None:
-        dataset_id = self._state.get("dataset_id")
-        entries = [PinterestDatasetEntry.from_dict(entry) for entry in self._state.get("entries", [])]
-        if not dataset_id:
-            return
-        directory = self.root / dataset_id
-        completed_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
-        archive_entry = {
-            "dataset_id": dataset_id,
-            "completed_at": completed_at,
-            "links": [
-                {
-                    "url": entry.url,
-                    "label": entry.label,
-                    "theme": entry.theme,
-                }
-                for entry in entries
-            ],
-        }
-        self._archive.append(archive_entry)
-        try:
-            if directory.exists():
-                shutil.rmtree(directory)
-        except Exception:
-            logger.debug("Failed to remove Pinterest dataset directory %s", directory, exc_info=True)
-        self._state = {
-            "version": _PINTEREST_DATASET_STATE_VERSION,
-            "dataset_id": None,
-            "entries": [],
-            "rotation": {"queue": [], "index": 0},
-            "used_urls": sorted(self._used_urls),
-        }
-        self._save_state()
-        self._save_archive()
-
-    def acquire_image(
-        self,
-        *,
-        timeout: float = 60.0,
-        progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
-    ) -> PinterestAcquisition:
-        deadline = time.monotonic() + max(float(timeout), 5.0)
-        self._ensure_dataset()
-        while True:
-            with self._lock:
-                dataset_id, entry = self._pop_rotation_entry_locked()
-            if dataset_id and entry is not None:
-                directory = self._dataset_dir(str(dataset_id))
-                image_path = directory / entry.filename
-                if not image_path.exists():
-                    logger.debug("Pinterest image %s missing; rebuilding dataset", image_path)
-                    with self._lock:
-                        self._archive_current_dataset()
-                    self._ensure_dataset()
-                    continue
-                array, declared_edge, actual_edge = self._load_resized_image(image_path, entry)
-                with self._lock:
-                    entry.uses += 1
-                    entry.size_index = (entry.size_index + 1) % len(self.size_sequence)
-                    remaining = max(self.cycles_per_image - entry.uses, 0)
-                    self._update_entry(entry)
-                    exhausted = all(
-                        PinterestDatasetEntry.from_dict(candidate).uses >= self.cycles_per_image
-                        for candidate in self._state.get("entries", [])
-                    )
-                    if exhausted:
-                        self._archive_current_dataset()
-                return PinterestAcquisition(
-                    array=array,
-                    label=entry.label,
-                    theme=entry.theme,
-                    dataset_id=str(dataset_id),
-                    url=entry.url,
-                    use_index=entry.uses,
-                    remaining_uses=remaining,
-                    declared_edge=declared_edge,
-                    actual_edge=actual_edge,
-                )
-            if progress_callback is not None:
-                status = self.build_status()
-                if status is not None:
-                    progress_callback(status)
-            remaining_time = deadline - time.monotonic()
-            if remaining_time <= 0:
-                raise PinterestDownloadError("Pinterest dataset is empty")
-            wait_window = min(2.0, max(remaining_time, 0.5))
-            self._first_entry_ready.clear()
-            self._first_entry_ready.wait(wait_window)
-            self._ensure_dataset()
-
-    def _load_resized_image(
-        self, path: Path, entry: PinterestDatasetEntry
-    ) -> tuple[np.ndarray, int, int]:
-        target_edge = self.size_sequence[entry.size_index % len(self.size_sequence)]
-        target_edge = max(int(target_edge), self.min_edge)
-        with Image.open(path) as image:
-            converted = image.convert("RGB")
-            width, height = converted.size
-            longest = max(width, height, 1)
-            scale = float(target_edge) / float(longest)
-            if math.isclose(scale, 1.0, rel_tol=1e-3):
-                resized = converted
-            else:
-                new_width = max(1, int(round(width * scale)))
-                new_height = max(1, int(round(height * scale)))
-                resized = converted.resize((new_width, new_height), Image.BICUBIC)
-            max_pixels = self.max_preview_pixels
-            if resized.width * resized.height > max_pixels:
-                reduction = math.sqrt(max_pixels / float(resized.width * resized.height))
-                clipped_width = max(1, int(resized.width * reduction))
-                clipped_height = max(1, int(resized.height * reduction))
-                logger.debug(
-                    "Clipping Pinterest image %s from %dx%d to %dx%d for preview memory safety",
-                    entry.filename,
-                    resized.width,
-                    resized.height,
-                    clipped_width,
-                    clipped_height,
-                )
-                resized = resized.resize((clipped_width, clipped_height), Image.BILINEAR)
-            array = np.asarray(resized, dtype=np.float32) / 255.0
-            return np.clip(array, 0.0, 1.0), target_edge, max(resized.width, resized.height)
-
-
-def _process_memory_usage() -> tuple[int, int] | None:
-    """Return the process RSS and total system memory in bytes when available."""
-
-    try:
-        if psutil is not None:
-            process = psutil.Process(os.getpid())
-            rss = int(process.memory_info().rss)
-            total = int(psutil.virtual_memory().total)
-            if total > 0:
-                return rss, total
-    except Exception:
-        logger.debug("psutil memory query failed", exc_info=True)
-
-    if sys.platform.startswith("win"):
-        try:
-            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):  # pragma: no cover - platform specific
-                _fields_ = [
-                    ("cb", ctypes.c_ulong),
-                    ("PageFaultCount", ctypes.c_ulong),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
-
-            class MEMORYSTATUSEX(ctypes.Structure):  # pragma: no cover - platform specific
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            counters = PROCESS_MEMORY_COUNTERS()
-            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            if ctypes.windll.psapi.GetProcessMemoryInfo(
-                handle,
-                ctypes.byref(counters),
-                counters.cb,
-            ):
-                rss = int(counters.WorkingSetSize)
-            else:
-                rss = 0
-
-            status = MEMORYSTATUSEX()
-            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-                total = int(status.ullTotalPhys)
-            else:
-                total = 0
-            if rss > 0 and total > 0:
-                return rss, total
-        except Exception:
-            logger.debug("Windows memory query failed", exc_info=True)
-        return None
-
-    try:
-        with open("/proc/self/statm", encoding="utf8") as handle:
-            parts = handle.readline().split()
-            if len(parts) >= 2:
-                rss_pages = int(parts[1])
-                page_size = os.sysconf("SC_PAGE_SIZE")
-                rss = int(rss_pages * page_size)
-                total = int(os.sysconf("SC_PHYS_PAGES") * page_size)
-                if rss >= 0 and total > 0:
-                    return rss, total
-    except Exception:
-        logger.debug("/proc memory query failed", exc_info=True)
-
-    try:
-        import resource  # type: ignore
-
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        rss = int(usage.ru_maxrss)
-        if rss > 0:
-            if sys.platform == "darwin":
-                rss_bytes = rss
-            else:
-                rss_bytes = rss * 1024
-            total = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
-            if total > 0:
-                return int(rss_bytes), total
-    except Exception:
-        logger.debug("resource memory query failed", exc_info=True)
-
-    return None
-
-
-def _memory_relief_delay(threshold: float = 0.92) -> tuple[float, float]:
-    """Return a back-off delay (seconds) and utilisation ratio if memory is tight."""
-
-    stats = _process_memory_usage()
-    if not stats:
-        return 0.0, 0.0
-    rss, total = stats
-    if total <= 0:
-        return 0.0, 0.0
-    ratio = rss / float(total)
-    if ratio < threshold:
-        return 0.0, ratio
-    overshoot = ratio - threshold
-    delay = 0.05 + overshoot * 2.0
-    delay = max(0.02, min(delay, 0.75))
-    return delay, ratio
-
-
-@dataclass
-class UmbraAppState:
-    """In-memory state container used by the desktop UI."""
-
-    history: deque[dict[str, float]] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
-    composite_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
-    sound_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
-    readability_scores: deque[float] = field(default_factory=lambda: deque(maxlen=_HISTORY_LIMIT))
-
-    def record_generation(
-        self,
-        generation_index: int,
-        metrics: ReconstructionMetrics,
-        overlap: float,
-        *,
-        sound_metrics: ReconstructionMetrics | None = None,
-        sound_overlap: float | None = None,
-        sound_reference_metrics: ReconstructionMetrics | None = None,
-        sound_reference_overlap: float | None = None,
-        sound_reference_partial: float | None = None,
-        sound_alignment_partial: float | None = None,
-        sound_score: float | None = None,
-        sound_readability_score: float | None = None,
-        sound_alignment_score: float | None = None,
-        team_score: float | None = None,
-        ai_score_value: float | None = None,
-        frame_time_ms: float | None = None,
-        execution_backend: str | None = None,
-    ) -> dict[str, float]:
-        """Store metrics for a completed generation and return the entry."""
-
-        overlap_value = _nan_guard(overlap, 0.0)
-        psnr_value = _nan_guard(metrics.psnr, AI_PSNR_BASELINE)
-        ssim_value = _nan_guard(metrics.ssim, 0.0)
-
-        ai_score = composite_score(overlap_value, psnr_value, ssim_value)
-        if ai_score_value is not None:
-            try:
-                ai_score = float(np.clip(ai_score_value, 0.0, 100.0))
-            except (TypeError, ValueError):
-                ai_score = composite_score(overlap_value, psnr_value, ssim_value)
-        composite_value = 0.0
-        entry: dict[str, float] = {
-            "generation": float(generation_index),
-            "overlap": overlap_value,
-            "psnr": psnr_value,
-            "ssim": ssim_value,
-            "ai_overlap": overlap_value,
-            "ai_psnr": psnr_value,
-            "ai_ssim": ssim_value,
-            "ai_score": ai_score,
-        }
-
-        if frame_time_ms is not None:
-            try:
-                frame_value = float(frame_time_ms)
-            except (TypeError, ValueError):
-                frame_value = None
-            if frame_value is not None and np.isfinite(frame_value) and frame_value >= 0.0:
-                entry["frame_time_ms"] = frame_value
-                if frame_value > 1e-6:
-                    fps = float(np.clip(1000.0 / frame_value, 0.0, 9_999.0))
-                else:
-                    fps = 9_999.0
-                entry["frame_fps"] = fps
-
-        if execution_backend:
-            entry["execution_backend"] = str(execution_backend)
-
-        sound_psnr_value: float | None = None
-        sound_ssim_value: float | None = None
-        sound_overlap_value: float | None = None
-
-        reference_partial_value: float | None = None
-        if sound_reference_partial is not None:
-            try:
-                reference_partial_value = float(np.clip(sound_reference_partial, 0.0, 1.0))
-            except (TypeError, ValueError):
-                reference_partial_value = None
-
-        alignment_partial_value: float | None = None
-        if sound_alignment_partial is not None:
-            try:
-                alignment_partial_value = float(np.clip(sound_alignment_partial, 0.0, 1.0))
-            except (TypeError, ValueError):
-                alignment_partial_value = None
-
-        if sound_reference_metrics is not None and sound_reference_overlap is not None:
-            ref_overlap_value = _nan_guard(sound_reference_overlap, 0.0)
-            ref_psnr_value = _nan_guard(sound_reference_metrics.psnr, AI_PSNR_BASELINE)
-            ref_ssim_value = _nan_guard(sound_reference_metrics.ssim, 0.0)
-            entry.update(
-                {
-                    "sound_reference_psnr": ref_psnr_value,
-                    "sound_reference_ssim": ref_ssim_value,
-                    "sound_reference_overlap": ref_overlap_value,
-                }
-            )
-            sound_overlap_value = ref_overlap_value
-            sound_psnr_value = ref_psnr_value
-            sound_ssim_value = ref_ssim_value
-            if reference_partial_value is not None:
-                entry["sound_reference_partial"] = reference_partial_value * 100.0
-
-        if sound_psnr_value is None and sound_metrics is not None and sound_overlap is not None:
-            sound_overlap_value = _nan_guard(sound_overlap, 0.0)
-            sound_psnr_value = _nan_guard(sound_metrics.psnr, AI_PSNR_BASELINE)
-            sound_ssim_value = _nan_guard(sound_metrics.ssim, 0.0)
-
-        computed_sound_score: float | None = None
-        if (
-            sound_overlap_value is not None
-            and sound_psnr_value is not None
-            and sound_ssim_value is not None
-        ):
-            entry.update(
-                {
-                    "sound_psnr": sound_psnr_value,
-                    "sound_ssim": sound_ssim_value,
-                    "sound_overlap": sound_overlap_value,
-                }
-            )
-            computed_sound_score = audio_fidelity_score(
-                sound_overlap_value,
-                sound_psnr_value,
-                sound_ssim_value,
-                partial_credit=reference_partial_value,
-            )
-
-        sound_score_value: float | None = None
-        if sound_score is not None:
-            try:
-                sound_score_value = float(np.clip(sound_score, 0.0, 100.0))
-            except (TypeError, ValueError):
-                sound_score_value = None
-        elif computed_sound_score is not None:
-            sound_score_value = float(np.clip(computed_sound_score, 0.0, 100.0))
-
-        readability_value: float | None = None
-        if sound_readability_score is not None:
-            try:
-                readability_value = float(np.clip(sound_readability_score, 0.0, 100.0))
-            except (TypeError, ValueError):
-                readability_value = None
-        elif (
-            sound_overlap_value is not None
-            and sound_psnr_value is not None
-            and sound_ssim_value is not None
-        ):
-            readability_value = readability_score(
-                sound_overlap_value, sound_psnr_value, sound_ssim_value
-            )
-
-        if sound_score_value is not None:
-            entry["sound_score"] = sound_score_value
-            if math.isfinite(sound_score_value):
-                self.sound_scores.append(sound_score_value)
-        alignment_value: float | None = None
-        if sound_alignment_score is not None:
-            try:
-                alignment_value = float(np.clip(sound_alignment_score, 0.0, 100.0))
-            except (TypeError, ValueError):
-                alignment_value = None
-        elif (
-            alignment_partial_value is not None
-            and sound_metrics is not None
-            and sound_overlap is not None
-        ):
-            alignment_overlap = _nan_guard(sound_overlap, 0.0)
-            alignment_psnr = _nan_guard(sound_metrics.psnr, AI_PSNR_BASELINE)
-            alignment_ssim = _nan_guard(sound_metrics.ssim, 0.0)
-            computed_alignment = audio_fidelity_score(
-                alignment_overlap,
-                alignment_psnr,
-                alignment_ssim,
-                partial_credit=alignment_partial_value,
-            )
-            alignment_value = float(np.clip(computed_alignment, 0.0, 100.0))
-        if alignment_partial_value is not None:
-            entry["sound_alignment_partial"] = alignment_partial_value * 100.0
-        if alignment_value is not None:
-            entry["sound_alignment_score"] = alignment_value
-        if readability_value is not None:
-            readability_value = float(np.clip(readability_value, 0.0, 100.0))
-            entry["sound_readability_score"] = readability_value
-            if math.isfinite(readability_value):
-                self.readability_scores.append(readability_value)
-
-        team_value: float | None = None
-        if team_score is not None:
-            try:
-                team_value = float(np.clip(team_score, 0.0, 100.0))
-            except (TypeError, ValueError):
-                team_value = None
-        if team_value is not None:
-            entry["team_score"] = team_value
-            composite_value = team_value
-        elif sound_score_value is not None:
-            readability_fraction = 1.0
-            if readability_value is not None and math.isfinite(readability_value):
-                readability_fraction = float(
-                    np.clip(readability_value / 100.0, 0.0, 1.0)
-                )
-            alignment_fraction = 1.0
-            if alignment_value is not None and math.isfinite(alignment_value):
-                alignment_fraction = float(
-                    np.clip(alignment_value / 100.0, 0.0, 1.0)
-                )
-            composite_value = float(
-                np.clip(
-                    (ai_score * sound_score_value / 100.0)
-                    * readability_fraction
-                    * alignment_fraction,
-                    0.0,
-                    100.0,
-                )
-            )
-        else:
-            composite_value = float(np.clip(ai_score, 0.0, 100.0))
-
-        entry["composite_score"] = composite_value
-        self.history.append(entry)
-        self.composite_scores.append(float(composite_value))
-        return entry
-
-    def as_rows(self) -> list[dict[str, float]]:
-        """Return a copy of the history rows for analytics."""
-
-        return list(self.history)
-
-
-def _nan_guard(value: float, fallback: float) -> float:
-    return float(np.nan_to_num(value, nan=fallback, posinf=fallback, neginf=fallback))
-
-
-def _clamp_image(array: np.ndarray) -> np.ndarray:
-    arr = np.asarray(array, dtype=np.float32)
-    if arr.size == 0:
-        raise ValueError("Cannot display empty image array")
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    elif arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = np.repeat(arr, 3, axis=-1)
-    if arr.ndim != 3 or arr.shape[-1] != 3:
-        raise ValueError("Expected image shaped [H, W, 3] or [H, W]")
-    return np.clip(arr, 0.0, 1.0)
-
-
-_ID_ALPHABET = string.ascii_lowercase + string.digits
-
-
-def _generate_unique_model_path(
-    base_dir: Path, generation_index: float | None = None, *, extension: str = ".json"
-) -> Path:
-    """Return a unique file path for saving model snapshots."""
-
-    directory = Path(base_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-
-    suffix_value = 0
-    if generation_index is not None:
-        try:
-            suffix_value = max(int(round(float(generation_index))), 0)
-        except (TypeError, ValueError):
-            suffix_value = 0
-    suffix = f"{suffix_value:02d}"
-
-    while True:
-        token = "".join(secrets.choice(_ID_ALPHABET) for _ in range(8))
-        candidate = directory / f"{token}_{suffix}{extension}"
-        if not candidate.exists():
-            return candidate
-
-
-def _encode_image_to_base64(image: np.ndarray | None) -> str | None:
-    """Encode an ``image`` array into a base64 PNG string."""
-
-    if image is None:
-        return None
-    try:
-        clamped = _clamp_image(image)
-    except ValueError:
-        return None
-    buffer = BytesIO()
-    png_image = Image.fromarray((clamped * 255.0).astype(np.uint8))
-    png_image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def _decode_image_from_base64(data: str | None) -> np.ndarray | None:
-    """Decode a base64 PNG ``data`` string into a float image array."""
-
-    if not data:
-        return None
-    try:
-        binary = base64.b64decode(data)
-    except (TypeError, ValueError):
-        return None
-    try:
-        with Image.open(BytesIO(binary)) as image:
-            array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-    except Exception:
-        return None
-    return _clamp_image(array)
-
-
-def _metrics_from_mapping(mapping: Mapping[str, Any]) -> ReconstructionMetrics | None:
-    """Rebuild :class:`ReconstructionMetrics` from a JSON-style mapping."""
-
-    try:
-        psnr = float(mapping.get("psnr"))
-        ssim = float(mapping.get("ssim"))
-    except (TypeError, ValueError):
-        return None
-    if not (math.isfinite(psnr) and math.isfinite(ssim)):
-        return None
-    return ReconstructionMetrics(psnr=psnr, ssim=ssim)
-
-
-def _serialize_sound_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert the latest sound payload to a JSON-serialisable mapping."""
-
-    serialised: dict[str, Any] = {}
-    for key, value in payload.items():
-        if isinstance(value, ReconstructionMetrics):
-            serialised[key] = value.as_dict()
-        elif isinstance(value, np.ndarray):
-            serialised[key] = np.asarray(value).tolist()
-        elif isinstance(value, (np.floating, np.integer)):
-            serialised[key] = float(value)
-        else:
-            serialised[key] = value
-    return serialised
-
-
-def _deserialize_sound_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert a serialised sound payload back into runtime objects."""
-
-    restored: dict[str, Any] = {}
-    for key, value in payload.items():
-        if isinstance(value, Mapping):
-            metrics = _metrics_from_mapping(value)
-            if metrics is not None:
-                restored[key] = metrics
-                continue
-        restored[key] = value
-    return restored
-
-
-def _sanitize_history_entry(entry: Mapping[str, Any]) -> dict[str, float]:
-    """Convert arbitrary JSON history rows into numeric UI entries."""
-
-    sanitized: dict[str, float] = {}
-    for key, value in entry.items():
-        try:
-            sanitized[key] = float(value)
-        except (TypeError, ValueError):
-            continue
-    return sanitized
-
-
-def _to_photo_image(
-    array: np.ndarray,
-    *,
-    max_edge: int = _DISPLAY_MAX_EDGE,
-    rotation_deg: float = 0.0,
-) -> ImageTk.PhotoImage:
-    clamped = _clamp_image(array)
-    data = (clamped * 255.0).astype(np.uint8)
-    image = Image.fromarray(data, mode="RGB")
-    if rotation_deg:
-        image = image.rotate(
-            float(rotation_deg),
-            resample=Image.BICUBIC,
-            expand=True,
-            fillcolor=(16, 16, 16),
-        )
-    if max_edge and max(image.size) > max_edge:
-        image = ImageOps.contain(image, (max_edge, max_edge), Image.LANCZOS)
-    return ImageTk.PhotoImage(image)
-
-
-def _prepare_sound_preview(array: np.ndarray) -> np.ndarray:
-    """Return ``array`` rescaled for display while preserving structure."""
-
-    sound = np.nan_to_num(np.asarray(array, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
-    if sound.size == 0:
-        raise ValueError("Sound reconstruction is empty")
-    if sound.ndim == 3 and sound.shape[-1] > 3:
-        sound = sound[..., :3]
-    if sound.ndim == 2:
-        reduced = sound
-    elif sound.ndim == 3 and sound.shape[-1] == 3:
-        reduced = np.mean(sound, axis=-1)
-    else:
-        reduced = sound[..., 0]
-    reduced_min = float(np.min(reduced))
-    reduced_max = float(np.max(reduced))
-    span = reduced_max - reduced_min
-    if span <= 1e-4:
-        # Boost contrast for nearly-flat reconstructions so structure remains visible.
-        if span == 0.0:
-            normalized = np.zeros_like(sound)
-        else:
-            normalized = (sound - reduced_min) / max(span, 1e-6)
-    else:
-        normalized = (sound - reduced_min) / span
-    return np.clip(normalized, 0.0, 1.0)
-
-
-def _download_bytes(
-    url: str,
-    *,
-    timeout: float = 10.0,
-    referer: str | None = None,
-    opener: Callable[[urllib.request.Request], Any] | None = None,
-) -> bytes:
-    headers = {
-        "User-Agent": _PINTEREST_USER_AGENT,
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9," "image/avif,image/webp,image/apng,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    if referer:
-        headers["Referer"] = referer
-
-    request = urllib.request.Request(url, headers=headers)
-    opener_fn = opener or urllib.request.urlopen
-    try:
-        with opener_fn(request) as response:
-            return response.read()
-    except urllib.error.URLError as exc:  # pragma: no cover - defensive networking guard
-        raise PinterestDownloadError(f"Unable to download {url}: {exc}") from exc
-
-
-def _normalize_pinterest_source(_source: str | None) -> str:
-    if _source:
-        return _source
-    feeds = [url for url in _PINTEREST_THEME_FEEDS.values() if url]
-    if feeds:
-        return random.choice(feeds)
-    return _PINTEREST_DEFAULT_FEEDS[0]
-
-
-def _collect_pinterest_nodes(payload: Any) -> Iterable[Mapping[str, Any]]:
-    stack = [payload]
-    collected: list[Mapping[str, Any]] = []
-    while stack:
-        current = stack.pop()
-        if isinstance(current, Mapping):
-            collected.append(current)
-            stack.extend(current.values())
-        elif isinstance(current, list):
-            stack.extend(current)
-    return collected
-
-
-def _normalize_pinterest_url(url: str) -> str:
-    cleaned = html.unescape(url or "")
-    match = re.search(r"https://i\\.pinimg\\.com/[^\s\"'>)]+", cleaned, flags=re.IGNORECASE)
-    if match:
-        cleaned = match.group(0)
-    parsed = urllib.parse.urlparse(cleaned)
-    normalized = parsed._replace(query="", fragment="")
-    return normalized.geturl()
-
-
-def _parse_pinterest_feed_xml(text: str) -> list[tuple[str, str]]:
-    try:
-        root = ET.fromstring(text)
-    except ET.ParseError:
-        return []
-
-    channel = root.find("channel")
-    items = channel.findall("item") if channel is not None else root.findall(".//item")
-    candidates: list[tuple[str, str]] = []
-    for item in items:
-        title = (item.findtext("title") or "Pinterest inspiration").strip()
-        for child in item:
-            tag = child.tag.split("}")[-1]
-            if tag in {"content", "thumbnail"}:
-                url = child.attrib.get("url")
-                if url and url.startswith("http"):
-                    candidates.append((url, title))
-        description = item.findtext("description") or ""
-        for match in _PINTEREST_IMAGE_PATTERN.findall(description):
-            candidates.append((match, title))
-    return candidates
-
-
-def _parse_pinterest_html(text: str) -> list[tuple[str, str]]:
-    candidates: list[tuple[str, str]] = []
-
-    for snippet in _PINTEREST_JSON_SCRIPT_PATTERN.findall(text):
-        snippet = snippet.strip()
-        if not snippet:
-            continue
-        try:
-            payload = json.loads(html.unescape(snippet))
-        except json.JSONDecodeError:
-            continue
-        for node in _collect_pinterest_nodes(payload):
-            if not isinstance(node, Mapping):
-                continue
-            images = node.get("images")
-            if isinstance(images, Mapping):
-                orig = images.get("orig")
-                if isinstance(orig, Mapping):
-                    url_value = orig.get("url")
-                    if isinstance(url_value, str):
-                        title_value = node.get("title") or node.get("name") or node.get("description")
-                        label = str(title_value).strip() if title_value else "Pinterest inspiration"
-                        candidates.append((_normalize_pinterest_url(url_value), label))
-
-    for match in _PINTEREST_IMAGE_TAG_PATTERN.finditer(text):
-        url = _normalize_pinterest_url(match.group("url"))
-        title = match.group("title")
-        label = html.unescape(title).strip() if title else "Pinterest inspiration"
-        candidates.append((url, label))
-
-    if not candidates:
-        for url in _PINTEREST_IMAGE_PATTERN.findall(text):
-            candidates.append((_normalize_pinterest_url(url), "Pinterest inspiration"))
-
-    return candidates
-
-
-def _parse_pinterest_feed(feed_data: bytes | str) -> list[tuple[str, str]]:
-    text = feed_data.decode("utf-8", errors="replace") if isinstance(feed_data, bytes) else feed_data
-    candidates = _parse_pinterest_feed_xml(text)
-    if not candidates:
-        candidates = _parse_pinterest_html(text)
-    if not candidates:
-        raise ValueError("Unable to parse Pinterest feed XML")
-
-    deduped: OrderedDict[str, str] = OrderedDict()
-    for url, label in candidates:
-        normalized = _normalize_pinterest_url(url)
-        if normalized not in deduped:
-            deduped[normalized] = label
-    return list(deduped.items())
-
-
-def fetch_pinterest_inspiration(*, timeout: float = 10.0) -> tuple[np.ndarray, str]:
-    """Download a random image from the curated Pinterest board."""
-
-    feed_url = _normalize_pinterest_source(None)
-    feed_bytes = _download_bytes(feed_url, timeout=timeout)
-    try:
-        candidates = _parse_pinterest_feed(feed_bytes)
-    except ValueError as exc:  # pragma: no cover - defensive
-        raise PinterestDownloadError(str(exc)) from exc
-
-    image_url, title = random.choice(candidates)
-    referer = feed_url if feed_url.startswith("http") else "https://www.pinterest.com/"
-
-    def _attempt(url: str) -> bytes:
-        return _download_bytes(url, timeout=timeout, referer=referer)
-
-    try:
-        image_bytes = _attempt(image_url)
-    except PinterestDownloadError as exc:
-        fallback_urls = [
-            image_url.replace("/736x/", replacement)
-            for replacement in ("/564x/", "/474x/", "/236x/")
-        ]
-        for candidate in fallback_urls:
-            candidate = candidate.strip()
-            if not candidate or candidate == image_url:
-                continue
-            try:
-                image_bytes = _attempt(candidate)
-                break
-            except PinterestDownloadError:
-                continue
-        else:
-            raise exc
-
-    with Image.open(BytesIO(image_bytes)) as downloaded:
-        array = np.asarray(downloaded.convert("RGB"), dtype=np.float32) / 255.0
-
-    label = (title or "Pinterest inspiration").strip() or "Pinterest inspiration"
-    return np.clip(array, 0.0, 1.0), f"{label} (Pinterest)"
-
-
-class UmbraDesktopApp:
-    """Lightweight Tkinter front-end for Project Umbra."""
-
-    def __init__(self, root: tk.Tk) -> None:
-        if _IMPORT_ERROR is not None:  # pragma: no cover - defensive
-            raise RuntimeError("Tkinter is not available") from _IMPORT_ERROR
-
-        self.root = root
-        self.root.title("Project Umbra")
-        self._configure_fullscreen()
-        self.encoder = NoiseStreamEncoder()
-        self.decoder = NoiseStreamDecoder()
-        self.manager: EvolutionManager | None = None
-        self.reference_image: np.ndarray | None = None
-        self.reference_label = ""
-        self.reconstruction: np.ndarray | None = None
-        self.sound_reconstruction: np.ndarray | None = None
-        self.state = UmbraAppState()
-        self._status_var = tk.StringVar(value="Select a reference image to begin.")
-        self._run_mode_var = tk.StringVar(value="infinite")
-        self._score_threshold = tk.DoubleVar(value=88.0)
-        self._advanced_logging_var = tk.BooleanVar(value=False)
-        self._advanced_logging_enabled = bool(self._advanced_logging_var.get())
-        self._primary_score_var = tk.StringVar(value="Overall score: –")
-        self._readability_score_var = tk.StringVar(value="WAV readability score: –")
-        self._baseline_score_var = tk.StringVar(value="AI baseline score: –")
-        self._reference_info_var = tk.StringVar(value="No reference loaded.")
-        self._recon_info_var = tk.StringVar(value="Awaiting AI reconstruction metrics…")
-        self._sound_info_var = tk.StringVar(value="Sound preview pending…")
-        self._loading_message_var = tk.StringVar(value="")
-        self._text_status_var = tk.StringVar(value="Enter text to encode into colour static.")
-        self._reading_status_var = tk.StringVar(value="Reading lab idle.")
-        self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self._worker: threading.Thread | None = None
-        self._running = False
-        self._last_refresh = 0.0
-        self._latest_sound_payload: dict[str, Any] | None = None
-        self._latest_generation_entry: dict[str, float] | None = None
-        self._latest_text_metadata: TextEncodingMetadata | None = None
-        self._latest_text_payload: str | None = None
-        self._reading_samples: deque[ReadingSample] = deque()
-        self._reading_thread: threading.Thread | None = None
-        self._reading_waveform: np.ndarray | None = None
-        self._pinterest_manager: PinterestDatasetManager | None = None
-        self._preview_angle = 0.0
-        self._rotation_value_var = tk.StringVar(value="0°")
-        self._rotation_slider: tk.Scale | None = None
-
-        self._reference_label_widget: tk.Label | None = None
-        self._reference_image_widget: tk.Label | None = None
-        self._reference_info_label: tk.Label | None = None
-        self._reference_photo: ImageTk.PhotoImage | None = None
-        self._recon_label_widget: tk.Label | None = None
-        self._recon_image_widget: tk.Label | None = None
-        self._recon_info_label: tk.Label | None = None
-        self._recon_photo: ImageTk.PhotoImage | None = None
-        self._sound_label_widget: tk.Label | None = None
-        self._sound_image_widget: tk.Label | None = None
-        self._sound_info_label: tk.Label | None = None
-        self._sound_photo: ImageTk.PhotoImage | None = None
-        self._graph_canvas: tk.Canvas | None = None
-        self._loading_modal: tk.Toplevel | None = None
-        self._loading_progress: Any = None
-        self._text_input: tk.Text | None = None
-        self._diagnostics_notebook: Any | None = None
-        self._log_text: tk.Text | None = None
-        self._loop_tree: Any | None = None
-        self._loop_summary_var = tk.StringVar(
-            value="Loop diagnostics will appear after the first generation."
-        )
-        self._pending_logs: list[str] = []
-        self._pending_loop_payloads: list[Mapping[str, Any]] = []
-
-        self._build_layout()
-        self._use_demo_image()
-        self.root.after(200, self._poll_queue)
-
-    # ------------------------------------------------------------------ UI setup
-    def _configure_fullscreen(self) -> None:
-        try:
-            self.root.state("zoomed")  # type: ignore[attr-defined]
-        except Exception:
-            try:
-                self.root.attributes("-zoomed", True)
-            except Exception:
-                self.root.attributes("-fullscreen", False)
-
-    def _maybe_pause_for_memory(self) -> None:
-        """Sleep briefly when system memory is under pressure."""
-
-        delay, ratio = _memory_relief_delay()
-        if delay > 0.0:
-            logger.debug(
-                "Memory pressure %.1f%% detected; pausing worker for %.3f s",
-                ratio * 100.0,
-                delay,
-            )
-            time.sleep(delay)
-        else:
-            time.sleep(0.0)
-
-    def _ensure_pinterest_manager(self) -> PinterestDatasetManager:
-        if self._pinterest_manager is not None:
-            return self._pinterest_manager
-        dataset_root = Path.home() / ".umbra" / "pinterest_datasets"
-        try:
-            manager = PinterestDatasetManager(root=dataset_root)
-        except Exception as exc:
-            logger.debug("Failed to initialise Pinterest dataset manager: %s", exc, exc_info=True)
-            raise
-        self._pinterest_manager = manager
-        return manager
-
-    # ------------------------------------------------------------------ Modal helpers
-    def _show_loading_modal(self, message: str) -> None:
-        if tk is None:
-            return
-        if self._loading_modal is not None:
-            self._loading_message_var.set(message)
-            return
-        modal = tk.Toplevel(self.root)
-        modal.configure(bg="#202020")
-        modal.title("Please wait…")
-        modal.resizable(False, False)
-        modal.transient(self.root)
-        try:
-            modal.grab_set()
-        except Exception:
-            logger.debug("Loading modal grab failed", exc_info=True)
-        self._loading_message_var.set(message)
-        label = tk.Label(
-            modal,
-            textvariable=self._loading_message_var,
-            fg="white",
-            bg="#202020",
-            wraplength=280,
-            justify=tk.CENTER,
-            font=("Segoe UI", 11),
-        )
-        label.pack(padx=24, pady=(24, 12))
-        if ttk is not None:
-            progress = ttk.Progressbar(modal, mode="indeterminate", length=240)
-            progress.pack(padx=24, pady=(0, 24))
-            try:
-                progress.start(12)
-            except Exception:
-                logger.debug("Loading modal progress bar failed", exc_info=True)
-            self._loading_progress = progress
-        else:
-            self._loading_progress = None
-        self._loading_modal = modal
-        self.root.update_idletasks()
-
-    def _hide_loading_modal(self) -> None:
-        modal = self._loading_modal
-        if modal is None:
-            return
-        try:
-            if self._loading_progress is not None:
-                self._loading_progress.stop()  # type: ignore[attr-defined]
-        except Exception:
-            logger.debug("Loading modal progress teardown failed", exc_info=True)
-        try:
-            modal.grab_release()
-        except Exception:
-            logger.debug("Loading modal grab release failed", exc_info=True)
-        try:
-            modal.destroy()
-        except Exception:
-            logger.debug("Destroying loading modal failed", exc_info=True)
-        self._loading_modal = None
-        self._loading_progress = None
-        self._loading_message_var.set("")
-
-    def _update_loading_modal(self, entry: Mapping[str, Any] | None = None) -> None:
-        if not self._running and entry is None:
-            return
-        if entry is None:
-            self._show_loading_modal("Evolution running…\nPreparing first generation…")
-            return
-
-        def _safe_float(key: str, default: float) -> float:
-            try:
-                return float(entry.get(key, default))
-            except (TypeError, ValueError):
-                return default
-
-        generation = _safe_float("generation", 0.0)
-        overlap = _safe_float("sound_overlap", _safe_float("overlap", 0.0))
-        psnr = _safe_float("sound_psnr", _safe_float("psnr", AI_PSNR_BASELINE))
-        ssim = _safe_float("sound_ssim", _safe_float("ssim", 0.0))
-        readability = entry.get("sound_readability_score")
-        if readability is None:
-            readability = readability_score(overlap, psnr, ssim)
-        try:
-            readability_value = float(readability)
-        except (TypeError, ValueError):
-            readability_value = 0.0
-
-        message = (
-            "Evolution running…"
-            f"\nGeneration {generation:.0f}"
-            f"\nOverlap {overlap:.2f}%"
-            f"\nPSNR {psnr:.2f} dB"
-            f"\nReadability {readability_value:.2f}"
-        )
-        frame_time = entry.get("frame_time_ms")
-        if frame_time is not None:
-            try:
-                frame_value = float(frame_time)
-            except (TypeError, ValueError):
-                frame_value = None
-            if frame_value is not None and frame_value > 0.0:
-                fps_value = entry.get("frame_fps")
-                if fps_value is not None:
-                    try:
-                        fps_numeric = float(fps_value)
-                    except (TypeError, ValueError):
-                        fps_numeric = None
-                else:
-                    fps_numeric = None
-                if fps_numeric is None and frame_value > 1e-6:
-                    fps_numeric = 1000.0 / frame_value
-                if fps_numeric is not None:
-                    message += f"\nRender {frame_value:.1f} ms ({fps_numeric:.1f} FPS)"
-                else:
-                    message += f"\nRender {frame_value:.1f} ms"
-        self._show_loading_modal(message)
-
-    def _build_layout(self) -> None:
-        control_frame = tk.Frame(self.root, bg="#101010")
-        control_frame.pack(fill=tk.X, side=tk.TOP)
-
-        tk.Button(control_frame, text="Load image…", command=self._choose_image).pack(
-            side=tk.LEFT, padx=6, pady=6
-        )
-        tk.Button(control_frame, text="Pinterest inspiration", command=self._fetch_pinterest_async).pack(
-            side=tk.LEFT, padx=6, pady=6
-        )
-        tk.Button(control_frame, text="Demo gradient", command=self._use_demo_image).pack(
-            side=tk.LEFT, padx=6, pady=6
-        )
-        tk.Button(
-            control_frame,
-            text="Build demo exe model here",
-            command=self._build_demo_executable,
-        ).pack(side=tk.LEFT, padx=6, pady=6)
-        tk.Button(
-            control_frame,
-            text="⭳ Extract parameters",
-            command=self._export_model_parameters,
-        ).pack(side=tk.LEFT, padx=6, pady=6)
-        tk.Button(
-            control_frame,
-            text="💾 Save snapshot",
-            command=self._save_model_snapshot,
-        ).pack(side=tk.LEFT, padx=6, pady=6)
-        tk.Button(
-            control_frame,
-            text="📂 Load model…",
-            command=self._load_model_parameters,
-        ).pack(side=tk.LEFT, padx=6, pady=6)
-
-        tk.Checkbutton(
-            control_frame,
-            text="Keep running until paused",
-            variable=self._run_mode_var,
-            onvalue="infinite",
-            offvalue="finite",
-            command=self._toggle_run_mode,
-        ).pack(side=tk.LEFT, padx=10)
-
-        tk.Label(control_frame, text="Auto-refresh at sound score ≥", fg="white", bg="#101010").pack(
-            side=tk.LEFT, padx=(20, 4)
-        )
-        threshold_spin = tk.Spinbox(
-            control_frame,
-            from_=50,
-            to=100,
-            increment=1,
-            textvariable=self._score_threshold,
-            width=5,
-        )
-        threshold_spin.pack(side=tk.LEFT, padx=4)
-
-        tk.Button(control_frame, text="Start evolution", command=self.start_evolution).pack(
-            side=tk.LEFT, padx=10, pady=6
-        )
-        tk.Button(control_frame, text="Pause", command=self.stop_evolution).pack(
-            side=tk.LEFT, padx=6, pady=6
+        if dataset_id is None:
+            raise RuntimeError("No active dataset")
+
+        entries = self._state.get("entries", [])
+        rotation = self._state.get("rotation", {})
+        queue_ids = rotation.get("queue", [])
+        index = rotation.get("index", 0)
+
+        if not queue_ids:
+            raise RuntimeError("Empty rotation queue")
+
+        entry_id = queue_ids[index % len(queue_ids)]
+        entry_data = next((e for e in entries if e["identifier"] == entry_id), None)
+        if entry_data is None:
+            raise RuntimeError(f"Entry {entry_id} not found")
+
+        self._use_counter += 1
+        remaining = max(0, self._cycles_per_image - self._use_counter)
+
+        declared_edge = self._size_sequence[self._size_index % len(self._size_sequence)]
+        self._size_index += 1
+
+        dataset_dir = self._root / dataset_id
+        img_path = dataset_dir / entry_data["filename"]
+        actual_edge = declared_edge
+        img = None
+        if img_path.exists():
+            img = Image.open(img_path)
+            actual_edge = min(max(img.width, img.height), declared_edge)
+
+        acq = _Acquisition(
+            dataset_id=dataset_id,
+            use_index=self._use_counter,
+            remaining_uses=remaining,
+            declared_edge=declared_edge,
+            actual_edge=actual_edge,
+            image=img,
         )
 
-        tk.Checkbutton(
-            control_frame,
-            text="Advanced logging",
-            variable=self._advanced_logging_var,
-            onvalue=True,
-            offvalue=False,
-            command=self._handle_advanced_logging_toggle,
-            fg="white",
-            bg="#101010",
-            selectcolor="#303030",
-            activebackground="#202020",
-            activeforeground="white",
-        ).pack(side=tk.LEFT, padx=10)
+        if self._use_counter >= self._cycles_per_image:
+            self._archive.append({"dataset_id": dataset_id})
+            self._state.pop("dataset_id", None)
+            self._use_counter = 0
 
-        tk.Label(control_frame, textvariable=self._primary_score_var, fg="#8fdc6d", bg="#101010").pack(
-            side=tk.RIGHT, padx=12
-        )
-        tk.Label(
-            control_frame,
-            textvariable=self._readability_score_var,
-            fg="#9be9a8",
-            bg="#101010",
-        ).pack(side=tk.RIGHT, padx=12)
-        tk.Label(control_frame, textvariable=self._baseline_score_var, fg="#f4d35e", bg="#101010").pack(
-            side=tk.RIGHT, padx=12
-        )
-        tk.Label(control_frame, textvariable=self._status_var, fg="white", bg="#101010").pack(
-            side=tk.RIGHT, padx=12
-        )
+        return acq
 
-        text_frame = tk.LabelFrame(
-            self.root,
-            text="Text ↔ Sound lab",
-            bg="#181818",
-            fg="white",
-            labelanchor="nw",
-            padx=4,
-            pady=4,
-        )
-        text_frame.pack(fill=tk.X, padx=10, pady=(4, 6))
 
-        text_container = tk.Frame(text_frame, bg="#181818")
-        text_container.pack(fill=tk.X, expand=True, padx=4, pady=4)
-
-        scrollbar = tk.Scrollbar(text_container)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self._text_input = tk.Text(
-            text_container,
-            height=5,
-            wrap=tk.WORD,
-            bg="#101010",
-            fg="#f0f0f0",
-            insertbackground="#f0f0f0",
-            relief=tk.FLAT,
-            yscrollcommand=scrollbar.set,
-        )
-        self._text_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        scrollbar.config(command=self._text_input.yview)
-
-        text_buttons = tk.Frame(text_frame, bg="#181818")
-        text_buttons.pack(fill=tk.X, padx=4, pady=(0, 4))
-
-        tk.Button(
-            text_buttons,
-            text="Encode text as reference",
-            command=self._encode_text_reference,
-        ).pack(side=tk.LEFT, padx=4, pady=2)
-        tk.Button(
-            text_buttons,
-            text="Save text as WAV…",
-            command=self._save_text_as_wav,
-        ).pack(side=tk.LEFT, padx=4, pady=2)
-
-        reading_controls = tk.Frame(text_frame, bg="#181818")
-        reading_controls.pack(fill=tk.X, padx=4, pady=(0, 4))
-
-        tk.Button(
-            reading_controls,
-            text="Learn to read (A–Z)",
-            command=self._start_reading_session,
-        ).pack(side=tk.LEFT, padx=4, pady=2)
-        tk.Button(
-            reading_controls,
-            text="Next reading sample ▶",
-            command=self._advance_reading_sample,
-        ).pack(side=tk.LEFT, padx=4, pady=2)
-        tk.Label(
-            reading_controls,
-            textvariable=self._reading_status_var,
-            fg="#c9d1d9",
-            bg="#181818",
-        ).pack(side=tk.LEFT, padx=8)
-        tk.Button(
-            text_buttons,
-            text="Decode preview to text",
-            command=self._decode_sound_to_text,
-        ).pack(side=tk.LEFT, padx=4, pady=2)
-
-        tk.Label(
-            text_frame,
-            textvariable=self._text_status_var,
-            fg="#9be9a8",
-            bg="#181818",
-            anchor=tk.W,
-            justify=tk.LEFT,
-            wraplength=920,
-        ).pack(fill=tk.X, padx=4, pady=(0, 2))
-
-        preview_frame = tk.Frame(self.root, bg="#181818")
-        preview_frame.pack(fill=tk.BOTH, expand=True)
-
-        left_frame = tk.Frame(preview_frame, bg="#181818")
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._reference_label_widget = tk.Label(left_frame, text="Reference", fg="white", bg="#181818")
-        self._reference_label_widget.pack()
-        self._reference_image_widget = tk.Label(
-            left_frame,
-            bg="#101010",
-            fg="#cccccc",
-            text="No reference selected",
-            justify=tk.CENTER,
-            wraplength=320,
-        )
-        self._reference_image_widget.pack(padx=6, pady=6)
-        self._reference_info_label = tk.Label(
-            left_frame,
-            textvariable=self._reference_info_var,
-            fg="#9be9a8",
-            bg="#181818",
-        )
-        self._reference_info_label.pack(pady=(0, 10))
-
-        right_frame = tk.Frame(preview_frame, bg="#181818")
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._recon_label_widget = tk.Label(right_frame, text="AI reconstruction", fg="white", bg="#181818")
-        self._recon_label_widget.pack()
-        self._recon_image_widget = tk.Label(
-            right_frame,
-            bg="#101010",
-            fg="#cccccc",
-            text="Run evolution to view reconstructions",
-            justify=tk.CENTER,
-            wraplength=320,
-        )
-        self._recon_image_widget.pack(padx=6, pady=6)
-        self._recon_info_label = tk.Label(
-            right_frame,
-            textvariable=self._recon_info_var,
-            fg="#8fdc6d",
-            bg="#181818",
-            wraplength=360,
-            justify=tk.CENTER,
-        )
-        self._recon_info_label.pack(pady=(0, 10))
-
-        sound_frame = tk.Frame(preview_frame, bg="#181818")
-        sound_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._sound_label_widget = tk.Label(
-            sound_frame,
-            text="Sound-only reconstruction",
-            fg="white",
-            bg="#181818",
-        )
-        self._sound_label_widget.pack()
-        self._sound_image_widget = tk.Label(
-            sound_frame,
-            bg="#101010",
-            fg="#cccccc",
-            text="Waiting for sound reconstruction…",
-            wraplength=320,
-            justify=tk.CENTER,
-        )
-        self._sound_image_widget.pack(padx=6, pady=6)
-        self._sound_info_label = tk.Label(
-            sound_frame,
-            textvariable=self._sound_info_var,
-            fg="#58a6ff",
-            bg="#181818",
-            wraplength=360,
-            justify=tk.CENTER,
-        )
-        self._sound_info_label.pack(pady=(0, 10))
-
-        rotation_frame = tk.Frame(self.root, bg="#181818")
-        rotation_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
-        tk.Label(
-            rotation_frame,
-            text="Camera orbit",
-            fg="white",
-            bg="#181818",
-        ).pack(side=tk.LEFT, padx=(6, 10))
-        slider = tk.Scale(
-            rotation_frame,
-            from_=-180,
-            to=180,
-            orient=tk.HORIZONTAL,
-            resolution=1,
-            showvalue=False,
-            length=320,
-            command=self._handle_preview_rotation,
-            bg="#181818",
-            highlightthickness=0,
-        )
-        slider.pack(side=tk.LEFT, padx=4)
-        slider.configure(troughcolor="#303030", sliderlength=14)
-        slider.set(self._preview_angle)
-        self._rotation_slider = slider
-        tk.Label(
-            rotation_frame,
-            textvariable=self._rotation_value_var,
-            fg="#9be9a8",
-            bg="#181818",
-        ).pack(side=tk.LEFT, padx=8)
-        tk.Button(
-            rotation_frame,
-            text="Reset",
-            command=lambda: self._rotation_slider.set(0) if self._rotation_slider else None,
-        ).pack(side=tk.LEFT, padx=4)
-
-        graph_frame = tk.Frame(self.root, bg="#101010")
-        graph_frame.pack(fill=tk.BOTH, side=tk.BOTTOM, expand=True)
-        if ttk is not None:
-            notebook = ttk.Notebook(graph_frame)
-            notebook.pack(fill=tk.BOTH, expand=True)
-            self._diagnostics_notebook = notebook
-
-            metrics_tab = tk.Frame(notebook, bg="#101010")
-            notebook.add(metrics_tab, text="Metrics")
-            self._graph_canvas = tk.Canvas(
-                metrics_tab,
-                width=_GRAPH_WIDTH,
-                height=_GRAPH_HEIGHT,
-                bg="#0e0e0e",
-                highlightthickness=0,
-            )
-            self._graph_canvas.pack(fill=tk.BOTH, expand=True)
-            self._graph_canvas.bind("<Configure>", lambda _event: self._draw_graph())
-
-            log_tab = tk.Frame(notebook, bg="#080808")
-            notebook.add(log_tab, text="Complex Logs")
-            log_scroll = tk.Scrollbar(log_tab)
-            log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-            log_text = tk.Text(
-                log_tab,
-                state=tk.DISABLED,
-                bg="#080808",
-                fg="#f5f5f5",
-                wrap=tk.NONE,
-                insertbackground="#f5f5f5",
-                relief=tk.FLAT,
-                yscrollcommand=log_scroll.set,
-            )
-            log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
-            log_scroll.config(command=log_text.yview)
-            self._log_text = log_text
-
-            loops_tab = tk.Frame(notebook, bg="#101010")
-            notebook.add(loops_tab, text="Loop Timings")
-            if ttk is not None:
-                columns = ("loop", "duration", "percent")
-                loop_tree = ttk.Treeview(
-                    loops_tab,
-                    columns=columns,
-                    show="headings",
-                    height=9,
-                )
-                loop_tree.heading("loop", text="Loop")
-                loop_tree.heading("duration", text="Duration (s)")
-                loop_tree.heading("percent", text="Share")
-                loop_tree.column("loop", anchor="w", width=220)
-                loop_tree.column("duration", anchor="center", width=120)
-                loop_tree.column("percent", anchor="center", width=100)
-                loop_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
-                self._loop_tree = loop_tree
-            summary_label = tk.Label(
-                loops_tab,
-                textvariable=self._loop_summary_var,
-                fg="#f0f6fc",
-                bg="#101010",
-                anchor=tk.W,
-                justify=tk.LEFT,
-                wraplength=_GRAPH_WIDTH - 40,
-            )
-            summary_label.pack(fill=tk.X, padx=12, pady=(0, 10))
-
-            if self._pending_logs:
-                pending = list(self._pending_logs)
-                self._pending_logs.clear()
-                for entry in pending:
-                    self._append_log_entry(entry)
-            if self._pending_loop_payloads:
-                pending_profiles = list(self._pending_loop_payloads)
-                self._pending_loop_payloads.clear()
-                for payload in pending_profiles:
-                    self._update_loop_profile(payload)
-        else:
-            self._graph_canvas = tk.Canvas(
-                graph_frame,
-                width=_GRAPH_WIDTH,
-                height=_GRAPH_HEIGHT,
-                bg="#0e0e0e",
-                highlightthickness=0,
-            )
-            self._graph_canvas.pack(fill=tk.BOTH, expand=True)
-            self._graph_canvas.bind("<Configure>", lambda _event: self._draw_graph())
-
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _append_log_entry(self, message: str) -> None:
-        """Display a complex log entry, buffering if the widget is unavailable."""
-
-        if self._log_text is None:
-            self._pending_logs.append(message)
-            return
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}"
-        widget = self._log_text
-        widget.configure(state=tk.NORMAL)
-        widget.insert(tk.END, line + "\n")
-        try:
-            total_lines = int(float(widget.index("end-1line")))
-        except Exception:
-            total_lines = 0
-        max_lines = 600
-        if total_lines > max_lines:
-            widget.delete("1.0", f"{total_lines - max_lines + 1}.0")
-        widget.see(tk.END)
-        widget.configure(state=tk.DISABLED)
-
-    def _update_loop_profile(self, payload: Mapping[str, Any]) -> None:
-        """Update the loop diagnostics tab with the latest profiling payload."""
-
-        loops_list: list[dict[str, float | str]] = []
-        raw_loops = payload.get("loops", [])
-        if isinstance(raw_loops, Sequence):
-            for entry in raw_loops:
-                if isinstance(entry, Mapping):
-                    loops_list.append(
-                        {
-                            "name": str(entry.get("name", "loop")),
-                            "seconds": float(entry.get("seconds") or 0.0),
-                        }
-                    )
-                elif isinstance(entry, Sequence) and len(entry) >= 2:
-                    loops_list.append(
-                        {
-                            "name": str(entry[0]),
-                            "seconds": float(entry[1] or 0.0),
-                        }
-                    )
-        summary = payload.get("summary") or {}
-        worker = payload.get("worker") or {}
-        generation = payload.get("generation", "?")
-        duration_seconds = float(
-            worker.get("duration") or summary.get("total_seconds") or 0.0
-        )
-        evaluated = int(
-            worker.get("evaluated")
-            or summary.get("candidate_count")
-            or len(loops_list)
-        )
-        population = worker.get("population")
-        batch = worker.get("batch_size")
-        next_batch = worker.get("next_batch_size")
-        workers = worker.get("workers")
-        population_adjusted_to = worker.get("population_adjusted_to")
-        reason = worker.get("population_adjustment_reason")
-        duration_ema = worker.get("duration_ema")
-        target_duration = worker.get("target_duration")
-        throughput = summary.get("throughput")
-
-        summary_text = (
-            f"Gen {generation} · {evaluated} candidates in {duration_seconds:.2f}s"
-        )
-        if population is not None:
-            summary_text += f" · population {int(population)}"
-        if batch is not None and next_batch is not None:
-            summary_text += f" · batch {int(batch)}→{int(next_batch)}"
-        elif batch is not None:
-            summary_text += f" · batch {int(batch)}"
-        if workers is not None:
-            summary_text += f" · workers {int(workers)}"
-        if reason and population_adjusted_to is not None:
-            try:
-                adjusted = int(population_adjusted_to)
-            except Exception:
-                adjusted = population_adjusted_to
-            if reason == "slow":
-                summary_text += f" · reduced to {adjusted}"
-            elif reason == "fast":
-                summary_text += f" · increased to {adjusted}"
-            elif reason == "hyper":
-                summary_text += f" · tuned to {adjusted}"
-        if throughput is not None:
-            try:
-                summary_text += f" · throughput {float(throughput):.2f} cand/s"
-            except Exception:
-                pass
-        if duration_ema is not None and target_duration is not None:
-            try:
-                summary_text += (
-                    f" · EMA {float(duration_ema):.2f}s target {float(target_duration):.2f}s"
-                )
-            except Exception:
-                pass
-        self._loop_summary_var.set(summary_text)
-
-        if self._loop_tree is None:
-            self._pending_loop_payloads.append(
-                {
-                    "generation": generation,
-                    "loops": loops_list,
-                    "summary": dict(summary),
-                    "worker": dict(worker),
-                }
-            )
-            return
-
-        tree = self._loop_tree
-        tree.delete(*tree.get_children())
-        total_seconds = duration_seconds if duration_seconds > 0 else 0.0
-        for entry in loops_list:
-            name = str(entry.get("name", "loop"))
-            seconds = float(entry.get("seconds") or 0.0)
-            percent = (seconds / total_seconds * 100.0) if total_seconds > 0 else 0.0
-            tree.insert("", "end", values=(name, f"{seconds:.3f}", f"{percent:.1f}%"))
-
-    # ------------------------------------------------------------------ Controls
-    def _toggle_run_mode(self) -> None:
-        mode = self._run_mode_var.get()
-        if mode not in {"infinite", "finite"}:
-            self._run_mode_var.set("finite")
-
-    def _handle_preview_rotation(self, value: str) -> None:
-        try:
-            angle = float(value)
-        except (TypeError, ValueError):
-            return
-        if math.isclose(angle, self._preview_angle, abs_tol=0.01):
-            self._preview_angle = angle
-            self._rotation_value_var.set(f"{angle:.0f}°")
-            return
-        self._preview_angle = angle
-        self._rotation_value_var.set(f"{angle:.0f}°")
-        self._refresh_preview_rotation()
-
-    def _refresh_preview_rotation(self) -> None:
-        if self.reference_image is not None:
-            self._update_reference_preview()
-        if self.reconstruction is not None:
-            self._update_reconstruction(self.reconstruction)
-        if self.sound_reconstruction is not None:
-            self._update_sound_reconstruction(self.sound_reconstruction, preprocessed=True)
-
-    def _choose_image(self) -> None:
-        if filedialog is None:
-            messagebox.showerror("Unavailable", "File selection dialog is not available in this environment.")
-            return
-        path = filedialog.askopenfilename(title="Select reference image")
-        if not path:
-            return
-        try:
-            with Image.open(path) as image:
-                array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-        except Exception as exc:
-            messagebox.showerror("Load failed", f"Could not load image: {exc}")
-            return
-        self._set_reference(array, Path(path).name)
-        self._status_var.set(f"Loaded reference {path}")
-
-    def _use_demo_image(self) -> None:
-        x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
-        gradient = np.outer(x, np.ones_like(x))
-        demo = np.stack([gradient, gradient[::-1], np.sqrt(gradient)], axis=-1)
-        self._set_reference(demo, "Demo gradient")
-        self._status_var.set("Using demo gradient scene.")
-
-    def _set_reference(self, image: np.ndarray, label: str) -> None:
-        self.reference_image = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
-        self.reference_label = label
-        if self._reference_label_widget is not None:
-            self._reference_label_widget.config(text=f"Reference · {label}")
-        self._clear_reconstruction_preview("No reconstruction yet.")
-        self._clear_sound_preview("Waiting for sound reconstruction…", info_text="Sound preview pending…")
-        self._update_reference_preview()
-        if self._running:
-            self.stop_evolution()
-            if self._worker is not None and self._worker.is_alive():
-                self._worker.join(timeout=1.0)
-        self.manager = None
-        self._reset_manager()
-
-    def _fetch_pinterest_async(self) -> None:
-        self._status_var.set("Fetching Pinterest inspiration…")
-        thread = threading.Thread(target=self._download_pinterest_image, daemon=True)
-        thread.start()
-
-    def _download_pinterest_image(self) -> None:
-        acquisition: PinterestAcquisition | None = None
-        manager: PinterestDatasetManager | None = None
-        try:
-            manager = self._ensure_pinterest_manager()
-        except Exception as exc:
-            logger.debug("Pinterest dataset manager unavailable: %s", exc, exc_info=True)
-        if manager is not None:
-            def _report_status(snapshot: Mapping[str, Any]) -> None:
-                self._queue.put(("pinterest_status", dict(snapshot)))
-
-            try:
-                acquisition = manager.acquire_image(progress_callback=_report_status)
-            except PinterestDownloadError as exc:
-                logger.debug("Dataset Pinterest fetch failed: %s", exc)
-            except Exception as exc:
-                logger.warning("Dataset Pinterest fetch crashed: %s", exc, exc_info=True)
-        if acquisition is not None:
-            total_cycles = max(acquisition.use_index + acquisition.remaining_uses, acquisition.use_index)
-            info_label = (
-                f"{acquisition.label} (Pinterest · {acquisition.theme} · dataset {acquisition.dataset_id}"
-                f" · use {acquisition.use_index}/{total_cycles}"
-                f" · target {acquisition.declared_edge}px, actual {acquisition.actual_edge}px)"
-            )
-            self._queue.put(("pinterest", acquisition.array, info_label))
-            return
-        try:
-            image, label = fetch_pinterest_inspiration(timeout=12.0)
-        except Exception as exc:
-            logger.warning("Pinterest download failed: %s", exc)
-            self._queue.put(("status", f"Pinterest fetch failed: {exc}"))
-            return
-        self._queue.put(("pinterest", image, label))
-
-    def _encode_text_reference(self) -> None:
-        if self._text_input is None:
-            return
-        text = self._text_input.get("1.0", tk.END).strip()
-        if not text:
-            self._text_status_var.set("Enter text to encode into a reference image.")
-            return
-        try:
-            image, metadata = encode_text_to_image(text)
-        except Exception as exc:
-            logger.exception("Text encoding failed", exc_info=exc)
-            self._text_status_var.set(f"Text encoding failed: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Text encoding failed", f"Could not encode text: {exc}")
-            return
-        self._latest_text_metadata = metadata
-        self._latest_text_payload = text
-        self._text_status_var.set(
-            f"Encoded {metadata.payload_bytes} bytes into {metadata.width}×{metadata.height} reference."
-        )
-        self._set_reference(image, f"Text payload · {len(text)} chars")
-
-    def _save_text_as_wav(self) -> None:
-        if self._text_input is None:
-            return
-        text = self._text_input.get("1.0", tk.END).strip()
-        if not text:
-            self._text_status_var.set("Enter text before saving a WAV preview.")
-            return
-        try:
-            waveform, metadata = encode_text_to_waveform(text)
-        except Exception as exc:
-            logger.exception("Text-to-WAV encoding failed", exc_info=exc)
-            self._text_status_var.set(f"Text-to-WAV encoding failed: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Text to WAV", f"Could not create WAV: {exc}")
-            return
-        default_name = f"umbra_text_{int(time.time())}.wav"
-        if filedialog is not None:
-            destination = filedialog.asksaveasfilename(
-                title="Save text WAV",
-                defaultextension=".wav",
-                initialfile=default_name,
-                filetypes=(("WAV", "*.wav"), ("All files", "*.*")),
-            )
-        else:
-            destination = str(Path.cwd() / default_name)
-        if not destination:
-            self._text_status_var.set("WAV save cancelled.")
-            return
-        try:
-            save_waveform_as_wav(
-                waveform,
-                sample_rate=int(metadata.sample_rate or 16_000),
-                path=destination,
-            )
-        except Exception as exc:
-            logger.exception("Failed to save text WAV", exc_info=exc)
-            self._text_status_var.set(f"WAV save failed: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("WAV save failed", f"Could not write WAV file:\n{exc}")
-            return
-        self._latest_text_metadata = metadata
-        self._latest_text_payload = text
-        self._text_status_var.set(f"Saved text signal to {destination}")
-
-    def _start_reading_session(self) -> None:
-        if self._reading_thread is not None and self._reading_thread.is_alive():
-            self._reading_status_var.set("Reading lab is already preparing samples…")
-            return
-        self._reading_samples.clear()
-        self._reading_waveform = None
-        self._reading_status_var.set("Preparing alphabet curriculum…")
-        thread = threading.Thread(target=self._prepare_reading_samples, daemon=True)
-        self._reading_thread = thread
-        thread.start()
-
-    def _prepare_reading_samples(self) -> None:
-        tokens = list(string.ascii_uppercase) + list(string.digits)
-        samples: deque[ReadingSample] = deque()
-        for token in tokens:
-            try:
-                image, image_meta = encode_text_to_image(token)
-                waveform, wave_meta = encode_text_to_waveform(token)
-            except Exception as exc:
-                logger.debug("Reading sample %s failed: %s", token, exc, exc_info=True)
-                continue
-            samples.append(
-                ReadingSample(
-                    token=token,
-                    image=np.asarray(image, dtype=np.float32),
-                    image_metadata=image_meta,
-                    waveform=np.asarray(waveform, dtype=np.float32),
-                    waveform_metadata=wave_meta,
-                )
-            )
-        self._reading_samples = samples
-        self._queue.put(("reading_ready", len(samples)))
-        self._reading_thread = None
-
-    def _advance_reading_sample(self) -> None:
-        if not self._reading_samples:
-            self._reading_status_var.set("Start a reading session to queue samples.")
-            return
-        sample = self._reading_samples[0]
-        self._reading_samples.rotate(-1)
-        if self._text_input is not None:
-            self._text_input.delete("1.0", tk.END)
-            self._text_input.insert("1.0", sample.token)
-        self._latest_text_metadata = sample.image_metadata
-        self._latest_text_payload = sample.token
-        self._text_status_var.set(f"Alphabet sample '{sample.token}' ready.")
-        self._reading_waveform = sample.waveform.copy()
-        self._set_reference(sample.image, f"Alphabet · {sample.token}")
-        metadata = sample.waveform_metadata
-        self._latest_sound_payload = {
-            "sample_rate": int(metadata.sample_rate or 16_000),
-            "segments": metadata.segments,
-            "marker_duration": metadata.marker_duration,
-            "text_token": sample.token,
-        }
-        queue_length = len(self._reading_samples)
-        self._reading_status_var.set(
-            f"Learning '{sample.token}'. {queue_length} samples queued."
-        )
-
-    def _decode_sound_to_text(self) -> None:
-        source: np.ndarray | None = None
-        if self.sound_reconstruction is not None:
-            source = self.sound_reconstruction
-        elif self.reconstruction is not None:
-            source = self.reconstruction
-        elif self.reference_image is not None:
-            source = self.reference_image
-        if source is None:
-            self._text_status_var.set("No image available to decode.")
-            return
-        try:
-            text, metadata = decode_image_to_text(source)
-        except Exception as exc:
-            logger.debug("Decoding text from preview failed: %s", exc)
-            self._text_status_var.set(f"Decoding failed: {exc}")
-            if messagebox is not None:
-                messagebox.showwarning("Decode text", f"Could not decode text: {exc}")
-            return
-        if self._text_input is not None:
-            self._text_input.delete("1.0", tk.END)
-            self._text_input.insert("1.0", text)
-        self._latest_text_metadata = metadata
-        self._latest_text_payload = text
-        self._text_status_var.set(
-            f"Decoded {len(text)} characters from {metadata.width}×{metadata.height} preview."
-        )
-
-    # ------------------------------------------------------------------ Evolution loop
-    def start_evolution(self) -> None:
-        if self._running:
-            return
-        if self.reference_image is None:
-            self._status_var.set("Select a reference image first.")
-            return
-        if self.manager is None:
-            self.manager = self._create_manager()
-        self._clear_sound_preview("Waiting for sound reconstruction…", info_text="Sound preview pending…")
-        self._running = True
-        self._update_loading_modal(None)
-        self._status_var.set("Evolution running…")
-        self._worker = threading.Thread(target=self._run_loop, daemon=True)
-        self._worker.start()
-
-    def stop_evolution(self) -> None:
-        self._running = False
-        self._hide_loading_modal()
-        self._status_var.set("Evolution paused. Press start to resume.")
-
-    def _handle_advanced_logging_toggle(self) -> None:
-        state = bool(self._advanced_logging_var.get())
-        self._advanced_logging_enabled = state
-        if state:
-            logger.info(
-                "Advanced logging enabled for audio reconstruction diagnostics."
-            )
-        else:
-            logger.info("Advanced logging disabled for audio reconstruction diagnostics.")
-
-    def _reset_manager(self) -> None:
-        if self.reference_image is None:
-            return
-        self.manager = self._create_manager()
-        self.state = UmbraAppState()
-        self._draw_graph()
-
-    def _create_manager(self) -> EvolutionManager:
-        assert self.reference_image is not None
-        base_seed = int(time.time()) & 0x7FFFFFFF
-        return EvolutionManager(
-            self.reference_image,
-            self.encoder,
-            self.decoder,
-            population_size=4,
-            base_seed=base_seed,
-            autosave_interval=4,
-            max_generations=_UI_GENERATION_LIMIT,
-        )
-
-    def _run_loop(self) -> None:
-        assert self.manager is not None
-        while self._running:
-            try:
-                generation = self.manager.run_generation()
-            except EvolutionLimitReached as exc:
-                logger.info("Evolution halted after reaching limit: %s", exc)
-                self._queue.put(
-                    (
-                        "status",
-                        f"Generation limit reached at {exc.limit} generations.",
-                    )
-                )
-                self._queue.put(("evolution_complete", {"limit": exc.limit}))
-                self._running = False
-                break
-            except GPUAccelerationRequiredError as exc:
-                logger.error("GPU acceleration unavailable: %s", exc)
-                message = (
-                    "GPU acceleration error: "
-                    "install the CUDA runtime (nvrtc) or enable CPU fallback in settings."
-                )
-                self._queue.put(("status", message))
-                self._queue.put(("gpu_error", {"error": str(exc)}))
-                self._running = False
-                break
-            except Exception as exc:  # pragma: no cover - defensive logging path
-                logger.exception("Evolution failed", exc_info=exc)
-                self._queue.put(("status", f"Evolution error: {exc}"))
-                self._running = False
-                break
-
-            if not generation.candidates:
-                self._queue.put(("status", "No candidates evaluated this generation."))
-                self._maybe_pause_for_memory()
-                continue
-
-            best = generation.best_candidate
-            reconstruction = np.asarray(best.reconstruction, dtype=np.float32)
-            sound_payload: dict[str, Any] = {}
-            sound_image: np.ndarray | None
-            if best.waveform_reconstruction is not None:
-                logger.info(
-                    "Generating WAV reconstruction preview for seed %d", best.seed
-                )
-                sound_image = np.asarray(best.waveform_reconstruction, dtype=np.float32)
-                base_reference = (
-                    self.reference_image if self.reference_image is not None else reconstruction
-                )
-                ref_image = np.clip(np.asarray(base_reference, dtype=np.float32), 0.0, 1.0)
-                recon_clipped = np.clip(reconstruction, 0.0, 1.0)
-                sound_clipped = np.clip(sound_image, 0.0, 1.0)
-                sound_metrics = best.waveform_packet_metrics
-                sound_overlap = best.waveform_packet_overlap
-                if sound_metrics is None or sound_overlap is None:
-                    sound_metrics = compute_metrics(recon_clipped, sound_clipped)
-                    _, overlap_value = multiplicative_overlap(recon_clipped, sound_clipped)
-                    sound_overlap = float(overlap_value)
-                sound_reference_metrics = best.waveform_reference_metrics
-                sound_reference_overlap = best.waveform_reference_overlap
-                if sound_reference_metrics is None or sound_reference_overlap is None:
-                    sound_reference_metrics = compute_metrics(ref_image, sound_clipped)
-                    _, overlap_value = multiplicative_overlap(ref_image, sound_clipped)
-                    sound_reference_overlap = float(overlap_value)
-                reference_partial = getattr(best, "waveform_reference_partial", None)
-                if reference_partial is None:
-                    try:
-                        reference_partial = partial_alignment_fraction(ref_image, sound_clipped)
-                    except ValueError:
-                        reference_partial = None
-                alignment_partial = getattr(best, "waveform_alignment_partial", None)
-                if alignment_partial is None:
-                    try:
-                        alignment_partial = partial_alignment_fraction(
-                            recon_clipped, sound_clipped
-                        )
-                    except ValueError:
-                        alignment_partial = None
-                sound_payload = {
-                    "sound_metrics": sound_metrics,
-                    "sound_overlap": sound_overlap,
-                    "sound_reference_metrics": sound_reference_metrics,
-                    "sound_reference_overlap": sound_reference_overlap,
-                }
-                if reference_partial is not None:
-                    sound_payload["sound_reference_partial"] = float(reference_partial)
-                if alignment_partial is not None:
-                    sound_payload["sound_alignment_partial"] = float(alignment_partial)
-                if best.waveform_sample_rate is not None:
-                    sound_payload["sample_rate"] = int(best.waveform_sample_rate)
-                if best.waveform_segments is not None:
-                    sound_payload["segments"] = int(best.waveform_segments)
-                if best.waveform_marker_duration is not None:
-                    sound_payload["marker_duration"] = float(best.waveform_marker_duration)
-                if best.waveform_sound_score is not None:
-                    sound_payload["sound_score"] = float(best.waveform_sound_score)
-                if getattr(best, "waveform_readability_score", None) is not None:
-                    sound_payload["sound_readability_score"] = float(
-                        best.waveform_readability_score
-                    )
-                if getattr(best, "waveform_alignment_score", None) is not None:
-                    sound_payload["sound_alignment_score"] = float(
-                        best.waveform_alignment_score
-                    )
-                if getattr(best, "team_score", None) is not None:
-                    sound_payload["team_score"] = float(best.team_score)
-            else:
-                logger.debug(
-                    "Waveform reconstruction unavailable for seed %d", best.seed
-                )
-                sound_image = None
-
-            entry = self.state.record_generation(
-                generation.index,
-                best.metrics,
-                best.overlap_score,
-                sound_metrics=sound_payload.get("sound_metrics"),
-                sound_overlap=sound_payload.get("sound_overlap"),
-                sound_reference_metrics=sound_payload.get("sound_reference_metrics"),
-                sound_reference_overlap=sound_payload.get("sound_reference_overlap"),
-                sound_reference_partial=sound_payload.get("sound_reference_partial"),
-                sound_alignment_partial=sound_payload.get("sound_alignment_partial"),
-                sound_score=sound_payload.get("sound_score"),
-                sound_readability_score=sound_payload.get("sound_readability_score"),
-                sound_alignment_score=sound_payload.get("sound_alignment_score"),
-                team_score=sound_payload.get("team_score"),
-                ai_score_value=getattr(best, "ai_score", None),
-                frame_time_ms=getattr(best, "frame_time_ms", None),
-                execution_backend=getattr(best, "execution_backend", None),
-            )
-            self._latest_sound_payload = dict(sound_payload) if sound_payload else None
-            self._latest_generation_entry = dict(entry)
-            self._queue.put(
-                (
-                    "generation",
-                    reconstruction,
-                    best.metrics,
-                    entry,
-                    sound_image,
-                    sound_payload,
-                )
-            )
-
-            timing_summary = getattr(generation, "timing_summary", {}) or {}
-            worker_summary = getattr(generation, "worker_summary", {}) or {}
-            loops_payload = getattr(generation, "loop_timings", []) or []
-            duration_seconds = float(
-                worker_summary.get("duration")
-                or timing_summary.get("total_seconds")
-                or 0.0
-            )
-            summary_text = (
-                f"Gen {generation.index}: {len(generation.candidates)} candidates "
-                f"in {duration_seconds:.2f}s"
-            )
-            summary_text += f" · best {best.overlap_score:.2f}%"
-            ref_overlap = getattr(best, "reference_overlap", None)
-            if (
-                ref_overlap is not None
-                and np.isfinite(ref_overlap)
-                and abs(ref_overlap - best.overlap_score) > 1e-3
-            ):
-                summary_text += f" (ref {ref_overlap:.2f}%)"
-            bootstrap_overlap = getattr(best, "sound_bootstrap_overlap", None)
-            if (
-                bootstrap_overlap is not None
-                and np.isfinite(bootstrap_overlap)
-                and ref_overlap is not None
-                and abs(bootstrap_overlap - ref_overlap) > 1e-3
-            ):
-                summary_text += f" · bootstrap {bootstrap_overlap:.2f}%"
-            try:
-                summary_text += f" · reward {float(best.reward):.2f}"
-            except Exception:
-                pass
-            population = worker_summary.get("population")
-            if population is not None:
-                summary_text += f" · population {int(population)}"
-            batch_size = worker_summary.get("batch_size")
-            next_batch = worker_summary.get("next_batch_size")
-            if batch_size is not None and next_batch is not None:
-                summary_text += f" · batch {int(batch_size)}→{int(next_batch)}"
-            reason = worker_summary.get("population_adjustment_reason")
-            adjusted = worker_summary.get("population_adjusted_to")
-            if reason and adjusted is not None:
-                try:
-                    adjusted_int = int(adjusted)
-                except Exception:
-                    adjusted_int = adjusted
-                if reason == "slow":
-                    summary_text += f" · reduced to {adjusted_int}"
-                elif reason == "fast":
-                    summary_text += f" · increased to {adjusted_int}"
-                elif reason == "hyper":
-                    summary_text += f" · tuned to {adjusted_int}"
-            self._queue.put(("complex_log", summary_text))
-            self._queue.put(
-                (
-                    "loop_profile",
-                    {
-                        "generation": generation.index,
-                        "summary": dict(timing_summary),
-                        "worker": dict(worker_summary),
-                        "loops": list(loops_payload),
-                    },
-                )
-            )
-
-            if self.reference_image is not None and self._run_mode_var.get() == "infinite":
-                threshold = float(self._score_threshold.get())
-                if entry["composite_score"] >= threshold and (time.time() - self._last_refresh) > 30.0:
-                    self._queue.put(("refresh_pinterest", None, None))
-                    self._last_refresh = time.time()
-
-            self._maybe_pause_for_memory()
-
-        self._worker = None
-
-    # ------------------------------------------------------------------ Event processing
-    def _poll_queue(self) -> None:
-        processed = False
-        while True:
-            try:
-                message = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            processed = True
-            kind = message[0]
-            if kind == "generation":
-                (
-                    _,
-                    reconstruction,
-                    _metrics,
-                    entry,
-                    sound_image,
-                    _,
-                ) = message
-                self._update_reconstruction(np.asarray(reconstruction, dtype=np.float32))
-                self._update_sound_reconstruction(
-                    None if sound_image is None else np.asarray(sound_image, dtype=np.float32)
-                )
-                self._apply_generation_entry(entry)
-                self._draw_graph()
-            elif kind == "complex_log":
-                _, text = message
-                self._append_log_entry(str(text))
-            elif kind == "loop_profile":
-                _, payload = message
-                if isinstance(payload, Mapping):
-                    self._update_loop_profile(payload)
-            elif kind == "status":
-                _, text = message
-                self._status_var.set(str(text))
-            elif kind == "gpu_error":
-                _, payload = message
-                error_text = "GPU acceleration unavailable"
-                if isinstance(payload, Mapping):
-                    details = payload.get("error")
-                    if details:
-                        error_text = str(details)
-                self._hide_loading_modal()
-                guidance = (
-                    "GPU acceleration required. Install the CUDA runtime (nvrtc) or "
-                    "enable CPU fallback in settings."
-                )
-                self._status_var.set(guidance)
-                if messagebox is not None:  # pragma: no cover - UI side effect
-                    messagebox.showerror("GPU acceleration", f"{guidance}\n\nDetails: {error_text}")
-            elif kind == "evolution_complete":
-                _, payload = message
-                limit = 0
-                if isinstance(payload, Mapping):
-                    try:
-                        limit = int(payload.get("limit", 0))
-                    except Exception:  # pragma: no cover - defensive conversion
-                        limit = 0
-                self._hide_loading_modal()
-                self._status_var.set(
-                    "Generation limit reached"
-                    if limit <= 0
-                    else f"Generation limit reached at {limit} generations."
-                )
-                self._running = False
-            elif kind == "pinterest_status":
-                _, payload = message
-                dataset_id = payload.get("dataset_id", "?")
-                image_count = int(payload.get("entries", 0) or 0)
-                total_mb = float(payload.get("bytes", 0.0) or 0.0) / 1_048_576
-                complete = bool(payload.get("complete"))
-                error = payload.get("error")
-                status = (
-                    f"Preparing Pinterest dataset {dataset_id} · {image_count} images · {total_mb:.2f} MB"
-                )
-                if complete:
-                    status += " · ready"
-                if error:
-                    status += f" · {error}"
-                self._status_var.set(status)
-            elif kind == "pinterest":
-                _, image, label = message
-                self._set_reference(image, label)
-                self._status_var.set(f"Loaded Pinterest inspiration: {label}")
-            elif kind == "reading_ready":
-                _, count = message
-                sample_count = int(count or 0)
-                if sample_count <= 0:
-                    self._reading_status_var.set(
-                        "Reading lab could not prepare samples; check logs."
-                    )
-                else:
-                    self._reading_status_var.set(
-                        f"Alphabet curriculum ready ({sample_count} samples)."
-                    )
-                    self._advance_reading_sample()
-            elif kind == "refresh_pinterest":
-                self._fetch_pinterest_async()
-
-        if processed:
-            self._draw_graph()
-        if self._running and (self._worker is None or not self._worker.is_alive()):
-            logger.info("Evolution worker stopped unexpectedly; restarting.")
-            self._worker = threading.Thread(target=self._run_loop, daemon=True)
-            self._worker.start()
-        self.root.after(200, self._poll_queue)
-
-    def _collect_model_export_payload(self) -> tuple[dict[str, Any], str]:
-        """Assemble the current model state into a JSON-friendly payload."""
-
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        history_rows = [_sanitize_history_entry(row) for row in self.state.as_rows()]
-
-        latest_entry: dict[str, Any] | None = None
-        if self._latest_generation_entry is not None:
-            latest_entry = {}
-            for key, value in self._latest_generation_entry.items():
-                if isinstance(value, (np.floating, np.integer)):
-                    latest_entry[key] = float(value)
-                else:
-                    latest_entry[key] = value
-
-        payload_serialised: dict[str, Any] | None = None
-        if self._latest_sound_payload:
-            payload_serialised = _serialize_sound_payload(self._latest_sound_payload)
-
-        wav_base64: str | None = None
-        if (
-            self.reconstruction is not None
-            and payload_serialised is not None
-            and all(
-                key in payload_serialised for key in ("sample_rate", "segments", "marker_duration")
-            )
-        ):
-            try:
-                wav_bytes = encode_image_to_wav_bytes(
-                    self.reconstruction,
-                    sample_rate=int(payload_serialised["sample_rate"]),
-                    segments=int(payload_serialised["segments"]),
-                    marker_duration=float(payload_serialised["marker_duration"]),
-                )
-                wav_base64 = base64.b64encode(wav_bytes).decode("ascii")
-            except Exception as exc:  # pragma: no cover - defensive conversion guard
-                logger.debug("Failed to regenerate WAV for export: %s", exc)
-
-        export_payload = {
-            "saved_at": timestamp,
-            "reference": {
-                "label": self.reference_label,
-                "image_png_base64": _encode_image_to_base64(self.reference_image),
-            },
-            "latest_reconstruction_png": _encode_image_to_base64(self.reconstruction),
-            "latest_sound_reconstruction_png": _encode_image_to_base64(self.sound_reconstruction),
-            "latest_generation_entry": latest_entry or {},
-            "history": history_rows,
-            "composite_scores": [float(value) for value in self.state.composite_scores],
-            "sound_scores": [float(value) for value in self.state.sound_scores],
-            "readability_scores": [float(value) for value in self.state.readability_scores],
-            "latest_sound_payload": payload_serialised,
-            "latest_sound_wav_base64": wav_base64,
-        }
-
-        return export_payload, timestamp
-
-    def _export_model_parameters(self) -> None:
-        """Persist the current model history, images, and sound payload to JSON."""
-
-        export_payload, timestamp = self._collect_model_export_payload()
-        default_name = f"umbra_model_parameters_{timestamp}.json"
-
-        if filedialog is not None:
-            chosen = filedialog.asksaveasfilename(
-                title="Export model parameters",
-                defaultextension=".json",
-                initialfile=default_name,
-                filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
-            )
-        else:
-            chosen = ""
-
-        if chosen:
-            destination = Path(chosen)
-        else:
-            destination = Path.cwd() / default_name
-
-        try:
-            destination.write_text(json.dumps(export_payload, indent=2))
-        except Exception as exc:  # pragma: no cover - filesystem failure guard
-            logger.exception("Failed to export model parameters")
-            self._status_var.set(f"Parameter export failed: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Export failed", f"Could not write export file:\n{exc}")
-            return
-
-        self._status_var.set(f"Model parameters saved to {destination}")
-        if messagebox is not None:
-            messagebox.showinfo(
-                "Export complete",
-                f"Model parameters and artifacts saved to:\n{destination}",
-            )
-
-    def _save_model_snapshot(self) -> None:
-        """Persist the current model to a snapshots directory with a unique name."""
-
-        export_payload, _timestamp = self._collect_model_export_payload()
-        generation_entry = export_payload.get("latest_generation_entry")
-        generation_index: float | None = None
-        if isinstance(generation_entry, Mapping) and "generation" in generation_entry:
-            try:
-                generation_index = float(generation_entry["generation"])
-            except (TypeError, ValueError):
-                generation_index = None
-
-        snapshots_dir = Path.home() / ".umbra" / "snapshots"
-        destination = _generate_unique_model_path(snapshots_dir, generation_index)
-
-        try:
-            destination.write_text(json.dumps(export_payload, indent=2))
-        except Exception as exc:
-            logger.exception("Failed to write snapshot")
-            self._status_var.set(f"Snapshot save failed: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Snapshot save failed", f"Could not save snapshot:\n{exc}")
-            return
-
-        self._status_var.set(f"Snapshot saved to {destination}")
-        if messagebox is not None:
-            messagebox.showinfo("Snapshot saved", f"Model snapshot written to:\n{destination}")
-
-    def _load_model_parameters(self) -> None:
-        """Load a previously saved model payload into the UI."""
-
-        if filedialog is None:
-            if messagebox is not None:
-                messagebox.showerror(
-                    "Unavailable",
-                    "File selection dialog is not available in this environment.",
-                )
-            return
-
-        chosen = filedialog.askopenfilename(
-            title="Load model parameters",
-            defaultextension=".json",
-            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
-        )
-        if not chosen:
-            return
-
-        try:
-            payload = json.loads(Path(chosen).read_text())
-        except Exception as exc:
-            logger.exception("Failed to read model payload")
-            self._status_var.set(f"Load failed: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Load failed", f"Could not load model:\n{exc}")
-            return
-
-        self.stop_evolution()
-
-        reference_info = payload.get("reference") if isinstance(payload, Mapping) else None
-        reference_label = ""
-        reference_image = None
-        if isinstance(reference_info, Mapping):
-            reference_label = str(reference_info.get("label", "")).strip()
-            reference_image = _decode_image_from_base64(reference_info.get("image_png_base64"))
-
-        if reference_image is not None:
-            self.reference_image = reference_image
-            self.reference_label = reference_label
-            if self._reference_label_widget is not None:
-                label_text = f"Reference · {reference_label}" if reference_label else "Reference"
-                self._reference_label_widget.config(text=label_text)
-            self._update_reference_preview()
-        else:
-            self._clear_reference_preview("No reference loaded.")
-
-        reconstruction_image = _decode_image_from_base64(payload.get("latest_reconstruction_png"))
-        if reconstruction_image is not None:
-            self._update_reconstruction(reconstruction_image)
-        else:
-            self._clear_reconstruction_preview("No reconstruction yet.")
-
-        sound_image = _decode_image_from_base64(payload.get("latest_sound_reconstruction_png"))
-        if sound_image is not None:
-            self._update_sound_reconstruction(sound_image)
-        else:
-            self._clear_sound_preview("Sound reconstruction unavailable")
-
-        self.state = UmbraAppState()
-        history_rows = payload.get("history") if isinstance(payload, Mapping) else None
-        if isinstance(history_rows, Iterable):
-            for row in history_rows:
-                if isinstance(row, Mapping):
-                    self.state.history.append(_sanitize_history_entry(row))
-
-        for value in payload.get("composite_scores", []) if isinstance(payload, Mapping) else []:
-            try:
-                self.state.composite_scores.append(float(value))
-            except (TypeError, ValueError):
-                continue
-        for value in payload.get("sound_scores", []) if isinstance(payload, Mapping) else []:
-            try:
-                self.state.sound_scores.append(float(value))
-            except (TypeError, ValueError):
-                continue
-        for value in payload.get("readability_scores", []) if isinstance(payload, Mapping) else []:
-            try:
-                self.state.readability_scores.append(float(value))
-            except (TypeError, ValueError):
-                continue
-
-        latest_entry_data = payload.get("latest_generation_entry") if isinstance(payload, Mapping) else None
-        if isinstance(latest_entry_data, Mapping):
-            sanitized_entry = _sanitize_history_entry(latest_entry_data)
-            self._latest_generation_entry = sanitized_entry
-        else:
-            sanitized_entry = {}
-            self._latest_generation_entry = None
-
-        latest_sound_payload = payload.get("latest_sound_payload") if isinstance(payload, Mapping) else None
-        if isinstance(latest_sound_payload, Mapping):
-            self._latest_sound_payload = _deserialize_sound_payload(latest_sound_payload)
-        else:
-            self._latest_sound_payload = None
-
-        if sanitized_entry:
-            self._apply_generation_entry(sanitized_entry)
-        else:
-            self._primary_score_var.set("Overall score: –")
-            self._readability_score_var.set("WAV readability score: –")
-            self._baseline_score_var.set("AI baseline score: –")
-            self._recon_info_var.set("Awaiting AI reconstruction metrics…")
-            self._sound_info_var.set("Sound metrics unavailable.")
-
-        self.manager = None
-        self._draw_graph()
-        self._status_var.set(f"Loaded model from {chosen}")
-        if messagebox is not None:
-            messagebox.showinfo("Model loaded", f"Model restored from:\n{chosen}")
-
-    def _build_demo_executable(self) -> None:
-        if self.reconstruction is None and self.reference_image is None:
-            self._status_var.set("Generate a candidate before building the demo executable.")
-            if messagebox is not None:
-                messagebox.showinfo(
-                    "Demo builder",
-                    "Run at least one generation or select an image before packaging the demo.",
-                )
-            return
-
-        image = self.reconstruction
-        if image is None and self.reference_image is not None:
-            image = self.reference_image
-        if image is None:
-            self._status_var.set("No image available for demo packaging.")
-            return
-
-        payload = self._latest_sound_payload or {}
-        sample_rate = int(payload.get("sample_rate", 48_000))
-        segments = int(payload.get("segments", 1))
-        marker_duration = float(payload.get("marker_duration", 0.05))
-        label = self.reference_label or "Best candidate"
-
-        metadata: dict[str, Any] = {}
-        if self._latest_generation_entry is not None:
-            entry = self._latest_generation_entry
-            for key in ("sound_score", "ai_score", "composite_score"):
-                if key in entry:
-                    metadata[key] = float(entry[key])
-
-        try:
-            destination = build_demo_executable(
-                np.asarray(image, dtype=np.float32),
-                sample_rate=sample_rate,
-                segments=max(1, segments),
-                marker_duration=max(0.001, marker_duration),
-                label=label,
-                metadata=metadata,
-            )
-        except Exception as exc:  # pragma: no cover - packaging is user initiated
-            logger.exception("Failed to build demo executable")
-            self._status_var.set(f"Demo build failed: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Demo builder", f"Failed to build demo executable: {exc}")
-            return
-
-        self._status_var.set(f"Demo executable saved to {destination}")
-        if messagebox is not None:
-            messagebox.showinfo(
-                "Demo builder",
-                f"A demo executable has been written to:\n{destination}",
-            )
-            return
-
-    # ------------------------------------------------------------------ Rendering helpers
-    def _update_reference_info(self) -> None:
-        if self._reference_info_var is None:
-            return
-        if self.reference_image is None:
-            self._reference_info_var.set("No reference loaded.")
-            return
-        height, width = self.reference_image.shape[:2]
-        self._reference_info_var.set(f"{int(width)}×{int(height)} px")
-
-    def _clear_reference_preview(self, message: str = "No reference loaded.") -> None:
-        self.reference_image = None
-        self.reference_label = ""
-        if self._reference_image_widget is not None:
-            self._reference_image_widget.config(image="", text=message)
-        if self._reference_label_widget is not None:
-            self._reference_label_widget.config(text="Reference")
-        self._reference_photo = None
-        self._update_reference_info()
-
-    def _clear_reconstruction_preview(
-        self, message: str = "No reconstruction yet.", *, info_text: str | None = None
-    ) -> None:
-        self.reconstruction = None
-        if self._recon_image_widget is not None:
-            self._recon_image_widget.config(image="", text=message)
-        self._recon_photo = None
-        self._recon_info_var.set(info_text or "Awaiting AI reconstruction metrics…")
-
-    def _clear_sound_preview(
-        self, message: str = "Sound reconstruction unavailable", *, info_text: str | None = None
-    ) -> None:
-        self.sound_reconstruction = None
-        if self._sound_image_widget is not None:
-            self._sound_image_widget.config(image="", text=message)
-        self._sound_photo = None
-        self._sound_info_var.set(info_text or "Sound reconstruction unavailable.")
-
-    def _update_reference_preview(self) -> None:
-        if self.reference_image is None or self._reference_image_widget is None:
-            return
-        try:
-            angle = getattr(self, "_preview_angle", 0.0)
-            photo = _to_photo_image(self.reference_image, rotation_deg=angle)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to render reference preview: %s", exc)
-            return
-        self._reference_photo = photo
-        self._reference_image_widget.config(image=self._reference_photo, text="")
-        self._update_reference_info()
-
-    def _update_reconstruction(self, reconstruction: np.ndarray) -> None:
-        self.reconstruction = np.clip(np.asarray(reconstruction, dtype=np.float32), 0.0, 1.0)
-        if self._recon_image_widget is None:
-            return
-        try:
-            angle = getattr(self, "_preview_angle", 0.0)
-            photo = _to_photo_image(self.reconstruction, rotation_deg=angle)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to render reconstruction preview: %s", exc)
-            return
-        self._recon_photo = photo
-        self._recon_image_widget.config(image=self._recon_photo, text="")
-        self._recon_info_var.set("Awaiting AI reconstruction metrics…")
-
-    def _update_sound_reconstruction(
-        self, sound_image: np.ndarray | None, *, preprocessed: bool = False
-    ) -> None:
-        if self._sound_image_widget is None:
-            return
-        if sound_image is None:
-            logger.debug("Sound reconstruction unavailable for UI display")
-            self._clear_sound_preview("Sound reconstruction unavailable")
-            return
-        if preprocessed:
-            logger.debug("Refreshing sound reconstruction preview for rotation update")
-        else:
-            logger.info("Generating WAV reconstruction preview for UI display")
-        try:
-            array = np.asarray(sound_image, dtype=np.float32)
-            if preprocessed:
-                prepared = np.clip(array, 0.0, 1.0)
-            else:
-                prepared = _prepare_sound_preview(array)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to prepare sound reconstruction preview: %s", exc)
-            self._clear_sound_preview("Sound reconstruction unavailable")
-            return
-        self.sound_reconstruction = prepared
-        try:
-            angle = getattr(self, "_preview_angle", 0.0)
-            photo = _to_photo_image(self.sound_reconstruction, rotation_deg=angle)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to render sound reconstruction preview: %s", exc)
-            self._clear_sound_preview("Sound reconstruction unavailable")
-            return
-        self._sound_photo = photo
-        self._sound_image_widget.config(image=self._sound_photo, text="")
-        self._sound_info_var.set("Sound preview ready – awaiting metrics…")
-
-    def _apply_generation_entry(self, entry: Mapping[str, Any]) -> None:
-        """Update status labels and metric summaries for a generation."""
-
-        def _as_float(key: str, default: float = 0.0) -> float:
-            try:
-                return float(entry.get(key, default))
-            except (TypeError, ValueError):
-                return default
-
-        self._update_loading_modal(entry)
-        status_parts: list[str] = []
-        if "generation" in entry:
-            status_parts.append(f"Generation {_as_float('generation'):.0f}")
-        frame_time = entry.get("frame_time_ms")
-        try:
-            frame_value = None if frame_time is None else float(frame_time)
-        except (TypeError, ValueError):
-            frame_value = None
-        if frame_value is not None and frame_value > 0.0:
-            fps_value = entry.get("frame_fps")
-            try:
-                fps_numeric = None if fps_value is None else float(fps_value)
-            except (TypeError, ValueError):
-                fps_numeric = None
-            if fps_numeric is None and frame_value > 1e-6:
-                fps_numeric = 1000.0 / frame_value
-            if fps_numeric is not None:
-                status_parts.append(f"Render {frame_value:.1f} ms ({fps_numeric:.1f} FPS)")
-            else:
-                status_parts.append(f"Render {frame_value:.1f} ms")
-        backend = entry.get("execution_backend")
-        if backend:
-            status_parts.append(f"Backend {str(backend).upper()}")
-        sound_score = entry.get("sound_score")
-        if (
-            sound_score is not None
-            and "sound_overlap" in entry
-            and "sound_psnr" in entry
-            and "sound_ssim" in entry
-        ):
-            status_parts.append(f"Sound overlap {_as_float('sound_overlap'):.2f}%")
-            status_parts.append(f"Sound PSNR {_as_float('sound_psnr'):.2f} dB")
-            status_parts.append(f"Sound SSIM {_as_float('sound_ssim'):.3f}")
-            try:
-                status_parts.append(f"Sound score {float(sound_score):.2f}")
-            except (TypeError, ValueError):
-                status_parts.append("Sound score unavailable")
-            alignment_value = entry.get("sound_alignment_score")
-            if alignment_value is not None:
-                try:
-                    status_parts.append(
-                        f"Sound alignment {float(alignment_value):.2f}"
-                    )
-                except (TypeError, ValueError):
-                    status_parts.append("Sound alignment unavailable")
-            readability_value = entry.get("sound_readability_score")
-            if readability_value is not None:
-                try:
-                    status_parts.append(
-                        f"Sound readability {float(readability_value):.2f}"
-                    )
-                except (TypeError, ValueError):
-                    status_parts.append("Sound readability unavailable")
-        else:
-            status_parts.append("Sound score unavailable")
-        composite_score = entry.get("composite_score")
-        if composite_score is not None:
-            status_parts.append(f"Overall score {float(composite_score):.2f}")
-        team_value = entry.get("team_score")
-        if team_value is not None:
-            try:
-                status_parts.append(f"Team score {float(team_value):.2f}")
-            except (TypeError, ValueError):
-                status_parts.append("Team score unavailable")
-        status_parts.append(f"AI overlap {_as_float('overlap'):.2f}%")
-        status_parts.append(f"AI PSNR {_as_float('psnr', AI_PSNR_BASELINE):.2f} dB")
-        status_parts.append(f"AI SSIM {_as_float('ssim'):.3f}")
-        self._status_var.set(" · ".join(status_parts))
-        if composite_score is not None:
-            try:
-                self._primary_score_var.set(f"Overall score: {float(composite_score):.2f}")
-            except (TypeError, ValueError):
-                self._primary_score_var.set("Overall score: –")
-        else:
-            self._primary_score_var.set("Overall score: – (waiting for sound)")
-
-        readability_score = entry.get("sound_readability_score")
-        if sound_score is not None and readability_score is not None:
-            try:
-                self._readability_score_var.set(
-                    f"WAV readability score: {float(readability_score):.2f}"
-                )
-            except (TypeError, ValueError):
-                self._readability_score_var.set("WAV readability score: –")
-        else:
-            self._readability_score_var.set("WAV readability score: –")
-
-        ai_baseline = entry.get("ai_score")
-        if ai_baseline is not None:
-            try:
-                self._baseline_score_var.set(f"AI baseline score: {float(ai_baseline):.2f}")
-            except (TypeError, ValueError):
-                self._baseline_score_var.set("AI baseline score: –")
-        else:
-            self._baseline_score_var.set("AI baseline score: –")
-
-        self._update_preview_metrics(entry)
-
-    def _update_preview_metrics(self, entry: Mapping[str, Any]) -> None:
-        """Refresh the textual captions below the preview panes."""
-
-        def _as_float(key: str, default: float = 0.0) -> float:
-            try:
-                return float(entry.get(key, default))
-            except (TypeError, ValueError):
-                return default
-
-        ai_text = (
-            f"Overlap {_as_float('overlap'):.2f}% · "
-            f"PSNR {_as_float('psnr', AI_PSNR_BASELINE):.2f} dB · "
-            f"SSIM {_as_float('ssim'):.3f}"
-        )
-        ai_score = entry.get("ai_score")
-        if ai_score is not None:
-            try:
-                ai_text += f" · Score {float(ai_score):.2f}"
-            except (TypeError, ValueError):
-                pass
-        team_value = entry.get("team_score")
-        if team_value is not None:
-            try:
-                ai_text += f" · Team {float(team_value):.2f}"
-            except (TypeError, ValueError):
-                pass
-        self._recon_info_var.set(ai_text)
-
-        sound_score = entry.get("sound_score")
-        if (
-            sound_score is not None
-            and "sound_overlap" in entry
-            and "sound_psnr" in entry
-            and "sound_ssim" in entry
-        ):
-            sound_text = (
-                f"Overlap {_as_float('sound_overlap'):.2f}% · "
-                f"PSNR {_as_float('sound_psnr'):.2f} dB · "
-                f"SSIM {_as_float('sound_ssim'):.3f}"
-            )
-            try:
-                sound_text += f" · Score {float(sound_score):.2f}"
-            except (TypeError, ValueError):
-                pass
-            alignment_value = entry.get("sound_alignment_score")
-            if alignment_value is not None:
-                try:
-                    sound_text += f" · Alignment {float(alignment_value):.2f}"
-                except (TypeError, ValueError):
-                    pass
-            readability = entry.get("sound_readability_score")
-            if readability is not None:
-                try:
-                    sound_text += f" · Readability {float(readability):.2f}"
-                except (TypeError, ValueError):
-                    pass
-            self._sound_info_var.set(sound_text)
-        else:
-            self._sound_info_var.set("Sound metrics unavailable.")
-
-    def _draw_graph(self) -> None:
-        if self._graph_canvas is None:
-            return
-        width = int(self._graph_canvas.winfo_width() or _GRAPH_WIDTH)
-        height = int(self._graph_canvas.winfo_height() or _GRAPH_HEIGHT)
-        margin = 40
-        self._graph_canvas.delete("all")
-        self._graph_canvas.create_rectangle(0, 0, width, height, fill="#0e0e0e", outline="")
-        rows = self.state.as_rows()
-        if len(rows) < 2:
-            self._graph_canvas.create_text(
-                width // 2,
-                height // 2,
-                fill="#666",
-                text="Run a few generations to view the sound score trend.",
-            )
-            return
-
-        composite_rows = [
-            (row["generation"], row["composite_score"])
-            for row in rows
-            if "composite_score" in row and "sound_score" in row
-        ]
-        readability_rows = [
-            (row["generation"], row["sound_readability_score"])
-            for row in rows
-            if "sound_readability_score" in row and "sound_score" in row
-        ]
-        if len(composite_rows) < 2 and len(readability_rows) < 2:
-            self._graph_canvas.create_text(
-                width // 2,
-                height // 2,
-                fill="#666",
-                text="Waiting for sound reconstructions…",
-            )
-            return
-
-        x_values: list[float] = []
-        y_values: list[float] = []
-        if composite_rows:
-            x_values.extend(generation for generation, _ in composite_rows)
-            y_values.extend(score for _, score in composite_rows)
-        if readability_rows:
-            x_values.extend(generation for generation, _ in readability_rows)
-            y_values.extend(score for _, score in readability_rows)
-        baseline_rows = [(row["generation"], row["ai_score"]) for row in rows if "ai_score" in row]
-        if not x_values:
-            x_values.extend(generation for generation, _ in baseline_rows)
-        if not y_values:
-            y_values.extend(score for _, score in baseline_rows)
-        if not x_values:
-            x_values = [0.0]
-        if not y_values:
-            y_values = [0.0]
-        x_min, x_max = min(x_values), max(x_values)
-        if x_max == x_min:
-            x_max = x_min + 1
-
-        baseline_vals = [val for _, val in baseline_rows] if baseline_rows else []
-        y_max_candidate = max(y_values + baseline_vals) if y_values or baseline_vals else 0.0
-        y_min_candidate = min(y_values + baseline_vals) if y_values or baseline_vals else 0.0
-        y_min = 0.0 if y_min_candidate >= 0 else float(y_min_candidate)
-        y_max = max(100.0, float(y_max_candidate))
-        if y_max == y_min:
-            y_max = y_min + 1
-
-        def _scale_x(val: float) -> float:
-            return margin + (val - x_min) / (x_max - x_min) * (width - 2 * margin)
-
-        def _scale_y(val: float) -> float:
-            return height - margin - (val - y_min) / (y_max - y_min) * (height - 2 * margin)
-
-        for tick in range(0, 101, 25):
-            y = _scale_y(float(tick))
-            self._graph_canvas.create_line(margin, y, width - margin, y, fill="#1f1f1f")
-            self._graph_canvas.create_text(margin - 6, y, text=f"{tick}", fill="#555", anchor=tk.E)
-
-        if len(composite_rows) >= 2:
-            composite_points: list[float] = []
-            for generation, score in composite_rows:
-                composite_points.extend([_scale_x(generation), _scale_y(score)])
-            self._graph_canvas.create_line(composite_points, fill="#f4d35e", width=3, smooth=True)
-        elif len(composite_rows) == 1:
-            gx, gy = composite_rows[0]
-            x_pos, y_pos = _scale_x(gx), _scale_y(gy)
-            self._graph_canvas.create_oval(x_pos - 3, y_pos - 3, x_pos + 3, y_pos + 3, fill="#f4d35e", outline="")
-        if len(readability_rows) >= 2:
-            readability_points: list[float] = []
-            for generation, score in readability_rows:
-                readability_points.extend([_scale_x(generation), _scale_y(score)])
-            self._graph_canvas.create_line(readability_points, fill="#9be9a8", width=2, smooth=True)
-        elif len(readability_rows) == 1:
-            gx, gy = readability_rows[0]
-            x_pos, y_pos = _scale_x(gx), _scale_y(gy)
-            self._graph_canvas.create_oval(x_pos - 3, y_pos - 3, x_pos + 3, y_pos + 3, fill="#9be9a8", outline="")
-        if len(baseline_rows) >= 2:
-            baseline_points: list[float] = []
-            for generation, score in baseline_rows:
-                baseline_points.extend([_scale_x(generation), _scale_y(score)])
-            self._graph_canvas.create_line(baseline_points, fill="#58a6ff", width=2, dash=(4, 3))
-        elif len(baseline_rows) == 1:
-            gx, gy = baseline_rows[0]
-            x_pos, y_pos = _scale_x(gx), _scale_y(gy)
-            self._graph_canvas.create_oval(x_pos - 3, y_pos - 3, x_pos + 3, y_pos + 3, fill="#58a6ff", outline="")
-        self._graph_canvas.create_line(margin, height - margin, width - margin, height - margin, fill="#333")
-        self._graph_canvas.create_line(margin, margin, margin, height - margin, fill="#333")
-        legend_y = margin - 10
-        if len(composite_rows) >= 2:
-            self._graph_canvas.create_text(
-                margin,
-                legend_y,
-                text="Overall score",
-                fill="#f4d35e",
-                anchor=tk.W,
-            )
-            legend_y += 14
-        if len(readability_rows) >= 2:
-            self._graph_canvas.create_text(
-                margin,
-                legend_y,
-                text="WAV readability",
-                fill="#9be9a8",
-                anchor=tk.W,
-            )
-            legend_y += 14
-        if baseline_rows:
-            self._graph_canvas.create_text(
-                margin,
-                legend_y,
-                text="AI baseline",
-                fill="#58a6ff",
-                anchor=tk.W,
-            )
-        self._graph_canvas.create_text(
-            width - margin,
-            height - margin + 20,
-            text="Generation",
-            fill="#888",
-        )
-        label_y = margin
-        if composite_rows:
-            self._graph_canvas.create_text(
-                width - margin,
-                label_y,
-                text=f"Overall {composite_rows[-1][1]:.2f}",
-                fill="#f4d35e",
-                anchor=tk.E,
-            )
-            label_y += 16
-        if readability_rows:
-            self._graph_canvas.create_text(
-                width - margin,
-                label_y,
-                text=f"Readability {readability_rows[-1][1]:.2f}",
-                fill="#9be9a8",
-                anchor=tk.E,
-            )
-            label_y += 16
-        if baseline_rows:
-            latest_baseline = baseline_rows[-1][1]
-            self._graph_canvas.create_text(
-                width - margin,
-                label_y,
-                text=f"AI {latest_baseline:.2f}",
-                fill="#58a6ff",
-                anchor=tk.E,
-            )
-
-    # ------------------------------------------------------------------ Shutdown
-    def _on_close(self) -> None:
-        self._running = False
-        self.root.after(200, self.root.destroy)
-
-
-def main() -> None:
-    """Launch the Tkinter desktop application."""
-
-    if tk is None or _IMPORT_ERROR is not None:
-        raise RuntimeError(
-            "Tkinter is unavailable on this system; install Tk support to run the desktop UI."
-        ) from _IMPORT_ERROR
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(name)s: %(message)s")
+def main():
     root = tk.Tk()
     UmbraDesktopApp(root)
     root.mainloop()
 
-__all__ = [
-    "UmbraDesktopApp",
-    "UmbraAppState",
-    "PinterestDatasetManager",
-    "PinterestDatasetEntry",
-    "PinterestAcquisition",
-    "ReadingSample",
-    "fetch_pinterest_inspiration",
-    "_normalize_pinterest_url",
-    "_generate_unique_model_path",
-    "main",
-]
-
-
-if __name__ == "__main__":  # pragma: no cover - GUI entry point
+if __name__ == "__main__":
     main()
