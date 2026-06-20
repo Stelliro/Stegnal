@@ -16,19 +16,33 @@ The implementation is intentionally lightweight and self-contained so that the t
 
 ## Getting Started
 
+### Quick start (Windows)
+
+Double-click one of the launchers. On first run they create a dedicated `.venv`
+(Python 3.12), install everything, and start the app; subsequent runs just launch:
+
+- **`launch_umbra_ui.bat`** — the Tkinter desktop explorer / evolution playground (`umbra ui`).
+- **`launch_terminal.bat`** — the standalone customtkinter "Terminal" (`app.py`).
+
+### Manual setup
+
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[ui]"      # ".[ui]" pulls in the desktop-UI deps (customtkinter, sounddevice)
 ```
 
 On Windows PowerShell:
 
 ```powershell
-py -m venv .venv
+& "$env:LocalAppData\Programs\Python\Python312\python.exe" -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e .
+pip install -e ".[ui]"
 ```
+
+> Use Python **3.12** for this project. (Python 3.10 — which the old bundled
+> venvs were built on — has been removed from this machine, and the system
+> default `python` is 3.14.)
 
 ### Optional GPU acceleration
 
@@ -88,16 +102,12 @@ umbra ui
 
 The command opens a native window that renders the original image, the encoded noise packet, the decoder's reconstruction, and a multiplicative overlap map that highlights shared signal energy. The sidebar controls expose the evolution playground with AI/sound composite scoring, Pinterest inspiration downloads, autosave, and long-running evolution support.
 
-On Windows you can launch the UI directly with the provided helper scripts:
-
-```powershell
-./launch_umbra_ui.ps1
-```
-
-or
+On Windows you can launch either desktop app directly by double-clicking its
+helper script (each bootstraps the `.venv` on first run):
 
 ```bat
-launch_umbra_ui.bat
+launch_umbra_ui.bat     :: Tkinter explorer  (python -m umbra ui)
+launch_terminal.bat     :: customtkinter "Terminal"  (python app.py)
 ```
 
 Both scripts call `python -m umbra ui`, so any extra arguments are forwarded to the CLI wrapper.

@@ -1,10 +1,10 @@
 @echo off
 cd /d "%~dp0"
-title Project Umbra // Desktop Explorer
+title Project Umbra // Terminal
 color 0b
 
 echo ========================================================
-echo        PROJECT UMBRA // DESKTOP EXPLORER (umbra ui)
+echo        PROJECT UMBRA // TERMINAL (app.py)
 echo ========================================================
 echo.
 
@@ -16,9 +16,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [SYSTEM] Launching Desktop Explorer...
+echo [SYSTEM] Launching Terminal...
 echo ========================================================
-"%~dp0.venv\Scripts\python.exe" -m umbra ui
+"%~dp0.venv\Scripts\python.exe" "%~dp0app.py"
 
 if errorlevel 1 (
     echo.

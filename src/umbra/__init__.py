@@ -1,4 +1,6 @@
-"""Project Umbra toy pipeline package."""
+# __init__.py
+
+"""Project Umbra package."""
 
 from .codec import (
     decode_wav_bytes_to_image,
@@ -8,12 +10,7 @@ from .codec import (
 )
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
-from .evolution import (
-    EvolutionLimitReached,
-    EvolutionManager,
-    HyperPerformanceProfile,
-    ParentLineage,
-)
+from .evolution import Candidate, EvolutionLimitReached, EvolutionManager, Gene, GenerationRecord
 from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
 from .neural import NeuralRewardModel
@@ -43,8 +40,9 @@ __all__ = [
     "decode_wav_bytes_to_image",
     "EvolutionManager",
     "EvolutionLimitReached",
-    "ParentLineage",
-    "HyperPerformanceProfile",
+    "Candidate",
+    "Gene",
+    "GenerationRecord",
     "compute_metrics",
     "ReconstructionMetrics",
     "run_pipeline",

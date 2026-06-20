@@ -133,3 +133,25 @@ This is a **proof-of-possibility** initiative. The goal is to demonstrate that �
 **CONFIDENTIAL — INTERNAL DISTRIBUTION ONLY**
 
 ---
+
+### Addendum — Project lineage (2026-06-20)
+
+Several parallel working copies (V4/V5/V6 and an "UmbraFusion" scaffold) were
+consolidated; the duplicates are archived in `TOP SECRET/Backups/` and their
+docs preserved in `LEGACY_DOCUMENTS.md`. Worthwhile directions carried forward
+from that exploration:
+
+* **Learned decoder.** Replace the correlation/denoise decoder with a trained
+  model (AE / VAE / UNet) — the M3 milestone above. UmbraFusion stubbed
+  `models/` + `training/` for exactly this.
+* **Large-image mapping.** Instead of building giant permutation-index arrays,
+  map pixels ⇄ audio through a PRP (Feistel network) keyed by the shared seed,
+  and support a temporary `scale < 1.0` downscale for huge inputs on limited RAM.
+* **Stable round-trip API.** Keep the public contract small and symmetric:
+  `image_to_wave(img, sr=...)` / `wave_to_image(wav, sr=..., target_size=(W,H))`,
+  same `seed` both ways. (Today the equivalent lives in `umbra.audio` +
+  `umbra.encoding`/`decoding`.)
+* **Dataset tooling.** Curriculum auto-fetch + verified raster transcode with
+  retry/truncation checks (archived under `UmbraFusion/umbra_io/`).
+
+---
