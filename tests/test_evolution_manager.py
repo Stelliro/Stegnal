@@ -103,32 +103,29 @@ def test_recommend_difficulty_gates_on_ssim() -> None:
     assert mgr.recommend_difficulty(0.01, 0.0) >= 0.01
 
 
-def test_difficulty_credits_reward_when_recognizable() -> None:
-    from umbra.audio import image_data_to_audio
-    from umbra.evolution import Candidate, ProxyPacket
+def test_reward_is_competence_led_and_escalates() -> None:
+    """Reward = 100*competence + quality, so difficulty actually climbs off the
+    floor and the score reflects the hardest channel cleared (not an easy one)."""
+    import random
 
+    random.seed(0)
+    np.random.seed(0)
     yy, xx = np.mgrid[0:48, 0:48].astype(np.float32) / 48.0
     image = np.stack([xx, yy, (xx + yy) * 0.5], axis=-1).astype(np.float32)
-    packet = NoiseStreamEncoder(sigma=0.0).encode(image, seed=123)  # clean channel
-    wav, _ = image_data_to_audio(packet.encoded, 48000)
-    proxy = ProxyPacket(packet, wav.astype(np.float32) / 32767.0)
+    mgr = EvolutionManager(image, simulation_mode=True, population_size=16,
+                           difficulty_min_ssim=0.4)
+    for _ in range(20):
+        mgr.evolve_generation(0.1)
 
-    mgr = EvolutionManager(image, simulation_mode=True, population_size=1,
-                           difficulty_min_ssim=0.3, difficulty_reward_weight=1.0)
-    cand = Candidate(genes=mgr._random_gene())
-    cand.genes.start_sample = 0
-    cand.genes.denoise_sigma = 0.2
-
-    mgr._current_difficulty = 0.1
-    r_lo = mgr._evaluate_single_candidate(cand, proxy, packet.permutation_seed)
-    ssim = cand.metrics.ssim
-    mgr._current_difficulty = 0.8
-    r_hi = mgr._evaluate_single_candidate(cand, proxy, packet.permutation_seed)
-
-    assert ssim >= mgr.difficulty_min_ssim       # recognizable -> bonus applies
-    assert r_hi > r_lo                            # harder is rewarded, not punished
-    # reward scales exactly by the difficulty-bonus ratio (1 + w*difficulty)
-    assert abs(r_hi / r_lo - (1.0 + 0.8) / (1.0 + 0.1)) < 1e-3
+    best = mgr.population[0]
+    comp = best.heritage.competence
+    # difficulty escalated well off the 0.01 floor (the old bug left it stuck)
+    assert comp > 0.05
+    # reward is competence-led: reward == 100*competence + quality, quality in [0,1]
+    assert 0.0 <= (best.reward - 100.0 * comp) <= 1.0 + 1e-6
+    # the champion captured the hardest difficulty cleared
+    assert mgr.champion is not None
+    assert mgr.champion["difficulty_cleared"] >= comp - 1e-9
 
 
 def test_heritage_child_inherits_stronger_competence() -> None:

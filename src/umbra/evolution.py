@@ -310,6 +310,7 @@ class EvolutionManager:
         self.difficulty = 0.1            # current channel difficulty (encoder sigma)
         self._current_difficulty = 0.1   # difficulty of the generation being scored
         self._last_best_ssim = 0.0
+        self.champion = None             # best candidate ever (hardest difficulty)
 
         # Smart, learned difficulty controller (smooth transitions). Per-lineage
         # difficulty in sim mode advances each bloodline from its own competence.
@@ -819,8 +820,23 @@ class EvolutionManager:
             ref = np.stack([ref] * 3, axis=-1)
         return ref
 
-    def _score_recon(self, recon, reference, difficulty):
-        """Structure-gated composite reward with the difficulty bonus."""
+    def _update_champion(self, cand) -> None:
+        """Record the best candidate ever seen (hardest difficulty, then quality)."""
+        comp = float(getattr(cand.heritage, "competence", 0.0)) if cand.heritage else 0.0
+        record = {
+            "reward": float(cand.reward),
+            "difficulty_cleared": comp,
+            "ssim": float(getattr(cand.metrics, "ssim", 0.0) or 0.0),
+            "psnr": float(getattr(cand.metrics, "psnr", 0.0) or 0.0),
+            "generation": int(self.generation_count + 1),
+            "genes": cand.genes.to_dict(),
+        }
+        if self.champion is None or record["reward"] > self.champion.get("reward", -1.0):
+            self.champion = record
+
+    def _score_recon(self, recon, reference):
+        """Return ``(quality, metrics)`` where quality is the structure-gated
+        composite score in [0, 1] for a reconstruction vs the reference."""
         from .metrics import composite_score, compute_metrics
         from .visualization import multiplicative_overlap
 
@@ -828,11 +844,7 @@ class EvolutionManager:
         metrics = compute_metrics(reference, recon)
         _, overlap = multiplicative_overlap(reference, recon)
         quality = composite_score(float(overlap), metrics.psnr, metrics.ssim)
-        # Credit the difficulty being survived, but only once recognizable.
-        bonus = 1.0
-        if metrics.ssim >= self.difficulty_min_ssim:
-            bonus += self.difficulty_reward_weight * float(difficulty)
-        return float(quality * bonus * 100.0), metrics
+        return float(quality), metrics
 
     def _decode_from_wave(self, raw_wave, image_shape, perm_seed, genes, use_gpu):
         """Decode a recovered image from a (normalized) recorded waveform."""
@@ -853,8 +865,8 @@ class EvolutionManager:
                                 perm_seed, difficulty, *, noise_seed, use_gpu=False):
         """Per-lineage sim evaluation: noise the shared key at this difficulty,
         push it through the audio channel, decode, and score. Returns
-        ``(reward, ssim)``. Uses a private RNG so it is thread-safe under the
-        hybrid CPU/GPU scheduler."""
+        ``(quality, ssim)`` where quality is the composite score in [0, 1]. Uses a
+        private RNG so it is thread-safe under the hybrid CPU/GPU scheduler."""
         try:
             rng = np.random.default_rng(int(noise_seed) & 0xFFFFFFFF)
             if difficulty > 0:
@@ -866,10 +878,10 @@ class EvolutionManager:
             if difficulty > 0:
                 wav_norm = np.clip(wav_norm + rng.normal(0, difficulty * 0.1, len(wav_norm)), -1.0, 1.0)
             recon = self._decode_from_wave(wav_norm, image_shape, perm_seed, cand.genes, use_gpu)
-            reward, metrics = self._score_recon(recon, reference, difficulty)
+            quality, metrics = self._score_recon(recon, reference)
             cand.reconstruction = np.clip(np.asarray(recon, dtype=np.float32), 0.0, 1.0)
             cand.metrics = metrics
-            return reward, float(metrics.ssim)
+            return float(quality), float(metrics.ssim)
         except Exception:
             return 0.0, 0.0
 
@@ -897,17 +909,20 @@ class EvolutionManager:
             def _score(i, use_gpu):
                 cand = self.population[i]
                 diff_i = float(np.clip(cand.heritage.competence + step, 0.01, 1.0))
-                reward, ssim = self._evaluate_at_difficulty(
+                quality, ssim = self._evaluate_at_difficulty(
                     cand, reference, clean_encoded, image_shape, master_seed, diff_i,
                     noise_seed=master_seed + i, use_gpu=use_gpu,
                 )
-                cand.reward = reward
                 cand.eval_ssim = ssim
                 cand.eval_difficulty = diff_i
-                cand.heritage.cumulative_reward += reward
                 # Competence ratchet: clearing the bar at a harder channel sticks.
                 if ssim >= self.difficulty_min_ssim and diff_i > cand.heritage.competence:
                     cand.heritage.competence = diff_i
+                # Fitness: the difficulty CLEARED dominates selection; current
+                # quality (<=1) is a tiebreaker. This pushes the curriculum
+                # harder, and reward -> 100 means a near-maximal channel was beaten.
+                cand.reward = 100.0 * cand.heritage.competence + quality
+                cand.heritage.cumulative_reward += cand.reward
 
             self._split_map(len(self.population), _score)
 
@@ -943,11 +958,15 @@ class EvolutionManager:
         self.difficulty_controller.observe(best.eval_difficulty, best.eval_ssim)
         if best.heritage is not None:
             best.heritage.wins += 1
+        self._update_champion(best)
 
+        # Explorers join at the population's current standing (median competence)
+        # so fresh genes compete at the frontier instead of resetting to the floor.
+        med_comp = float(np.median([c.heritage.competence for c in self.population]))
         next_gen = [best]
-        for _ in range(5):
+        for _ in range(3):
             child = Candidate(genes=self._random_gene())
-            child.heritage = Heritage(birth_generation=self.generation_count + 1)
+            child.heritage = Heritage(competence=med_comp, birth_generation=self.generation_count + 1)
             next_gen.append(child)
 
         while len(next_gen) < self.population_size:
@@ -1021,16 +1040,16 @@ class EvolutionManager:
                 decoder = NoiseStreamDecoder(denoise_sigma=cand.genes.denoise_sigma)
                 recon = decoder.decode(test_pkt, seed=seed, genes=cand.genes, use_gpu=use_gpu)
 
-                # Structure-gated composite reward + difficulty bonus (shared logic).
-                score, metrics = self._score_recon(recon, reference, self._current_difficulty)
-                if score > best_score:
-                    best_score = score
+                # Shared-channel (hardware) mode: score on reconstruction quality.
+                quality, metrics = self._score_recon(recon, reference)
+                if quality > best_score:
+                    best_score = quality
                     best_recon = np.clip(np.asarray(recon, dtype=np.float32), 0.0, 1.0)
                     best_metrics = metrics
 
             cand.reconstruction = best_recon
             cand.metrics = best_metrics
-            return max(0.0, best_score)
+            return max(0.0, best_score) * 100.0
         except Exception:
             return 0.0
 

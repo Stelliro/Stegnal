@@ -107,6 +107,7 @@ class UmbraModel:
         self.sessions: list[TrainingSession] = []
         self.peers: list[PeerRecord] = []         # best candidates seen, by reward
         self.performance: list[dict] = []          # per-session score summary
+        self.champion: dict | None = None          # best candidate ever (hardest difficulty)
         self.provenance: dict = {"format_version": FORMAT_VERSION, "git": _git_hash()}
 
     # -- training -------------------------------------------------------
@@ -183,8 +184,16 @@ class UmbraModel:
              "competence": float(getattr(getattr(c, "heritage", None), "competence", 0.0) or 0.0)}
             for c in sorted(population, key=lambda c: c.reward, reverse=True)[:5]
         ]
-        return self.train(feats, rewards, source=source, recordings=recordings,
-                           peers=peers, notes=notes)
+        result = self.train(feats, rewards, source=source, recordings=recordings,
+                            peers=peers, notes=notes)
+        # Track the run's best-ever candidate (hardest difficulty cleared).
+        champ = getattr(manager, "champion", None)
+        if champ is not None and (
+            self.champion is None
+            or champ.get("reward", 0.0) > self.champion.get("reward", -1.0)
+        ):
+            self.champion = dict(champ)
+        return result
 
     def predict(self, features) -> np.ndarray:
         return self.reward_model.predict(np.asarray(features, dtype=np.float32))
@@ -202,6 +211,7 @@ class UmbraModel:
             "sessions": [asdict(s) for s in self.sessions],
             "peers": [asdict(p) for p in self.peers],
             "performance": self.performance,
+            "champion": self.champion,
             "provenance": self.provenance,
             "reward_model": self.reward_model.to_state(),
         }
@@ -221,6 +231,7 @@ class UmbraModel:
         model.sessions = [TrainingSession(**s) for s in data.get("sessions", [])]
         model.peers = [PeerRecord(**p) for p in data.get("peers", [])]
         model.performance = list(data.get("performance", []))
+        model.champion = data.get("champion")
         model.provenance = dict(data.get("provenance", model.provenance))
         return model
 
@@ -243,10 +254,15 @@ class UmbraModel:
 
     def summary(self) -> str:
         last = self.performance[-1] if self.performance else {}
+        champ = ""
+        if self.champion:
+            champ = (f"; champion cleared difficulty "
+                     f"{self.champion.get('difficulty_cleared', 0.0):.3f} "
+                     f"@ reward {self.champion.get('reward', 0.0):.1f}")
         return (
             f"{self.name}: {self.generations_trained} train steps, "
             f"{self.total_samples} samples, {len(self.peers)} peers tracked; "
-            f"last best_reward={last.get('best_reward', 0.0):.2f} "
+            f"last best_reward={last.get('best_reward', 0.0):.2f}{champ} "
             f"(updated {self.updated_at})"
         )
 

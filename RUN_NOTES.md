@@ -25,7 +25,17 @@ optional and disabled unless explicitly enabled.
 | `UMBRA_UNLOCK_GENES` | `0` | Set to `1` to let the search tune color/gamma/contrast genes too (default "purist" mode locks them to neutral). Note: benchmarks show this usually *lowers* the score in short runs — the extra dimensions dilute convergence — so leave it off unless experimenting. |
 | `UMBRA_DIFFICULTY_MIN_SSIM` | `0.5` | Auto-difficulty only raises the channel difficulty once the best SSIM clears this bar; below it, difficulty eases off. So harder is *earned*, never imposed on a struggling run. |
 | `UMBRA_DIFFICULTY_STEP` | `0.02` | Per-generation difficulty change applied by the adaptive controller. |
-| `UMBRA_DIFFICULTY_REWARD_WEIGHT` | `1.0` | How much the current difficulty boosts a *recognizable* candidate's reward (`reward = quality·(1 + weight·difficulty)·100` when SSIM ≥ min). Makes "good at a harder channel" score higher, so progress isn't punished. |
+| `UMBRA_DIFFICULTY_REWARD_WEIGHT` | `1.0` | Deprecated/no-op. Superseded by the competence-led reward below — kept only for backward compatibility. |
+
+> **Reward model (sim mode):** `reward = 100·competence + quality`, where
+> `competence` is the hardest channel difficulty a candidate's lineage has
+> cleared (SSIM ≥ `UMBRA_DIFFICULTY_MIN_SSIM`) and `quality` is the composite
+> score in [0,1]. Difficulty *cleared* dominates selection, so the curriculum
+> actually escalates and a reward approaching 100 means a near-maximal-noise
+> channel was beaten (a hard target with the current denoiser — it plateaus at
+> the decoder's capability wall). The best candidate ever ("champion") is tracked
+> and saved into the model checkpoint; the UI's **SAVE BEST** button writes it to
+> `Models/` named by the difficulty it cleared.
 
 ## Training, checkpoints & acoustic capture
 

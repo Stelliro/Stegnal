@@ -96,3 +96,32 @@ def test_candidate_feature_vector_shape():
     vec = candidate_feature_vector(_C(), difficulty=0.2)
     assert len(vec) == 5
     assert vec[0] == 88.0 and vec[3] == 0.7
+
+
+def test_champion_roundtrip(tmp_path):
+    rng = np.random.default_rng(0)
+    model = UmbraModel(name="champ")
+    feats, rewards = _fake_batch(rng)
+    model.train(feats, rewards)
+    model.champion = {
+        "difficulty_cleared": 0.3, "reward": 30.5, "ssim": 0.5, "psnr": 20.0,
+        "generation": 7, "genes": {"denoise_sigma": 0.4},
+    }
+    loaded = UmbraModel.load(model.save(tmp_path / "c.umbra.json"))
+    assert loaded.champion["difficulty_cleared"] == 0.3
+    assert loaded.champion["reward"] == 30.5
+    assert "champion cleared difficulty" in loaded.summary()
+
+
+def test_train_from_generation_captures_champion():
+    image = np.random.default_rng(3).random((24, 24, 3)).astype(np.float32)
+    mgr = EvolutionManager(
+        image, simulation_mode=True, population_size=6, difficulty_min_ssim=0.4,
+    )
+    for _ in range(5):
+        mgr.evolve_generation(0.1)
+    model = UmbraModel()
+    model.train_from_generation(mgr, source="simulation")
+    assert model.champion is not None
+    assert model.champion["difficulty_cleared"] >= 0.01
+    assert "difficulty_cleared" in model.champion and "genes" in model.champion

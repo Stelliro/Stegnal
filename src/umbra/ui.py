@@ -122,6 +122,7 @@ class UmbraDesktopApp:
         ttk.Button(ctrl, text="EXPORT JSON", command=self._export_data).pack(side=tk.RIGHT)
         ttk.Button(ctrl, text="LOAD MODEL", command=self._load_model).pack(side=tk.RIGHT, padx=2)
         ttk.Button(ctrl, text="SAVE MODEL", command=self._save_model).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(ctrl, text="SAVE BEST", command=self._save_best).pack(side=tk.RIGHT, padx=2)
 
         self.audio_panel = ttk.LabelFrame(parent, text="INTERFERENCE LAB", padding=10)
         self.audio_panel.pack(fill=tk.X, padx=10)
@@ -239,19 +240,24 @@ class UmbraDesktopApp:
                     p = (display_wave.reshape(256, 256, 3) + 1.0) / 2.0
                     self.root.after(0, lambda i=p: self._display_image(self.air_canvas, i))
                 
-                # --- AUTO DIFFICULTY (SSIM-gated) ---
-                # Only make the channel harder once the run is recognizable
-                # (best SSIM >= threshold); otherwise ease off. Harder is earned.
-                if self.auto_difficulty_var.get() and len(self.state.generation_history) > 0:
+                # --- AUTO DIFFICULTY ---
+                # Sim mode auto-manages difficulty per-lineage (the curriculum
+                # controller advances each bloodline from its earned competence);
+                # hardware mode uses the SSIM-gated controller on the shared channel.
+                mgr = self.state.evolution_manager
+                if (self.auto_difficulty_var.get() and self.state.generation_history
+                        and not self.simulation_mode_var.get()):
                     best = self.state.generation_history[-1].best_candidate
                     best_ssim = float(getattr(best.metrics, 'ssim', 0.0) or 0.0)
-                    self.state.difficulty = self.state.evolution_manager.recommend_difficulty(
-                        self.state.difficulty, best_ssim
-                    )
+                    self.state.difficulty = mgr.recommend_difficulty(self.state.difficulty, best_ssim)
                     self.root.after(0, lambda: self.diff_scale.set(self.state.difficulty))
 
-                rec = self.state.evolution_manager.evolve_generation(self.state.difficulty)
+                rec = mgr.evolve_generation(self.state.difficulty)
                 self.state.generation_history.append(rec)
+                # Reflect the auto-managed frontier difficulty back onto the slider.
+                if self.simulation_mode_var.get():
+                    self.state.difficulty = float(getattr(mgr, "difficulty", self.state.difficulty))
+                    self.root.after(0, lambda d=self.state.difficulty: self.diff_scale.set(d))
                 try:
                     self._ensure_model().train_from_generation(
                         self.state.evolution_manager,
@@ -334,6 +340,29 @@ class UmbraDesktopApp:
             logger.info(model.summary())
         except Exception as exc:
             messagebox.showerror("Save Model", str(exc))
+
+    def _save_best(self):
+        """Save the model tagged for its champion (hardest difficulty cleared)."""
+        from tkinter import messagebox
+        model = self._ensure_model()
+        champ = model.champion or getattr(
+            getattr(self.state, "evolution_manager", None), "champion", None)
+        if not champ:
+            messagebox.showinfo("Save Best", "No champion yet — run a few generations first.")
+            return
+        diff = float(champ.get("difficulty_cleared", 0.0))
+        rew = float(champ.get("reward", 0.0))
+        models_dir = Path(__file__).resolve().parents[2] / "Models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        name = f"umbra_best_d{diff:.3f}_r{rew:.1f}_{int(time.time())}.umbra.json"
+        try:
+            path = model.save(models_dir / name)
+            self.lbl_status.config(
+                text=f"Saved BEST: difficulty {diff:.3f}, reward {rew:.1f} -> {path.name}",
+                foreground="green")
+            logger.info("Saved best model: %s", model.summary())
+        except Exception as exc:
+            messagebox.showerror("Save Best", str(exc))
 
     def _load_model(self):
         from tkinter import filedialog, messagebox
