@@ -1,5 +1,10 @@
 # Project Umbra — Test Build 0.1.0
 
+> **Status: early prototype — help wanted.** This is an experimental research
+> build. Testers and contributors are welcome; see
+> [CONTRIBUTING.md](CONTRIBUTING.md). Licensed for **noncommercial use only**
+> under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+
 This repository contains the first toy build of the Project Umbra pipeline. The goal of the build is to demonstrate the end-to-end flow of transforming an input image into a noise-like carrier and reconstructing a recognizable image using the same secret seed.
 
 The implementation is intentionally lightweight and self-contained so that the team can iterate quickly before integrating heavier AI models.
