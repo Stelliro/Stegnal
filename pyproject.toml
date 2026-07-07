@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "project-umbra"
-version = "0.1.0"
-description = "Toy encoder/decoder pipeline for Project Umbra"
+version = "0.2.0"
+description = "Real acoustic (ultrasonic/high-freq) image/text to audio transmission with AI post-channel prediction, secure key derivation from AI recon + physical channel fingerprint, over-air testing and adaptation."
 readme = "README.md"
 authors = [{ name = "Umbra Team" }]
 license = { text = "PolyForm-Noncommercial-1.0.0" }
