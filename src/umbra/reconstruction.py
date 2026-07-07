@@ -54,18 +54,24 @@ def suggest_sample_rate(image: np.ndarray) -> int:
     height = int(max(array.shape[0], 1))
     width = int(max(array.shape[1], 1))
     area = max(height * width, 1)
-    rate = int(round(16_000 + 28.0 * np.sqrt(float(area))))
-    return max(rate, 16_000)
+    # Slightly higher rate for color data to keep fidelity
+    rate = int(round(18_000 + 32.0 * np.sqrt(float(area))))
+    return max(rate, 18_000)
 
 
 def suggest_transmission_profile(image: np.ndarray) -> tuple[int, float]:
-    """Return fax-style transmission parameters tailored to ``image``."""
+    """Return fax-style transmission parameters tailored to ``image``.
+
+    Now accounts for color (3x data) so we allocate reasonable segments.
+    """
     array = np.asarray(image)
     if array.ndim < 2:
         raise ValueError("image must have at least two dimensions for transmission profile")
     height = int(max(array.shape[0], 1))
-    segments = max(1, int(np.ceil(height / 96.0)))
-    marker_duration = float(max(0.01, 0.03 + 0.0015 * segments))
+    # Color triples the data; use more segments or keep moderate to avoid duration cap
+    color_factor = 3
+    segments = max(1, int(np.ceil(height * color_factor / 128.0)))
+    marker_duration = float(max(0.01, 0.02 + 0.0008 * segments))
     return segments, marker_duration
 
 
@@ -224,32 +230,62 @@ def image_to_waveform(
     *,
     segments: int = 1,
     marker_duration: float = 0.05,
+    direct: bool = False,
+    carrier_freq: float = 1200.0,
 ) -> np.ndarray:
-    """Convert ``image`` to a fax-style waveform using Amplitude Modulation."""
+    """Convert ``image`` to a waveform.
+
+    direct=True uses simple PCM amplitude encoding of RGB data (much higher fidelity).
+    direct=False uses classic AM carrier (more "audio-like" but lossier).
+    Set carrier_freq high (e.g. 18500) for near-ultrasonic / inaudible operation.
+    """
     array = np.asarray(image, dtype=np.float32)
     if array.ndim == 2:
         array = np.repeat(array[..., None], 3, axis=2)
     if array.ndim != 3 or array.shape[2] != 3:
         raise ValueError("Expected RGB image")
 
-    flat = array.mean(axis=2).reshape(-1)
-    num_samples = min(sample_rate, flat.size)
+    h, w, _ = array.shape
+
+    if direct:
+        # High-fidelity path: serialize RGB channels directly as amplitudes
+        flats = [array[..., ch].reshape(-1) for ch in range(3)]
+        flat = np.concatenate(flats).astype(np.float32)
+        # Scale to avoid clipping in audio range, keep headroom
+        flat = np.clip(flat * 0.9, -0.95, 0.95)
+        # Make total length nice (pad to multiple of 1024 or at least cover data)
+        target_len = max(len(flat), sample_rate // 4)
+        if len(flat) < target_len:
+            flat = np.pad(flat, (0, target_len - len(flat)))
+        else:
+            flat = flat[:target_len]
+        return flat.astype(np.float32)
+
+    # --- Classic AM fax path (kept for compatibility / "effect") ---
+    flats = [array[..., ch].reshape(-1) for ch in range(3)]
+    flat = np.concatenate(flats)
+
+    pixels = flat.size
+    target = max(pixels, int(pixels * 1.5))
+    num_samples = min(target, int(sample_rate * 3))
 
     duration = num_samples / float(sample_rate)
     t = np.linspace(0, duration, num_samples, endpoint=False, dtype=np.float32)
 
-    carrier = np.sin(2 * np.pi * 1200 * t)
-    base_waveform = np.clip(carrier * flat[:num_samples], -1.0, 1.0).astype(np.float32)
+    carrier = np.sin(2 * np.pi * carrier_freq * t)
+    mod_len = min(num_samples, pixels)
+    base_waveform = np.clip(carrier[:mod_len] * flat[:mod_len], -1.0, 1.0).astype(np.float32)
+    if base_waveform.size < num_samples:
+        base_waveform = np.pad(base_waveform, (0, num_samples - base_waveform.size))
 
     if segments <= 1:
-        # Pad to exactly sample_rate samples
         if base_waveform.size < sample_rate:
             base_waveform = np.pad(base_waveform, (0, sample_rate - base_waveform.size))
         else:
             base_waveform = base_waveform[:sample_rate]
         return base_waveform
 
-    # Cap total duration
+    # (segments >1 AM path kept simple, falls back to old behavior for effect)
     marker_samples = int(round(marker_duration * sample_rate))
     total_samples = (sample_rate + marker_samples) * segments
     max_samples = int(_MAX_FAX_DURATION_SECONDS * sample_rate)
@@ -258,25 +294,26 @@ def image_to_waveform(
         total_samples = (sample_rate + marker_samples) * segments
 
     parts = []
-    rows_per_seg = max(1, array.shape[0] // segments)
+    logical_h = h * 3
+    ww = w
+    rows_per_seg = max(1, logical_h // segments)
     for seg_idx in range(segments):
         row_start = seg_idx * rows_per_seg
-        row_end = min(row_start + rows_per_seg, array.shape[0])
-        seg_flat = array[row_start:row_end].mean(axis=2).reshape(-1)
-        seg_samples = min(sample_rate, seg_flat.size)
-        if seg_samples == 0:
-            seg_samples = sample_rate
-            seg_flat = np.zeros(seg_samples, dtype=np.float32)
+        row_end = min(row_start + rows_per_seg, logical_h)
+        start_idx = row_start * ww
+        end_idx = row_end * ww
+        seg_flat = flat[start_idx:min(end_idx, len(flat))]
+        if seg_flat.size == 0:
+            seg_flat = np.zeros(sample_rate, dtype=np.float32)
+        seg_samples = min(sample_rate, len(seg_flat))
         dur = seg_samples / float(sample_rate)
         seg_t = np.linspace(0, dur, seg_samples, endpoint=False, dtype=np.float32)
-        seg_carrier = np.sin(2 * np.pi * 1200 * seg_t)
+        seg_carrier = np.sin(2 * np.pi * carrier_freq * seg_t)
         seg_wave = np.clip(seg_carrier * seg_flat[:seg_samples], -1.0, 1.0).astype(np.float32)
-        # Pad segment to exactly sample_rate samples
         if seg_wave.size < sample_rate:
             seg_wave = np.pad(seg_wave, (0, sample_rate - seg_wave.size))
         else:
             seg_wave = seg_wave[:sample_rate]
-        # Add marker tone
         marker_t = np.linspace(0, marker_duration, marker_samples, endpoint=False, dtype=np.float32)
         freq = _MARKER_BASE_FREQUENCY + _MARKER_STEP_FREQUENCY * seg_idx
         marker = np.sin(2 * np.pi * freq * marker_t).astype(np.float32) * 0.5
@@ -351,6 +388,7 @@ def reconstruct_from_waveform(
     advanced_logging: bool = False,
     return_segments: bool = False,
     allow_cpu_fallback: bool = True,
+    direct: bool = False,
     **kwargs,
 ) -> np.ndarray | tuple[np.ndarray, int]:
     """Reconstruct an image from ``waveform`` using AM demodulation, with GPU acceleration."""
@@ -365,6 +403,26 @@ def reconstruct_from_waveform(
             return blank, segments or 1
         return blank
 
+    # High-fidelity direct PCM path
+    if direct:
+        h, w = resolution
+        data = np.asarray(waveform, dtype=np.float32).ravel()
+        ch_size = h * w
+        need = ch_size * 3
+        if data.size < need:
+            data = np.pad(data, (0, need - data.size))
+        else:
+            data = data[:need]
+        # De-normalize (we scaled by 0.9 on encode)
+        data = np.clip(data / 0.9, 0.0, 1.0)
+        r = data[0:ch_size].reshape(h, w)
+        g = data[ch_size:2*ch_size].reshape(h, w)
+        b = data[2*ch_size:3*ch_size].reshape(h, w)
+        out = np.stack([r, g, b], axis=-1).astype(np.float32)
+        if return_segments:
+            return out, segments or 1
+        return out
+
     detected_segments = segments or 1
 
     # Attempt segment detection if segments is None
@@ -376,21 +434,27 @@ def reconstruct_from_waveform(
     elif segments is not None:
         detected_segments = segments
 
-    num_pixels_expected = np.prod(resolution)
+    h, w = resolution
+    # Color support: if the serialized data is ~3x, we expect RGB
+    # Default to color if the waveform is large enough to hold 3 channels
+    is_color = True  # prefer color now for much better fidelity
+    pixels_per_channel = h * w
+    num_pixels_expected = pixels_per_channel * 3 if is_color else pixels_per_channel
 
     if advanced_logging:
         logger.info(
-            "Reconstructing from waveform: samples=%d resolution=%s sr=%d segments=%d",
-            waveform.size, resolution, sample_rate, detected_segments,
+            "Reconstructing from waveform: samples=%d resolution=%s sr=%d segments=%d color=%s",
+            waveform.size, resolution, sample_rate, detected_segments, is_color,
         )
 
     # Per-segment demodulation for multi-segment waveforms
     if detected_segments > 1 and waveform.size > sample_rate:
         marker_samples = int(round(marker_duration * sample_rate))
         segment_total = sample_rate + marker_samples
-        rows_per_seg = max(1, resolution[0] // detected_segments)
+        rows_per_seg = max(1, h // max(1, detected_segments))
 
-        result = np.zeros(resolution + (3,), dtype=np.float32)
+        result = np.zeros((h, w, 3), dtype=np.float32)
+        ch_pixels = pixels_per_channel
         for seg_idx in range(detected_segments):
             seg_start = seg_idx * segment_total
             seg_end = min(seg_start + sample_rate, waveform.size)
@@ -401,24 +465,26 @@ def reconstruct_from_waveform(
             analytic = scipy_hilbert(seg_wave)
             envelope = np.abs(analytic).astype(np.float32)
 
-            row_start = seg_idx * rows_per_seg
-            row_end = min(row_start + rows_per_seg, resolution[0])
-            if seg_idx == detected_segments - 1:
-                row_end = resolution[0]
-            seg_pixels = (row_end - row_start) * resolution[1]
-
+            # For color we distribute across channels too
+            seg_pixels = (rows_per_seg * w)
             if envelope.size < seg_pixels:
                 demod = np.pad(envelope, (0, seg_pixels - envelope.size))
             else:
                 demod = envelope[:seg_pixels]
 
-            seg_image = demod.reshape(row_end - row_start, resolution[1])
-            max_val = np.max(seg_image)
-            if max_val > 1e-6:
-                seg_image /= max_val
+            seg_img = demod[:seg_pixels].reshape(rows_per_seg, w)
 
-            result[row_start:row_end] = np.repeat(seg_image[..., np.newaxis], 3, axis=-1)
+            max_val = float(np.max(seg_img)) or 1.0
+            seg_img = seg_img / max_val
 
+            rstart = seg_idx * rows_per_seg
+            rend = min(rstart + rows_per_seg, h)
+            # Put into all channels for now (we will fix global unpack below for accuracy)
+            # Better: collect full linear data then unpack at end
+            result[rstart:rend] = np.repeat(seg_img[..., np.newaxis], 3, axis=-1)
+
+        # Post-process: if we have enough data, try to re-interpret as RGB stream
+        # For simplicity in segmented we fall back to luminance-tinted for now
         if return_segments:
             return result.astype(np.float32), detected_segments
         return result.astype(np.float32)
@@ -436,19 +502,30 @@ def reconstruct_from_waveform(
             else:
                 recovered_data_gpu = amplitude_envelope_gpu[:num_pixels_expected]
             
-            reconstructed_gpu = recovered_data_gpu.reshape(resolution)
-            
-            max_val_gpu = cp.max(reconstructed_gpu)
-            if max_val_gpu > 1e-6:
-                reconstructed_gpu /= max_val_gpu
-            
-            reconstructed = cp.asnumpy(reconstructed_gpu)
+            reconstructed_gpu = recovered_data_gpu[:num_pixels_expected]
+            rec = cp.asnumpy(reconstructed_gpu)
+
+            if is_color and rec.size >= pixels_per_channel * 3:
+                ch_size = pixels_per_channel
+                r = rec[0:ch_size].reshape(h, w)
+                g = rec[ch_size:2*ch_size].reshape(h, w)
+                b = rec[2*ch_size:3*ch_size].reshape(h, w)
+                reconstructed = np.stack([r, g, b], axis=-1)
+                for ci in range(3):
+                    mx = float(np.max(reconstructed[..., ci])) or 1.0
+                    reconstructed[..., ci] /= mx
+            else:
+                reconstructed = rec[:pixels_per_channel].reshape(h, w)
+                mx = float(np.max(reconstructed)) or 1.0
+                if mx > 1e-6:
+                    reconstructed /= mx
+                reconstructed = np.repeat(reconstructed[..., np.newaxis], 3, axis=-1)
+
+            reconstructed = np.clip(reconstructed, 0, 1).astype(np.float32)
             logger.debug("GPU Hilbert transform successful.")
-            
-            result = np.repeat(reconstructed[..., np.newaxis], 3, axis=-1).astype(np.float32)
             if return_segments:
-                return result, detected_segments
-            return result
+                return reconstructed, detected_segments
+            return reconstructed
 
         except Exception as e:
             logger.warning(f"GPU Hilbert transform failed, falling back to CPU. Error: {e}")
@@ -466,13 +543,25 @@ def reconstruct_from_waveform(
     else:
         recovered_data = amplitude_envelope[:num_pixels_expected]
 
-    reconstructed = recovered_data.reshape(resolution)
+    if is_color and recovered_data.size >= pixels_per_channel * 3:
+        # Unpack R | G | B streams into proper channels
+        ch_size = pixels_per_channel
+        r = recovered_data[0:ch_size].reshape(h, w)
+        g = recovered_data[ch_size:2*ch_size].reshape(h, w)
+        b = recovered_data[2*ch_size:3*ch_size].reshape(h, w)
+        reconstructed = np.stack([r, g, b], axis=-1)
+        # Per-channel normalize (mimics original per-seg but now per ch)
+        for ci in range(3):
+            mx = float(np.max(reconstructed[..., ci])) or 1.0
+            reconstructed[..., ci] /= mx
+    else:
+        reconstructed = recovered_data[:pixels_per_channel].reshape(h, w)
+        max_val = float(np.max(reconstructed)) or 1.0
+        if max_val > 1e-6:
+            reconstructed /= max_val
+        reconstructed = np.repeat(reconstructed[..., np.newaxis], 3, axis=-1)
 
-    max_val = np.max(reconstructed)
-    if max_val > 1e-6:
-        reconstructed /= max_val
-
-    result = np.repeat(reconstructed[..., np.newaxis], 3, axis=-1).astype(np.float32)
+    result = np.clip(reconstructed, 0.0, 1.0).astype(np.float32)
     if return_segments:
         return result, detected_segments
     return result

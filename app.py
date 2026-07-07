@@ -15,6 +15,7 @@ from scipy.io import wavfile
 from umbra.audio import audio_to_image_data, image_data_to_audio
 from umbra.audio_mixer import EnvironmentMonitor
 from umbra.decoding import NoiseStreamDecoder
+from umbra.testing import run_audio_roundtrip_experiment
 
 # --- UMBRA IMPORTS ---
 from umbra.encoding import NoisePacket, NoiseStreamEncoder
@@ -262,6 +263,14 @@ class UmbraTerminal(ctk.CTk):
                                         state="disabled", fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, font=FONT_UI)
         self.btn_save_wav.pack(pady=5, padx=20, fill="x")
 
+        # NEW: Audio roundtrip experiment (core purpose)
+        self.btn_experiment = ctk.CTkButton(
+            self.frame_enc, text="🔬 RUN AUDIO EXPERIMENT (AI GUESS + SCORE)",
+            command=self.run_audio_experiment, fg_color=COLOR_SUCCESS, hover_color=COLOR_SUCCESS_HOVER,
+            font=FONT_UI, state="disabled"
+        )
+        self.btn_experiment.pack(pady=(10, 5), padx=20, fill="x")
+
         # --- RIGHT PANEL (DECODE) ---
         self.frame_dec = ctk.CTkFrame(self.content_frame, fg_color=COLOR_PANEL, corner_radius=10)
         self.frame_dec.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
@@ -391,6 +400,7 @@ class UmbraTerminal(ctk.CTk):
             
             self.btn_play_noise.configure(state="normal")
             self.btn_save_wav.configure(state="normal")
+            self.btn_experiment.configure(state="normal")
             self.log(f"Encoding Complete. Carrier Size: {len(self.current_audio)} samples.", "SUCCESS")
             
         except Exception as e:
@@ -402,6 +412,66 @@ class UmbraTerminal(ctk.CTk):
         if self.current_audio is not None:
             self.log("Playing carrier signal...", "AUDIO")
             sd.play(self.current_audio, self.sample_rate)
+
+    def run_audio_experiment(self):
+        """Core purpose flow: AI guesses post-audio look, transfer, score the three axes.
+        Now the primary focused feature with high-fidelity audio path.
+        """
+        if self.current_image is None:
+            messagebox.showwarning("No Image", "Load an image first.")
+            return
+        self.log("Running AUDIO ROUNDTRIP EXPERIMENT (high-fidelity mode)...", "EXPERIMENT")
+        try:
+            res = run_audio_roundtrip_experiment(self.current_image, resolution=(128, 128))
+            self.last_exp = res  # store for play/save
+
+            self.log("=== AUDIO EXPERIMENT RESULTS ===", "EXPERIMENT")
+            self.log(f"  Image→Audio fidelity : {res.image_to_audio_fidelity:.4f}", "EXPERIMENT")
+            self.log(f"  Audio→Image fidelity : {res.audio_to_image_fidelity:.4f}  (SSIM {res.metrics_orig_actual.ssim:.3f}, PSNR {res.metrics_orig_actual.psnr:.1f})", "EXPERIMENT")
+            self.log(f"  AI Prediction accuracy : {res.prediction_accuracy:.4f}  (guess vs actual SSIM {res.metrics_pred_actual.ssim:.3f})", "EXPERIMENT")
+            self.log(f"  >>> COMPOSITE SCORE    : {res.composite:.4f} <<<", "EXPERIMENT")
+
+            # === Visuals: Original (keep), AI Guess (enc), Actual (dec) ===
+            # Original
+            orig_u8 = np.clip(self.current_image * 255, 0, 255).astype(np.uint8)
+            orig_pil = Image.fromarray(orig_u8)
+            ctk_orig = ctk.CTkImage(light_image=orig_pil, dark_image=orig_pil, size=(256, 256))
+            self.lbl_img_preview.configure(image=ctk_orig, text="")
+            self.enc_image_ref = ctk_orig
+
+            # AI Guess
+            pred_u8 = np.clip(res.predicted * 255, 0, 255).astype(np.uint8)
+            pred_pil = Image.fromarray(pred_u8)
+            ctk_pred = ctk.CTkImage(light_image=pred_pil, dark_image=pred_pil, size=(256, 256))
+            # We temporarily overwrite the "carrier" preview with the guess
+            self.lbl_img_preview.configure(image=ctk_pred, text="AI GUESS")
+            self.enc_image_ref = ctk_pred
+
+            # Actual audio result
+            act_u8 = np.clip(res.actual * 255, 0, 255).astype(np.uint8)
+            act_pil = Image.fromarray(act_u8)
+            ctk_act = ctk.CTkImage(light_image=act_pil, dark_image=act_pil, size=(256, 256))
+            self.lbl_dec_preview.configure(image=ctk_act, text="AUDIO RESULT")
+            self.dec_image_ref = ctk_act
+
+            # Make a proper experiment WAV (using the direct high-fid path) for playback
+            from umbra.codec import encode_image_to_wav_bytes
+            from scipy.io import wavfile as wv
+            import io
+            wavb = encode_image_to_wav_bytes(self.current_image, direct=True)
+            bio = io.BytesIO(wavb)
+            sr, aud = wv.read(bio)
+            if aud.ndim > 1:
+                aud = aud[:, 0]
+            self.current_audio = aud.astype(np.float32) / 32767.0   # for sounddevice
+            self.sample_rate = sr
+            self.btn_play_noise.configure(state="normal")
+            self.btn_save_wav.configure(state="normal")
+
+            self.log("Experiment complete. Previews: LEFT=AI Guess, RIGHT=Actual audio decode. Use PLAY to hear the transmitted audio.", "SUCCESS")
+        except Exception as e:
+            traceback.print_exc()
+            self.log(f"Experiment error: {e}", "ERROR")
 
     def save_wav(self):
         if self.current_audio is None:

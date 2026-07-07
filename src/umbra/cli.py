@@ -9,11 +9,13 @@ import logging
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 from .decoding import NoiseStreamDecoder
 from .encoding import NoisePacket, NoiseStreamEncoder
 from .metrics import compute_metrics
 from .pipeline import run_pipeline
-from .testing import run_smoke_test
+from .testing import run_audio_roundtrip_experiment, run_smoke_test
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,35 @@ def command_smoke_test(args: argparse.Namespace) -> None:
     print("Smoke test complete. Reconstruction metrics:")
     print(f"  PSNR: {metrics.psnr:.3f}")
     print(f"  SSIM: {metrics.ssim:.3f}")
+
+
+def command_audio_experiment(args: argparse.Namespace) -> None:
+    """Run the audio transfer experiment with AI pre-guess and scoring."""
+    res = run_audio_roundtrip_experiment(
+        args.image,
+        resolution=(args.resolution, args.resolution) if args.resolution else None,
+    )
+    print("=== AUDIO ROUNDTRIP EXPERIMENT ===")
+    print(f"Input: {args.image}")
+    print(f"Resolution used: {res.original.shape[0]}x{res.original.shape[1]}")
+    print()
+    print("SCORES (higher is better):")
+    print(f"  Image -> Audio fidelity : {res.image_to_audio_fidelity:.4f}")
+    print(f"  Audio -> Image fidelity : {res.audio_to_image_fidelity:.4f}  (SSIM {res.metrics_orig_actual.ssim:.3f}, PSNR {res.metrics_orig_actual.psnr:.1f})")
+    print(f"  Agent prediction accuracy: {res.prediction_accuracy:.4f}  (guess vs actual recon SSIM {res.metrics_pred_actual.ssim:.3f})")
+    print()
+    print(f"  COMPOSITE (avg of 3): {res.composite:.4f}")
+    print()
+    if args.save_actual:
+        from PIL import Image as PILImage
+        out = (np.clip(res.actual, 0, 1) * 255).astype(np.uint8)
+        PILImage.fromarray(out).save(args.save_actual)
+        print(f"Saved actual reconstruction to {args.save_actual}")
+    if args.save_guess:
+        from PIL import Image as PILImage
+        out = (np.clip(res.predicted, 0, 1) * 255).astype(np.uint8)
+        PILImage.fromarray(out).save(args.save_guess)
+        print(f"Saved AI guess to {args.save_guess}")
 
 
 def command_ui(_args: argparse.Namespace) -> None:
@@ -173,6 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     ui_parser = subparsers.add_parser("ui", help="Launch the desktop visual explorer")
     ui_parser.set_defaults(func=command_ui)
+
+    audio_exp = subparsers.add_parser(
+        "audio-experiment",
+        help="Run image->audio->image roundtrip with AI pre-guess and report the 3-way scores",
+    )
+    audio_exp.add_argument("--image", required=True, help="Input image path")
+    audio_exp.add_argument("--resolution", type=int, default=0, help="Optional square resize (0 = original size)")
+    audio_exp.add_argument("--save-actual", default=None, help="Optional path to save the audio-decoded image")
+    audio_exp.add_argument("--save-guess", default=None, help="Optional path to save the AI predicted post-audio image")
+    audio_exp.set_defaults(func=command_audio_experiment)
 
     return parser
 

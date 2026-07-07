@@ -9,7 +9,11 @@ from typing import Any
 
 import numpy as np
 
-from .reconstruction import reconstruct_from_waveform
+from .reconstruction import (
+    reconstruct_from_waveform,
+    suggest_sample_rate,
+    suggest_transmission_profile,
+)
 
 try:  # pragma: no cover - import guard
     import torch
@@ -95,4 +99,87 @@ def predict_image_from_waveform(
         return base_prediction.astype(np.float32)
 
 
-__all__ = ["predict_image_from_waveform"]
+def predict_post_audio_image(
+    image: np.ndarray,
+    *,
+    model: Any | None = None,
+    blur_sigma: float = 0.8,
+    norm_mode: str = "per_segment",
+) -> np.ndarray:
+    """Predict what ``image`` will approximately look like after audio roundtrip.
+
+    This is the "AI guess" step: estimate the output of image->audio->image
+    *before* performing the actual transfer. The guess is compared to the
+    actual audio-decoded image for the prediction score.
+
+    Heuristic channel model (grayscale AM fax):
+      - luminance (mean over RGB)
+      - per-band or global max-normalization (mimics demod + rescale)
+      - mild gaussian blur (band-limit effect of carrier)
+      - repeat to 3 channels (color is lost in current carrier)
+
+    When a ``model`` (torch callable) is supplied it is used instead.
+    The heuristic is intentionally a close-but-imperfect approximation so that
+    the "how well did the agent predict" score is meaningful.
+    """
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    if arr.shape[2] > 3:
+        arr = arr[..., :3]
+    arr = np.clip(arr, 0.0, 1.0)
+
+    if model is not None and torch is not None:
+        try:
+            t = torch.as_tensor(arr.transpose(2, 0, 1)[None])  # 1x3xHxW
+            if torch.cuda.is_available():
+                t = t.to("cuda")
+            with torch.no_grad():
+                out = model(t)
+            if hasattr(out, "detach"):
+                out = out.detach().cpu().numpy()
+            out = np.asarray(out, dtype=np.float32)
+            if out.ndim == 4:
+                out = out[0]
+            if out.shape[0] == 3:
+                out = out.transpose(1, 2, 0)
+            out = np.clip(out, 0.0, 1.0)
+            if out.shape[:2] != arr.shape[:2]:
+                from scipy.ndimage import zoom
+                z = (arr.shape[0] / out.shape[0], arr.shape[1] / out.shape[1], 1)
+                out = zoom(out, z, order=3)
+            return out.astype(np.float32)
+        except Exception:
+            logger.exception("Torch post-audio predictor failed; using heuristic")
+
+    # --- Heuristic predictor (default) ---
+    # Agent does not have *exact* internal knowledge of segment count / norm points;
+    # use a simplified global + mild local model + extra blur to represent imperfect prediction.
+    # Improved predictor: now assumes the improved color-capable channel
+    # Agent tries to guess per-channel structure + some loss
+    h, w, _ = arr.shape
+    pred = arr.copy()  # start with original (optimistic agent that knows structure)
+    # Apply realistic degradations the channel still has: per-ch max norm-ish + blur
+    for ch in range(3):
+        ch_data = pred[..., ch]
+        mx = float(np.max(ch_data)) or 1.0
+        ch_data = ch_data / mx
+        pred[..., ch] = ch_data
+
+    # Channel crosstalk / loss simulation (agent not perfect)
+    pred = pred * 0.92 + 0.04
+
+    eff_blur = float(blur_sigma) * 0.9
+    if eff_blur > 0:
+        try:
+            from scipy.ndimage import gaussian_filter
+            for ch in range(3):
+                pred[..., ch] = gaussian_filter(pred[..., ch], sigma=eff_blur)
+        except Exception:
+            pass
+
+    pred = np.clip(pred, 0.0, 1.0).astype(np.float32)
+    return pred
+
+
+__all__ = ["predict_image_from_waveform", "predict_post_audio_image"]

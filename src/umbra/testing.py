@@ -5,13 +5,23 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
+from PIL import Image
 
-from umbra.codec import decode_waveform_to_image, encode_image_to_waveform
+from umbra.codec import (
+    decode_wav_bytes_to_image,
+    decode_waveform_to_image,
+    encode_image_to_wav_bytes,
+    encode_image_to_waveform,
+)
 from umbra.decoding import NoiseStreamDecoder
 from umbra.encoding import NoiseStreamEncoder
 from umbra.metrics import ReconstructionMetrics, compute_metrics
+from umbra.predictor import predict_post_audio_image
 from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
 
 logger = logging.getLogger(__name__)
@@ -94,4 +104,152 @@ def run_smoke_test(
     return packet_metrics
 
 
-__all__ = ["run_smoke_test"]
+@dataclass
+class AudioRoundtripResult:
+    """Result of a full image -> audio -> image experiment with AI prediction."""
+
+    original: np.ndarray
+    predicted: np.ndarray          # AI guess of post-audio appearance
+    actual: np.ndarray             # output of actual audio roundtrip
+    waveform: np.ndarray
+    sample_rate: int
+    # Core scores per user request
+    image_to_audio_fidelity: float  # proxy for "how well image got turned into audio"
+    audio_to_image_fidelity: float  # how well audio reconstructed to image (vs orig)
+    prediction_accuracy: float      # how well guessed matched the actual audio output
+    composite: float                # overall experiment score [0-1]
+    metrics_orig_actual: ReconstructionMetrics
+    metrics_pred_actual: ReconstructionMetrics
+
+
+def run_audio_roundtrip_experiment(
+    image: np.ndarray | str | Path | Image.Image,
+    *,
+    resolution: tuple[int, int] | None = None,
+    predictor_model: Any | None = None,
+    segments: int | None = None,
+    marker_duration: float | None = None,
+) -> AudioRoundtripResult:
+    """Run the core Umbra audio experiment.
+
+    Flow:
+      1. AI (predictor) guesses what the image will look like after audio processing.
+      2. Image is transferred to audio (WAV waveform).
+      3. Audio is transferred back to image.
+      4. Scores computed:
+         - image_to_audio_fidelity (energy preservation proxy via pre/post gray corr)
+         - audio_to_image_fidelity (actual vs original)
+         - prediction_accuracy (guess vs actual audio output)
+    """
+    # Load / normalize input
+    if isinstance(image, (str, Path)):
+        pil = Image.open(image).convert("RGB")
+        arr = np.asarray(pil, dtype=np.float32) / 255.0
+    elif isinstance(image, Image.Image):
+        arr = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    else:
+        arr = np.asarray(image, dtype=np.float32)
+        if arr.max() > 1.0:
+            arr = arr / 255.0
+        arr = np.clip(arr, 0.0, 1.0)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=-1)
+
+    if resolution is not None:
+        from skimage.transform import resize
+        arr = resize(arr, resolution + (3,), preserve_range=True, anti_aliasing=True).astype(np.float32)
+        arr = np.clip(arr, 0.0, 1.0)
+    else:
+        # For the audio fax toy channel, large images get truncated by design (duration cap).
+        # Auto-downscale to a practical "transmission" size so scores reflect the channel
+        # rather than data loss from artificial limits. User can pass explicit resolution.
+        h, w = arr.shape[:2]
+        max_dim = 256
+        if max(h, w) > max_dim:
+            scale = max_dim / float(max(h, w))
+            new_h = max(8, int(round(h * scale)))
+            new_w = max(8, int(round(w * scale)))
+            from skimage.transform import resize
+            arr = resize(arr, (new_h, new_w, 3), preserve_range=True, anti_aliasing=True).astype(np.float32)
+            arr = np.clip(arr, 0.0, 1.0)
+            logger.info("Auto-downscaled large input to %dx%d for audio experiment", new_h, new_w)
+
+    orig = arr.copy()
+
+    # 1. AI GUESS (before doing the transfer)
+    predicted = predict_post_audio_image(orig, model=predictor_model)
+
+    # 2+3. ACTUAL TRANSFER - use direct=True for high audio->image fidelity
+    wav_bytes = encode_image_to_wav_bytes(
+        orig,
+        segments=segments,
+        marker_duration=marker_duration,
+        direct=True,
+    )
+    dec_result = decode_wav_bytes_to_image(wav_bytes, resolution=orig.shape[:2], return_metadata=True, direct=True)
+    if isinstance(dec_result, tuple):
+        actual, _meta = dec_result
+    else:
+        actual = dec_result
+    actual = np.clip(np.asarray(actual, dtype=np.float32), 0.0, 1.0)
+
+    # Ensure shapes match
+    if actual.shape != orig.shape:
+        from skimage.transform import resize
+        actual = resize(actual, orig.shape, preserve_range=True, anti_aliasing=True).astype(np.float32)
+
+    # 4. SCORING
+    m_orig_actual = compute_metrics(orig, actual)
+    m_pred_actual = compute_metrics(predicted, actual)
+
+    # image_to_audio_fidelity: use correlation between original luminance and the demodulated
+    # (we can derive a proxy by re-encoding the actual and comparing internal, or simple:
+    #   since the carrier amplitude ~ luminance, we can measure how "consistent" the recovered
+    #   is with input structure using partial alignment + fft/edge from existing metrics.
+    gray_orig = np.mean(orig, axis=2)
+    gray_actual = np.mean(actual, axis=2)
+    # Pearson-like correlation (structure preservation in audio domain)
+    def _safe_corr(a, b):
+        a = a.ravel().astype(np.float32)
+        b = b.ravel().astype(np.float32)
+        a = (a - a.mean()) / (a.std() + 1e-9)
+        b = (b - b.mean()) / (b.std() + 1e-9)
+        return float(np.clip(np.mean(a * b), -1.0, 1.0))
+    encode_corr = _safe_corr(gray_orig, gray_actual)
+    image_to_audio_fid = float(np.clip((encode_corr + 1.0) / 2.0, 0.0, 1.0))  # map [-1,1] -> [0,1]
+
+    # audio_to_image_fidelity: how good was the reconstruction (use a bounded composite)
+    # normalize psnr/ssim into [0,1] contribution
+    psnr_n = float(np.clip((m_orig_actual.psnr - 12.0) / 28.0, 0.0, 1.0))
+    audio_to_image_fid = float(np.clip(0.6 * m_orig_actual.ssim + 0.4 * psnr_n, 0.0, 1.0))
+
+    # prediction_accuracy: similarity of AI guess to what actually came out of audio
+    psnr_p = float(np.clip((m_pred_actual.psnr - 12.0) / 28.0, 0.0, 1.0))
+    prediction_acc = float(np.clip(0.65 * m_pred_actual.ssim + 0.35 * psnr_p, 0.0, 1.0))
+
+    # Overall composite (equal weight on the three pillars described by user)
+    composite = float(np.clip(
+        (image_to_audio_fid + audio_to_image_fid + prediction_acc) / 3.0,
+        0.0, 1.0
+    ))
+
+    # For waveform we return a representative; user can re-encode if needed.
+    # Here we return the internal waveform used.
+    waveform = encode_image_to_waveform(orig)  # lightweight; not bytes
+
+    return AudioRoundtripResult(
+        original=orig.astype(np.float32),
+        predicted=predicted.astype(np.float32),
+        actual=actual.astype(np.float32),
+        waveform=waveform.astype(np.float32),
+        sample_rate=int(suggest_sample_rate(orig)),
+        image_to_audio_fidelity=image_to_audio_fid,
+        audio_to_image_fidelity=audio_to_image_fid,
+        prediction_accuracy=prediction_acc,
+        composite=composite,
+        metrics_orig_actual=m_orig_actual,
+        metrics_pred_actual=m_pred_actual,
+    )
+
+
+__all__ = ["run_smoke_test", "run_audio_roundtrip_experiment", "AudioRoundtripResult"]

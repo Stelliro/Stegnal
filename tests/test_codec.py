@@ -191,6 +191,8 @@ def test_decode_waveform_to_image_attempts_alternative_segments(monkeypatch: pyt
         advanced_logging: bool,
         return_segments: bool,
         allow_cpu_fallback: bool,
+        direct: bool = False,
+        **kwargs,
     ) -> tuple[np.ndarray, int]:
         calls.append(segments)
         rows, cols = resolution
@@ -253,6 +255,8 @@ def test_decode_wav_bytes_to_image_attempts_segment_fallback(monkeypatch: pytest
         advanced_logging: bool,
         return_segments: bool,
         allow_cpu_fallback: bool,
+        direct: bool = False,
+        **kwargs,
     ) -> tuple[np.ndarray, int]:
         calls.append(segments)
         rows, cols = resolution

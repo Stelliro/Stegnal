@@ -142,7 +142,7 @@ class AudioEngine:
         final_tx = payload / (peak + 1e-9) if peak > 0 else payload
         if sync:
             t = np.linspace(0, 0.2, int(fs * 0.2), False)
-            beep = np.sin(2 * np.pi * 1000 * t) * 0.8
+            beep = np.sin(2 * np.pi * 1000 * t) * 0.1  # very quiet initial sync beep: audible at low volume (10%) when mic close, not blasting at 100%
             final_tx = np.concatenate([beep, np.zeros(int(fs*0.1)), final_tx])
 
         recorded, finished, pos = [], threading.Event(), 0
@@ -168,7 +168,7 @@ class AudioEngine:
                     sd.sleep(500 + int(self.latency_ms))
             full = np.concatenate(recorded).flatten()
             if sync:
-                peaks = np.where(np.abs(full) > 0.2)[0]
+                peaks = np.where(np.abs(full) > 0.03)[0]  # lowered to detect quiet beep
                 if not len(peaks):
                     return None
                 start = peaks[0] + int(fs * 0.3) - 500

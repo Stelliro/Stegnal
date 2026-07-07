@@ -280,8 +280,14 @@ def encode_image_to_waveform(
     sample_rate: int | None = None,
     segments: int | None = None,
     marker_duration: float | None = None,
+    direct: bool = False,
+    carrier_freq: float = 1200.0,
 ) -> np.ndarray:
-    """Encode ``image`` into a waveform suitable for sonic transmission."""
+    """Encode ``image`` into a waveform suitable for sonic transmission.
+
+    direct=True uses high-fidelity PCM encoding of the RGB data (recommended for
+    good audio->image fidelity in experiments).
+    """
 
     array = _ensure_rgb_image(image)
     if sample_rate is None:
@@ -296,6 +302,8 @@ def encode_image_to_waveform(
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
+        direct=direct,
+        carrier_freq=carrier_freq,
     )
     return waveform.astype(np.float32)
 
@@ -306,14 +314,21 @@ def encode_image_to_wav_bytes(
     sample_rate: int | None = None,
     segments: int | None = None,
     marker_duration: float | None = None,
+    direct: bool = False,
+    carrier_freq: float = 1200.0,
 ) -> bytes:
-    """Encode ``image`` into WAV bytes."""
+    """Encode ``image`` into WAV bytes.
+
+    direct=True → high fidelity PCM path.
+    """
 
     waveform = encode_image_to_waveform(
         image,
         sample_rate=sample_rate,
         segments=segments,
         marker_duration=marker_duration,
+        direct=direct,
+        carrier_freq=carrier_freq,
     )
     return waveform_to_wav_bytes(waveform, sample_rate or suggest_sample_rate(image))
 
@@ -337,6 +352,7 @@ def _reconstruct_with_strategies(
     marker_duration: float,
     advanced_logging: bool = False,
     return_segments: bool = True,
+    direct: bool = False,
 ) -> tuple[np.ndarray, int]:
     """Try ``reconstruct_from_waveform`` with segment fallback."""
     try:
@@ -349,6 +365,7 @@ def _reconstruct_with_strategies(
             advanced_logging=advanced_logging,
             return_segments=return_segments,
             allow_cpu_fallback=True,
+            direct=direct,
         )
     except Exception:
         if segments is not None:
@@ -375,6 +392,7 @@ def decode_waveform_to_image(
     return_metadata: bool = False,
     advanced_logging: bool = False,
     allow_cpu_fallback: bool = True,
+    direct: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, DecodedWavMetadata]:
     """Decode ``waveform`` into an RGB image using heuristic reconstruction."""
 
@@ -395,6 +413,7 @@ def decode_waveform_to_image(
             marker_duration=marker_duration,
             advanced_logging=advanced_logging,
             return_segments=True,
+            direct=direct,
         )
     except Exception:
         logger.warning("Reconstruction failed; returning waveform preview.")
@@ -426,6 +445,7 @@ def decode_wav_bytes_to_image(
     return_metadata: bool = False,
     advanced_logging: bool = False,
     allow_cpu_fallback: bool = True,
+    direct: bool = False,
 ) -> tuple[np.ndarray, int] | tuple[np.ndarray, DecodedWavMetadata]:
     """Decode WAV ``data`` into an RGB image."""
 
@@ -462,6 +482,7 @@ def decode_wav_bytes_to_image(
         return_metadata=True,
         advanced_logging=advanced_logging,
         allow_cpu_fallback=allow_cpu_fallback,
+        direct=direct,
     )
     image, metadata = result  # type: ignore[misc]
 

@@ -15,7 +15,7 @@ from .logging_utils import configure_logging
 from .metrics import ReconstructionMetrics, compute_metrics
 from .neural import NeuralRewardModel
 from .pipeline import PipelineResult, replay_packet, run_pipeline
-from .predictor import predict_image_from_waveform
+from .predictor import predict_image_from_waveform, predict_post_audio_image
 from .reconstruction import (
     GeneratedShape,
     ReconstructionResult,
@@ -61,6 +61,7 @@ __all__ = [
     "image_to_waveform",
     "predict_missing_pixels",
     "predict_image_from_waveform",
+    "predict_post_audio_image",
     "reconstruct_from_waveform",
     "run_reconstruction_cycle",
     "waveform_to_wav_bytes",

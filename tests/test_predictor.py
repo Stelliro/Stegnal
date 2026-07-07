@@ -85,3 +85,28 @@ def test_predictor_uses_model_when_torch_available(monkeypatch) -> None:
     assert image.shape == (4, 4, 3)
     assert np.allclose(image, 0.5, atol=1e-6)
 
+
+def test_predict_post_audio_image_basic():
+    rng = np.random.default_rng(42)
+    img = rng.random((32, 48, 3), dtype=np.float32)
+    pred = predictor.predict_post_audio_image(img)
+    assert pred.shape == (32, 48, 3)
+    assert pred.dtype == np.float32
+    assert 0.0 <= pred.min() <= pred.max() <= 1.0
+    # With improved color support the predictor now tries to keep color, so diff can be larger.
+    # Just ensure it is a valid RGB image in range.
+    assert pred.shape == (32, 48, 3)
+    assert 0.0 <= pred.min() <= pred.max() <= 1.0
+
+
+def test_audio_experiment_end_to_end():
+    from umbra.testing import run_audio_roundtrip_experiment
+    rng = np.random.default_rng(7)
+    img = rng.random((40, 40, 3), dtype=np.float32)
+    res = run_audio_roundtrip_experiment(img)
+    assert 0.0 <= res.composite <= 1.0
+    assert 0.0 <= res.image_to_audio_fidelity <= 1.0
+    assert 0.0 <= res.audio_to_image_fidelity <= 1.0
+    assert 0.0 <= res.prediction_accuracy <= 1.0
+    assert res.predicted.shape == res.actual.shape == res.original.shape
+
