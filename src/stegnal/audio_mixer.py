@@ -3,10 +3,18 @@ import os
 import threading
 
 import numpy as np
-import sounddevice as sd
 from scipy.signal import butter, lfilter
 
+# sounddevice needs the PortAudio system library. CI/headless hosts often lack it,
+# and import then raises OSError. Keep the dependency optional so pure unit tests
+# (and UI stubs) can still import this module.
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    sd = None
+
 logger = logging.getLogger("Stegnal")
+
 
 def highpass_filter(data, cutoff=300, fs=48000, order=5):
     """Kills low-end room rumble and fan noise."""
@@ -23,6 +31,9 @@ class InterferenceSynth:
         
     def start(self, device_index):
         if self.running:
+            return
+        if sd is None:
+            logger.error("Synth failed: sounddevice/PortAudio not available")
             return
         self.running = True
         def callback(outdata, frames, time, status):
@@ -66,6 +77,8 @@ class AudioEngine:
         self.monitor_running = False
 
     def get_devices(self, kind='input'):
+        if sd is None:
+            return []
         try:
             devs = sd.query_devices()
             valid = []
@@ -89,6 +102,8 @@ class AudioEngine:
 
     def start_monitoring(self, device_index):
         if self.monitor_running:
+            return
+        if sd is None:
             return
         self.monitor_running = True
         def monitor_callback(indata, frames, time, status):
@@ -137,6 +152,8 @@ class AudioEngine:
         return clean_rec
 
     def _internal_io(self, payload, fs, idx_out, idx_in, sync):
+        if sd is None:
+            return None
         self.interrupt_flag = False
         peak = np.max(np.abs(payload))
         final_tx = payload / (peak + 1e-9) if peak > 0 else payload
@@ -183,6 +200,8 @@ class AudioEngine:
 
 def list_audio_devices(kind='input'):
     """Return ``"<index>: <name>"`` strings for devices of the given kind."""
+    if sd is None:
+        return []
     try:
         devs = sd.query_devices()
         valid = []
@@ -218,6 +237,9 @@ class EnvironmentMonitor:
     def start(self, music_device_index, mic_device_index):
         """Begin monitoring the microphone. Returns ``True`` on success."""
         if self.running:
+            return False
+        if sd is None:
+            logger.error("EnvironmentMonitor failed to start: sounddevice/PortAudio not available")
             return False
         self.music_device = music_device_index
         self.mic_device = mic_device_index
