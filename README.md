@@ -15,6 +15,33 @@
 
 **Keywords:** steganography, audio steganography, ultrasonic communication, acoustic channel, image-to-audio, covert channel, signal processing, channel fingerprinting, noncommercial research
 
+## At a glance
+
+<p align="center">
+  <img src="docs/images/pipeline.png" alt="Stegnal pipeline: payload → encode → transmit → capture → reconstruct → score/key" width="900" />
+</p>
+
+**Desktop UI** (real device selection, simulated + over-air experiments, scores):
+
+<p align="center">
+  <img src="docs/images/ui-screenshot.png" alt="Stegnal desktop UI showing original, AI prediction, reconstruction, and scores" width="900" />
+</p>
+
+**Example roundtrip** (image → audio → decode; mild simulated noise):
+
+<p align="center">
+  <img src="docs/images/roundtrip-example.png" alt="Reference, prediction concept, and reconstructed image with waveform snippet" width="820" />
+</p>
+
+**Channel-bound key idea** (research / experimental — not traditional encryption):
+
+<p align="center">
+  <img src="docs/images/key-concept.png" alt="AI reconstruction plus channel fingerprint combine into derived key material" width="780" />
+</p>
+
+> Regenerate these assets (UI capture uses the **secondary monitor** when present):  
+> `python scripts/generate_readme_images.py`
+
 ## Core Idea
 
 - Convert an image or text payload into an audio waveform (using AM carrier or direct PCM; configurable high carrier freq for ultrasonic-ish operation).
