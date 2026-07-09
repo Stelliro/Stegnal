@@ -106,9 +106,13 @@ def test_detected_runtime_reports_mismatch(monkeypatch, tmp_path):
 
     description = gpu_runtime.describe_detected_cuda_runtime()
     if sys.platform == "win32":  # pragma: no cover - platform-specific expectation
+        # Windows DLL names only encode a compact major (nvrtc64_130_0 → 13.x).
         expected = "CUDA Toolkit 13.x (NVRTC nvrtc64_130_0.dll)"
+    elif sys.platform == "darwin":  # pragma: no cover - macOS not in CI
+        expected = "CUDA Toolkit 13.0 (NVRTC libnvrtc.13.0.dylib)"
     else:
-        expected = "CUDA Toolkit 13.x (NVRTC libnvrtc.so.13.0)"
+        # Linux sonames expose major.minor (libnvrtc.so.13.0 → 13.0).
+        expected = "CUDA Toolkit 13.0 (NVRTC libnvrtc.so.13.0)"
     assert description == expected
 
     assert gpu_runtime.nvrtc_version_matches_requirement() is False
