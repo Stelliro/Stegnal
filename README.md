@@ -1,10 +1,19 @@
 # Stegnal
 
-Experimental system for transmitting images or text over audio channels (including high-frequency/ultrasonic options for stealth), with AI-assisted prediction of the post-channel result, real over-air testing, and derivation of secure key material from the combination of AI reconstruction and physical channel characteristics.
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE.md)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/Stelliro/Stegnal/actions/workflows/ci.yml/badge.svg)](https://github.com/Stelliro/Stegnal/actions)
 
-**Status:** Focused prototype for real acoustic channel experimentation. Not a production secure comms system.
+**Steganography + signal** experiments: send images or text as sound (including high-frequency / ultrasonic carriers), capture them through real speakers and mics, use AI-style prediction to reconstruct what survived the channel, and derive channel-bound key material from the reconstruction plus the physical path fingerprint.
 
-Licensed for **noncommercial use only** under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+| | |
+|---|---|
+| **What it is** | Research prototype for real acoustic (over-air) image/text transmission |
+| **Who it’s for** | Hobbyists, students, researchers, noncommercial experimenters |
+| **License** | Free to use, share, and modify — **noncommercial only** ([details](#license)) |
+| **Status** | Focused prototype. Not a production secure messaging system |
+
+**Keywords:** steganography, audio steganography, ultrasonic communication, acoustic channel, image-to-audio, covert channel, signal processing, channel fingerprinting, noncommercial research
 
 ## Core Idea
 
@@ -111,7 +120,17 @@ The UI is the main focus (`src/stegnal/ui.py`); keep changes focused on real aco
 
 ## License
 
-PolyForm Noncommercial License 1.0.0 — noncommercial use only.
+**[PolyForm Noncommercial License 1.0.0](LICENSE.md)**
+
+| Allowed | Not allowed |
+|---|---|
+| Personal use, learning, hobby projects | Selling the software or selling access to it |
+| Research, education, public knowledge | Using it in a commercial product or service |
+| Copying, modifying, and sharing under the same terms | Using it to make money (directly or as part of a paid offering) |
+| Contributions back to this project | Sublicensing under a more permissive commercial license |
+
+Full legal text: [LICENSE.md](LICENSE.md).  
+Plain language: free for everyone for noncommercial purposes; no commercial use or profiting off it.
 
 ## Acknowledgments / History
 

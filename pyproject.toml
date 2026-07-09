@@ -10,6 +10,33 @@ readme = "README.md"
 authors = [{ name = "Stegnal Team" }]
 license = { text = "PolyForm-Noncommercial-1.0.0" }
 requires-python = ">=3.9"
+keywords = [
+    "steganography",
+    "audio-steganography",
+    "ultrasonic",
+    "acoustic-communication",
+    "image-to-audio",
+    "covert-channel",
+    "signal-processing",
+    "channel-fingerprinting",
+    "noncommercial",
+    "research",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Education",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Security",
+]
 dependencies = [
     "numpy>=1.24",
     "pillow>=10.0",
