@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -183,7 +182,6 @@ def generate_roundtrip_demo() -> Path:
     wf_img = Image.new("RGB", (n * 3 + 80, 80), "#1a1a1a")
     wdraw = ImageDraw.Draw(wf_img)
     mid = 40
-    xs = np.linspace(0, wf_img.width - 1, num=min(len(wf), wf_img.width))
     pts = []
     step = max(1, len(wf) // wf_img.width)
     samples = wf[::step][: wf_img.width]
