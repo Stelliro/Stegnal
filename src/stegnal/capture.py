@@ -8,7 +8,7 @@ realisation of the same signal. Recording the same noise N times and combining
 the takes (the project's "messy key" idea) averages out room/mic noise, and the
 individual takes become training examples for the reward model.
 
-The actual play/record is delegated to :meth:`umbra.audio_mixer.AudioEngine.
+The actual play/record is delegated to :meth:`stegnal.audio_mixer.AudioEngine.
 transmit_and_record`, so a real run needs working audio hardware. The functions
 here are hardware-agnostic — pass any object exposing ``transmit_and_record`` —
 which keeps them unit-testable with a stub engine.
@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 from scipy.io import wavfile
 
-from .audio import AUDIO_SCALE_FACTOR, audio_to_image_data, image_data_to_audio
+from .audio import audio_to_image_data, image_data_to_audio
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +131,7 @@ def score_recordings(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Decode each recording and return ``(features, rewards)`` for training.
 
-    Features follow :data:`umbra.checkpoint.DEFAULT_FEATURE_NAMES`; the reward is
+    Features follow :data:`stegnal.checkpoint.DEFAULT_FEATURE_NAMES`; the reward is
     the structure-gated ``composite_score`` of the decoded image vs ``reference``.
     """
     from .checkpoint import DEFAULT_FEATURE_NAMES

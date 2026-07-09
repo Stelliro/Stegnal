@@ -1,6 +1,6 @@
-# Contributing to Project Umbra
+# Contributing to Stegnal
 
-**Project Umbra is an early-stage prototype, and help is genuinely wanted.**
+**Stegnal is an early-stage prototype, and help is genuinely wanted.**
 Whether you want to run it and report what happens, fix a bug, or push the
 research forward, contributions of all sizes are welcome.
 
@@ -18,9 +18,9 @@ research forward, contributions of all sizes are welcome.
   decoder (autoencoder / U-Net / diffusion) is the most promising direction for
   pushing the difficulty curriculum higher.
 - **Improve the evolutionary search / difficulty curriculum.** See
-  `src/umbra/evolution.py` and `src/umbra/difficulty.py`.
+  `src/stegnal/evolution.py` and `src/stegnal/difficulty.py`.
 - **Hardware acoustic path.** Test the speaker→microphone capture
-  (`src/umbra/capture.py`) on real hardware and report results.
+  (`src/stegnal/capture.py`) on real hardware and report results.
 - **Docs, tests, packaging, and tooling.** Always appreciated.
 
 ## Getting started (from source)
@@ -33,12 +33,12 @@ python -m venv .venv
 # Unix:     source .venv/bin/activate
 pip install -e ".[ui,dev]"
 pytest                  # run the test suite
-umbra smoke-test        # quick end-to-end sanity check
-umbra ui                # the desktop evolution explorer
+stegnal smoke-test        # quick end-to-end sanity check
+stegnal ui                # the desktop explorer
 python app.py           # the standalone "Terminal" encode/decode tool
 ```
 
-On Windows you can also just double-click `launch_umbra_ui.bat` (explorer) or
+On Windows you can also just double-click `launch_stegnal_ui.bat` (explorer) or
 `launch_terminal.bat` (Terminal); they create the virtual environment on first run.
 
 ## Try the prebuilt app

@@ -6,15 +6,15 @@ import logging
 import numpy as np
 import pytest
 
-import umbra.decoding as decoding
-import umbra.encoding as encoding
-import umbra.gpu_runtime as gpu_runtime
-import umbra.reconstruction as reconstruction
-from umbra.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
-from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
-from umbra.evolution import EvolutionManager, _chaotic_seed_mix
-from umbra.metrics import (
+import stegnal.decoding as decoding
+import stegnal.encoding as encoding
+import stegnal.gpu_runtime as gpu_runtime
+import stegnal.reconstruction as reconstruction
+from stegnal.codec import decode_wav_bytes_to_image, encode_image_to_wav_bytes
+from stegnal.decoding import NoiseStreamDecoder
+from stegnal.encoding import NoiseStreamEncoder
+from stegnal.evolution import EvolutionManager, _chaotic_seed_mix
+from stegnal.metrics import (
     audio_fidelity_score,
     composite_score,
     compute_metrics,
@@ -22,8 +22,8 @@ from umbra.metrics import (
     readability_score,
     team_cohesion_score,
 )
-from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
-from umbra.visualization import multiplicative_overlap
+from stegnal.reconstruction import suggest_sample_rate, suggest_transmission_profile
+from stegnal.visualization import multiplicative_overlap
 
 
 def test_evolution_generation_and_persistence(tmp_path) -> None:

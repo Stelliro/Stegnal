@@ -1,8 +1,8 @@
 import numpy as np
+import pytest
 from PIL import Image
 
-import pytest
-from umbra.ui import PinterestDatasetEntry, PinterestDatasetManager
+from stegnal.ui import PinterestDatasetEntry, PinterestDatasetManager
 
 pytestmark = pytest.mark.skip(reason="Legacy Pinterest dataset manager — UI was rewritten for audio experiment focus")
 

@@ -17,21 +17,21 @@ from .audio import AUDIO_SCALE_FACTOR, image_data_to_audio
 
 logger = logging.getLogger("evolution")
 
-_HYPER_MODE = os.environ.get("UMBRA_HYPER_MODE", "").strip() not in ("", "0", "false")
+_HYPER_MODE = os.environ.get("STEGNAL_HYPER_MODE", "").strip() not in ("", "0", "false")
 
 _VALID_COMPUTE_MODES = ("cpu", "gpu", "hybrid")
 
 
 def _env_compute_mode() -> str:
-    """Default compute mode from ``UMBRA_COMPUTE_MODE`` (cpu|gpu|hybrid)."""
-    mode = os.environ.get("UMBRA_COMPUTE_MODE", "cpu").strip().lower()
+    """Default compute mode from ``STEGNAL_COMPUTE_MODE`` (cpu|gpu|hybrid)."""
+    mode = os.environ.get("STEGNAL_COMPUTE_MODE", "cpu").strip().lower()
     return mode if mode in _VALID_COMPUTE_MODES else "cpu"
 
 
 def _env_gpu_fraction() -> float:
-    """Default GPU share for hybrid mode from ``UMBRA_GPU_FRACTION`` (0.0-1.0)."""
+    """Default GPU share for hybrid mode from ``STEGNAL_GPU_FRACTION`` (0.0-1.0)."""
     try:
-        value = float(os.environ.get("UMBRA_GPU_FRACTION", "0.5"))
+        value = float(os.environ.get("STEGNAL_GPU_FRACTION", "0.5"))
     except ValueError:
         value = 0.5
     return min(1.0, max(0.0, value))
@@ -48,8 +48,8 @@ def _cupy_available() -> bool:
 
 
 def _env_unlock_genes() -> bool:
-    """Default for color/gamma gene unlocking from ``UMBRA_UNLOCK_GENES``."""
-    return os.environ.get("UMBRA_UNLOCK_GENES", "").strip().lower() in ("1", "true", "yes", "on")
+    """Default for color/gamma gene unlocking from ``STEGNAL_UNLOCK_GENES``."""
+    return os.environ.get("STEGNAL_UNLOCK_GENES", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -130,7 +130,7 @@ class Heritage:
     cumulative_reward: float = 0.0
     wins: int = 0                      # times this lineage topped a generation
 
-    def child(self, other: "Heritage", *, generation: int, parent_seeds: list) -> "Heritage":
+    def child(self, other: Heritage, *, generation: int, parent_seeds: list) -> Heritage:
         """Breed a child heritage: inherit the stronger competence + deepen."""
         return Heritage(
             competence=max(self.competence, other.competence),
@@ -296,15 +296,15 @@ class EvolutionManager:
         # Adaptive difficulty: gated on SSIM so we only make it harder once the
         # population is doing well, and credit the difficulty back into the reward.
         self.difficulty_min_ssim = (
-            _env_float("UMBRA_DIFFICULTY_MIN_SSIM", _DIFFICULTY_MIN_SSIM)
+            _env_float("STEGNAL_DIFFICULTY_MIN_SSIM", _DIFFICULTY_MIN_SSIM)
             if difficulty_min_ssim is None else float(difficulty_min_ssim)
         )
         self.difficulty_step = (
-            _env_float("UMBRA_DIFFICULTY_STEP", _DIFFICULTY_STEP)
+            _env_float("STEGNAL_DIFFICULTY_STEP", _DIFFICULTY_STEP)
             if difficulty_step is None else float(difficulty_step)
         )
         self.difficulty_reward_weight = (
-            _env_float("UMBRA_DIFFICULTY_REWARD_WEIGHT", _DIFFICULTY_REWARD_WEIGHT)
+            _env_float("STEGNAL_DIFFICULTY_REWARD_WEIGHT", _DIFFICULTY_REWARD_WEIGHT)
             if difficulty_reward_weight is None else float(difficulty_reward_weight)
         )
         self.difficulty = 0.1            # current channel difficulty (encoder sigma)

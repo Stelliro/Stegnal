@@ -92,7 +92,7 @@ class DifficultyController:
         }
 
     @classmethod
-    def from_state(cls, state: dict) -> "DifficultyController":
+    def from_state(cls, state: dict) -> DifficultyController:
         ctrl = cls(
             target_ssim=state.get("target_ssim", 0.5),
             max_step=state.get("max_step", 0.05),

@@ -1,8 +1,8 @@
 <#
-  launch_umbra_ui.ps1 — PowerShell launcher for the Umbra desktop explorer.
+  launch_stegnal_ui.ps1 — PowerShell launcher for the Stegnal desktop explorer.
 
-  Mirrors launch_umbra_ui.bat: prefers a dedicated .venv (Python 3.12), creating
-  and populating it on first run, then launches `python -m umbra ui`. Validates
+  Mirrors launch_stegnal_ui.bat: prefers a dedicated .venv (Python 3.12), creating
+  and populating it on first run, then launches `python -m stegnal ui`. Validates
   the venv by actually running it, so a venv whose base Python was removed is
   rebuilt instead of failing later.
 #>
@@ -39,11 +39,11 @@ if (-not (Test-PyOk $venvPy)) {
 }
 
 # Ensure the package is importable; install on first run.
-& $venvPy -c "import umbra" *> $null
+& $venvPy -c "import stegnal" *> $null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[SYSTEM] Installing Umbra + UI dependencies (first run; may take a minute)..."
+    Write-Host "[SYSTEM] Installing Stegnal + UI dependencies (first run; may take a minute)..."
     & $venvPy -m pip install -e ".[ui]"
     if ($LASTEXITCODE -ne 0) { Write-Error "Failed to install dependencies."; exit $LASTEXITCODE }
 }
 
-& $venvPy -m umbra ui @Args
+& $venvPy -m stegnal ui @Args

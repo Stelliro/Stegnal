@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from umbra import reconstruction
-from umbra.reconstruction import (
+from stegnal import reconstruction
+from stegnal.reconstruction import (
     create_variations,
     generate_shape_collage,
     image_to_waveform,

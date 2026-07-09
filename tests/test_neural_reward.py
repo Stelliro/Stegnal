@@ -1,6 +1,6 @@
 import numpy as np
 
-from umbra.neural import NeuralRewardModel
+from stegnal.neural import NeuralRewardModel
 
 
 def test_neural_reward_model_handles_large_batches() -> None:

@@ -1,4 +1,4 @@
-"""Test fixtures for Project Umbra."""
+"""Test fixtures for Stegnal."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import numpy as np
 import pytest
 from skimage import filters
 
-import umbra.reconstruction as reconstruction
+import stegnal.reconstruction as reconstruction
 
 
 class _CuPyStub:
     """Minimal CuPy stand-in that delegates operations to NumPy."""
 
-    _umbra_skip_nvrtc_check = True
+    _stegnal_skip_nvrtc_check = True
     float32 = np.float32
     ndarray = np.ndarray
 
@@ -160,7 +160,7 @@ class _CuPyStub:
 def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure GPU-requiring code paths see a CuPy-compatible backend during tests."""
 
-    import umbra.gpu_runtime as gpu_runtime
+    import stegnal.gpu_runtime as gpu_runtime
 
     monkeypatch.setattr(gpu_runtime, "cp", _CuPyStub, raising=False)
     monkeypatch.setattr(gpu_runtime, "_NVRTC_CHECKED", True, raising=False)
@@ -173,7 +173,7 @@ def _install_cupy_stub(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(reconstruction, "cp", _CuPyStub, raising=False)
 
-    import umbra.encoding as encoding
+    import stegnal.encoding as encoding
 
     monkeypatch.setattr(encoding, "cp", _CuPyStub, raising=False)
 

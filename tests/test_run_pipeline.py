@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from umbra.pipeline import run_pipeline
+from stegnal.pipeline import run_pipeline
 
 
 def _make_image(path: Path, size: int = 64) -> None:

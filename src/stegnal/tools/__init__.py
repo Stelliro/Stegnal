@@ -1,4 +1,4 @@
-"""Utility front-ends and desktop helpers for Project Umbra."""
+"""Utility front-ends and desktop helpers for Stegnal."""
 
 from __future__ import annotations
 

@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-import umbra.codec as codec_module
-from umbra.codec import (
+import stegnal.codec as codec_module
+from stegnal.codec import (
     DecodedWavMetadata,
     _ensure_rgb_image,
     decode_image_to_text,
@@ -14,7 +14,7 @@ from umbra.codec import (
     encode_text_to_wav_bytes,
     encode_text_to_waveform,
 )
-from umbra.metrics import compute_metrics
+from stegnal.metrics import compute_metrics
 
 
 def _random_image(size: int = 8) -> np.ndarray:

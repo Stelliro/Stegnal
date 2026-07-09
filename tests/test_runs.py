@@ -1,12 +1,8 @@
-"""Tests for umbra.runs — run directory management and history persistence."""
+"""Tests for stegnal.runs — run directory management and history persistence."""
 
 from __future__ import annotations
 
-import json
-
-import pytest
-
-from umbra.runs import append_history, get_run_paths, load_history, new_run
+from stegnal.runs import append_history, get_run_paths, load_history, new_run
 
 
 def test_new_run_creates_directory(tmp_path):
@@ -31,7 +27,7 @@ def test_get_run_paths_creates_directory(tmp_path):
 
 def test_append_and_load_history_json_fallback(tmp_path, monkeypatch):
     """Test history persistence with the JSON fallback (no pandas)."""
-    import umbra.runs as runs_mod
+    import stegnal.runs as runs_mod
     monkeypatch.setattr(runs_mod, "pd", None)
 
     run_id = "json_test"
@@ -45,7 +41,7 @@ def test_append_and_load_history_json_fallback(tmp_path, monkeypatch):
 
 
 def test_append_history_replace_mode(tmp_path, monkeypatch):
-    import umbra.runs as runs_mod
+    import stegnal.runs as runs_mod
     monkeypatch.setattr(runs_mod, "pd", None)
 
     run_id = "replace_test"
@@ -58,7 +54,7 @@ def test_append_history_replace_mode(tmp_path, monkeypatch):
 
 
 def test_load_history_returns_empty_when_missing(tmp_path, monkeypatch):
-    import umbra.runs as runs_mod
+    import stegnal.runs as runs_mod
     monkeypatch.setattr(runs_mod, "pd", None)
 
     history = load_history("nonexistent", base_dir=tmp_path)
@@ -66,7 +62,7 @@ def test_load_history_returns_empty_when_missing(tmp_path, monkeypatch):
 
 
 def test_append_history_with_dict_input(tmp_path, monkeypatch):
-    import umbra.runs as runs_mod
+    import stegnal.runs as runs_mod
     monkeypatch.setattr(runs_mod, "pd", None)
 
     run_id = "single_dict"

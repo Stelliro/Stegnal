@@ -1,6 +1,6 @@
 # testing.py
 
-"""Test utilities for validating the Umbra pipeline without the UI."""
+"""Test utilities for validating the Stegnal pipeline without the UI."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from umbra.codec import (
+from stegnal.codec import (
     decode_wav_bytes_to_image,
     decode_waveform_to_image,
     encode_image_to_wav_bytes,
     encode_image_to_waveform,
 )
-from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
-from umbra.metrics import ReconstructionMetrics, compute_metrics
-from umbra.predictor import predict_post_audio_image
-from umbra.reconstruction import suggest_sample_rate, suggest_transmission_profile
+from stegnal.decoding import NoiseStreamDecoder
+from stegnal.encoding import NoiseStreamEncoder
+from stegnal.metrics import ReconstructionMetrics, compute_metrics
+from stegnal.predictor import predict_post_audio_image
+from stegnal.reconstruction import suggest_sample_rate, suggest_transmission_profile
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ def run_audio_roundtrip_experiment(
     segments: int | None = None,
     marker_duration: float | None = None,
 ) -> AudioRoundtripResult:
-    """Run the core Umbra audio experiment.
+    """Run the core Stegnal audio experiment.
 
     Flow:
       1. AI (predictor) guesses what the image will look like after audio processing.

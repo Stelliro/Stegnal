@@ -1,13 +1,12 @@
-"""Tests for umbra.config — load/save with validation and atomic writes."""
+"""Tests for stegnal.config — load/save with validation and atomic writes."""
 
 from __future__ import annotations
 
 import json
-import os
 
 import pytest
 
-from umbra.config import DEFAULT_CONFIG, load_config, save_config
+from stegnal.config import DEFAULT_CONFIG, load_config, save_config
 
 
 @pytest.fixture()

@@ -1,10 +1,10 @@
 @echo off
 cd /d "%~dp0"
-title Project Umbra // Terminal
+title Stegnal // Terminal
 color 0b
 
 echo ========================================================
-echo        PROJECT UMBRA // TERMINAL (app.py)
+echo        STEGNAL // TERMINAL (app.py)
 echo ========================================================
 echo.
 

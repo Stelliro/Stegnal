@@ -1,7 +1,7 @@
 # metrics.py
 
 """
-Evaluation utilities for Project Umbra.
+Evaluation utilities for Stegnal.
 Using Sigmoid gating to encourage climbing out of local minima.
 """
 

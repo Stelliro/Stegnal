@@ -1,6 +1,6 @@
 # __init__.py
 
-"""Project Umbra package."""
+"""Stegnal package."""
 
 from .codec import (
     decode_wav_bytes_to_image,

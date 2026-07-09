@@ -1,13 +1,12 @@
-"""Tests for umbra.adversarial — generator transforms and co-evolution."""
+"""Tests for stegnal.adversarial — generator transforms and co-evolution."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from umbra.adversarial import (
+from stegnal.adversarial import (
     AdversarialManager,
-    CoevolutionState,
     GeneratorParams,
     apply_generator,
 )

@@ -94,7 +94,7 @@ def allocate_pinned_array(shape: Iterable[int], dtype: np.dtype | type = np.floa
     else:
         # Ensure the pinned owner is retained even if CuPy discards it.
         try:
-            setattr(array, "_umbra_pinned_owner", pinned)
+            setattr(array, "_stegnal_pinned_owner", pinned)
         except AttributeError:  # pragma: no cover - ndarray may disallow attributes
             pass
     return array
@@ -180,7 +180,7 @@ def describe_last_error() -> str | None:
 def _iter_candidate_directories():
     """Yield directories that may contain NVRTC libraries."""
     # Custom hint paths
-    hints = os.environ.get("UMBRA_NVRTC_PATH_HINTS", "")
+    hints = os.environ.get("STEGNAL_NVRTC_PATH_HINTS", "")
     if hints:
         for hint in hints.split(os.pathsep):
             hint_path = Path(hint.strip())
@@ -389,7 +389,7 @@ def require_gpu(operation: str) -> None:
             f"GPU acceleration via CuPy is required for {operation}; CPU fallback is disabled."
         )
 
-    if getattr(cp, "_umbra_skip_nvrtc_check", False):  # pragma: no cover - exercised in tests
+    if getattr(cp, "_stegnal_skip_nvrtc_check", False):  # pragma: no cover - exercised in tests
         return
 
     if ensure_nvrtc_configured():

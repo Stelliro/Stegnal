@@ -1,15 +1,13 @@
-"""Tests for umbra.decoding — NoiseStreamDecoder and gene corrections."""
+"""Tests for stegnal.decoding — NoiseStreamDecoder and gene corrections."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import pytest
 
-from umbra.decoding import DiffusionInpainter, NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
+from stegnal.decoding import DiffusionInpainter, NoiseStreamDecoder
+from stegnal.encoding import NoiseStreamEncoder
 
 
 @dataclass

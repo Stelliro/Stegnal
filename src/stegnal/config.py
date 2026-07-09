@@ -5,7 +5,7 @@ import tempfile
 
 logger = logging.getLogger(__name__)
 
-CONFIG_FILE = "umbra_settings.json"
+CONFIG_FILE = "stegnal_settings.json"
 
 DEFAULT_CONFIG = {
     "audio_out_index": 0,

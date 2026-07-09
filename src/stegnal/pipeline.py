@@ -1,6 +1,6 @@
 # pipeline.py
 
-"""High-level helpers for the Project Umbra toy pipeline."""
+"""High-level helpers for the Stegnal toy pipeline."""
 
 from __future__ import annotations
 

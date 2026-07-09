@@ -1,9 +1,9 @@
 # ui.py
 """
-PROJECT UMBRA — Focused Audio Roundtrip Experiment UI
+STEGNAL — Focused Audio Roundtrip Experiment UI
 
-This is the main desktop UI launched by launch_umbra_ui.bat / launch_umbra_ui.ps1
-via `python -m umbra ui`.
+This is the main desktop UI launched by launch_stegnal_ui.bat / launch_stegnal_ui.ps1
+via `python -m stegnal ui`.
 
 Core purpose:
   - Load an image
@@ -15,27 +15,29 @@ Core purpose:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from dataclasses import dataclass
 from pathlib import Path
-import hashlib
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageTk
 
-# Core experiment
-from .testing import run_audio_roundtrip_experiment
 from .audio_mixer import AudioEngine
 from .codec import (
-    encode_image_to_waveform, 
     decode_waveform_to_image,
+    encode_image_to_waveform,
     encode_text_to_wav_bytes,
-    decode_wav_bytes_to_text
 )
+
+# Core experiment
+from .testing import run_audio_roundtrip_experiment
 
 # For audio playback + saving WAV
 sd = None
@@ -56,7 +58,7 @@ try:
 except Exception:
     encode_image_to_wav_bytes = None  # type: ignore
 
-logger = logging.getLogger("Umbra")
+logger = logging.getLogger("Stegnal")
 
 # --------------------------- THEME ---------------------------
 
@@ -114,12 +116,12 @@ def setup_dark_style(style: ttk.Style) -> None:
               bordercolor=[("focus", ACCENT)])
 
 
-class UmbraAudioUI:
+class StegnalAudioUI:
     """Clean, focused UI for the audio roundtrip + prediction experiment."""
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("PROJECT UMBRA // Audio Fidelity Experiment")
+        self.root.title("STEGNAL // Audio Fidelity Experiment")
         self.root.geometry("1400x900")
         self.root.minsize(1200, 800)
         self.root.configure(bg=DARK_BG)
@@ -157,7 +159,7 @@ class UmbraAudioUI:
         # Header
         header = ttk.Frame(self.root, padding=(16, 12))
         header.pack(fill=tk.X)
-        ttk.Label(header, text="PROJECT UMBRA", font=("Consolas", 20, "bold"), foreground=ACCENT).pack(side=tk.LEFT)
+        ttk.Label(header, text="STEGNAL", font=("Consolas", 20, "bold"), foreground=ACCENT).pack(side=tk.LEFT)
         ttk.Label(header, text="  //  Audio Transfer Fidelity Test", font=("Consolas", 14), foreground=MUTED).pack(side=tk.LEFT)
 
         # Controls - split into rows for better visibility in dark theme
@@ -306,7 +308,7 @@ class UmbraAudioUI:
         root_log = logging.getLogger()
         if not any(isinstance(hh, UILogHandler) for hh in root_log.handlers):
             root_log.addHandler(h)
-        logging.getLogger("Umbra").setLevel(logging.INFO)
+        logging.getLogger("Stegnal").setLevel(logging.INFO)
 
     # --------------------------- HELPERS ---------------------------
 
@@ -605,7 +607,6 @@ class UmbraAudioUI:
             from .metrics import compute_metrics
             m = compute_metrics(ref, recon)
             # Simple proxies for real
-            i2a_proxy = 0.7
             a2i_real = float(np.clip(0.5 * m.ssim + 0.5 * min((m.psnr - 10)/25, 1.0), 0, 1))
             self.score_labels["a2i"].config(text=f"{a2i_real:.4f} (real)")
             self.score_labels["comp"].config(text=f"real~{a2i_real:.3f}")
@@ -678,8 +679,9 @@ class UmbraAudioUI:
             # For text, we can use the text codec which embeds in image then waveform
             wav_bytes = encode_text_to_wav_bytes(text, direct=True)  # if supported, else fallback
             # Load as array for transmit
-            from scipy.io import wavfile as wv
             import io as _io
+
+            from scipy.io import wavfile as wv
             with _io.BytesIO(wav_bytes) as bio:
                 sr, wav_data = wv.read(bio)
             if wav_data.ndim > 1:
@@ -752,9 +754,11 @@ class UmbraAudioUI:
 
         base_res = self.res_var.get()
 
-        from skimage.transform import resize
-        from .metrics import compute_metrics
         import random
+
+        from skimage.transform import resize
+
+        from .metrics import compute_metrics
 
         ref_small = resize(self.reference, (base_res, base_res, 3), preserve_range=True).astype(np.float32)
         ref_small = np.clip(ref_small, 0, 1)
@@ -824,7 +828,7 @@ class UmbraAudioUI:
             try:
                 from scipy.stats import pearsonr
                 wf_corr = abs(pearsonr(waveform[:len(captured)], captured[:len(waveform)])[0])
-            except:
+            except Exception:
                 wf_corr = 0.0
             score = max(score, wf_corr * 0.5)  # boost if waveform matches better
 
@@ -864,11 +868,9 @@ class UmbraAudioUI:
 # tests continue to import without restoring the old 30k-line bloat.
 # ------------------------------------------------------------------
 
-from dataclasses import dataclass
-from typing import Any
 
 @dataclass
-class UmbraAppState:
+class StegnalAppState:
     """Minimal stub for legacy tests."""
     reference_image: Any = None
     difficulty: float = 0.1
@@ -888,12 +890,12 @@ def _normalize_pinterest_url(url: str) -> str:
         return url.split("?")[0]
     return url
 
-def _generate_unique_model_path(base_dir: str | Path, prefix: str = "umbra_model") -> Path:
+def _generate_unique_model_path(base_dir: str | Path, prefix: str = "stegnal_model") -> Path:
     """Stub that just returns a timestamped path."""
     import time
     base = Path(base_dir)
     base.mkdir(parents=True, exist_ok=True)
-    return base / f"{prefix}_{int(time.time())}.umbra.json"
+    return base / f"{prefix}_{int(time.time())}.stegnal.json"
 
 class PinterestDatasetEntry:
     """Stub for test_pinterest_dataset."""
@@ -921,12 +923,12 @@ class PinterestDatasetManager:
         pass
 
 # ------------------------------------------------------------------
-# ENTRYPOINT (used by launch_umbra_ui.bat / python -m umbra ui)
+# ENTRYPOINT (used by launch_stegnal_ui.bat / python -m stegnal ui)
 # ------------------------------------------------------------------
 
 def main():
     root = tk.Tk()
-    app = UmbraAudioUI(root)
+    StegnalAudioUI(root)
     root.mainloop()
 
 

@@ -454,7 +454,6 @@ def reconstruct_from_waveform(
         rows_per_seg = max(1, h // max(1, detected_segments))
 
         result = np.zeros((h, w, 3), dtype=np.float32)
-        ch_pixels = pixels_per_channel
         for seg_idx in range(detected_segments):
             seg_start = seg_idx * segment_total
             seg_end = min(seg_start + sample_rate, waveform.size)

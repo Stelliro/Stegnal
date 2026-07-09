@@ -1,6 +1,6 @@
 # neural.py
 
-"""Neural helpers for adaptive reward modelling in Project Umbra."""
+"""Neural helpers for adaptive reward modelling in Stegnal."""
 
 from __future__ import annotations
 

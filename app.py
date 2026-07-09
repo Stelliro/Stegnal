@@ -12,13 +12,13 @@ import sounddevice as sd
 from PIL import Image
 from scipy.io import wavfile
 
-from umbra.audio import audio_to_image_data, image_data_to_audio
-from umbra.audio_mixer import EnvironmentMonitor
-from umbra.decoding import NoiseStreamDecoder
-from umbra.testing import run_audio_roundtrip_experiment
+from stegnal.audio import audio_to_image_data, image_data_to_audio
+from stegnal.audio_mixer import EnvironmentMonitor
+from stegnal.decoding import NoiseStreamDecoder
 
-# --- UMBRA IMPORTS ---
-from umbra.encoding import NoisePacket, NoiseStreamEncoder
+# --- STEGNAL IMPORTS ---
+from stegnal.encoding import NoisePacket, NoiseStreamEncoder
+from stegnal.testing import run_audio_roundtrip_experiment
 
 # --- THE GOD GENE (UNIVERSAL KEY) ---
 GOD_GENE = {
@@ -39,12 +39,12 @@ FONT_UI = ("Roboto Medium", 13)
 FONT_HEADER = ("Roboto Medium", 20)
 FONT_MONO = ("Consolas", 12)
 
-class UmbraTerminal(ctk.CTk):
+class StegnalTerminal(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         # --- 1. WINDOW SETUP ---
-        self.title("PROJECT UMBRA // TERMINAL")
+        self.title("STEGNAL // TERMINAL")
         self.geometry("1280x850")
         ctk.set_appearance_mode("dark")
         
@@ -75,7 +75,7 @@ class UmbraTerminal(ctk.CTk):
         self.sidebar.grid_rowconfigure(10, weight=1)
 
         # Logo & Version
-        self.lbl_logo = ctk.CTkLabel(self.sidebar, text="PROJECT UMBRA", font=FONT_HEADER, text_color=COLOR_ACCENT)
+        self.lbl_logo = ctk.CTkLabel(self.sidebar, text="STEGNAL", font=FONT_HEADER, text_color=COLOR_ACCENT)
         self.lbl_logo.pack(pady=(30, 10), padx=20)
         
         self.lbl_version = ctk.CTkLabel(self.sidebar, text="v0.9.2 // CLASSIFIED", font=FONT_MONO, text_color="gray")
@@ -224,7 +224,7 @@ class UmbraTerminal(ctk.CTk):
         self.header_frame = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
         self.header_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
         
-        self.lbl_title = ctk.CTkLabel(self.header_frame, text="PROJECT UMBRA", font=("Roboto", 24, "bold"), text_color="white")
+        self.lbl_title = ctk.CTkLabel(self.header_frame, text="STEGNAL", font=("Roboto", 24, "bold"), text_color="white")
         self.lbl_title.pack(side="left")
         
         self.lbl_subtitle = ctk.CTkLabel(self.header_frame, text=" // NEURAL STEGANOGRAPHY LINK", font=("Roboto", 24), text_color="gray")
@@ -455,9 +455,11 @@ class UmbraTerminal(ctk.CTk):
             self.dec_image_ref = ctk_act
 
             # Make a proper experiment WAV (using the direct high-fid path) for playback
-            from umbra.codec import encode_image_to_wav_bytes
-            from scipy.io import wavfile as wv
             import io
+
+            from scipy.io import wavfile as wv
+
+            from stegnal.codec import encode_image_to_wav_bytes
             wavb = encode_image_to_wav_bytes(self.current_image, direct=True)
             bio = io.BytesIO(wavb)
             sr, aud = wv.read(bio)
@@ -552,5 +554,5 @@ class UmbraTerminal(ctk.CTk):
             messagebox.showerror("Decode Error", f"Failed to reconstruct packet.\n{str(e)}")
 
 if __name__ == "__main__":
-    app = UmbraTerminal()
+    app = StegnalTerminal()
     app.mainloop()

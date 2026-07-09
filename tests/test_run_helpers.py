@@ -1,10 +1,10 @@
-"""Tests for umbra.run_helpers — path sanitization and run directory setup."""
+"""Tests for stegnal.run_helpers — path sanitization and run directory setup."""
 
 from __future__ import annotations
 
 import pytest
 
-from umbra.run_helpers import RunPaths, chart_file, ensure_run_paths, runs_root
+from stegnal.run_helpers import chart_file, ensure_run_paths, runs_root
 
 
 def test_runs_root_creates_directory(tmp_path):

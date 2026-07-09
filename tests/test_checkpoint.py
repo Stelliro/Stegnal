@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from umbra.checkpoint import UmbraModel, candidate_feature_vector
-from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
-from umbra.evolution import EvolutionManager
+from stegnal.checkpoint import StegnalModel, candidate_feature_vector
+from stegnal.decoding import NoiseStreamDecoder
+from stegnal.encoding import NoiseStreamEncoder
+from stegnal.evolution import EvolutionManager
 
 
 def _fake_batch(rng, n=8):
@@ -18,7 +18,7 @@ def _fake_batch(rng, n=8):
 
 def test_train_records_metadata():
     rng = np.random.default_rng(0)
-    model = UmbraModel(name="m1")
+    model = StegnalModel(name="m1")
     feats, rewards = _fake_batch(rng)
     info = model.train(feats, rewards, source="simulation",
                        peers=[{"seed": 7, "reward": 99.0, "generation": 1}])
@@ -32,14 +32,14 @@ def test_train_records_metadata():
 
 def test_save_load_roundtrip_preserves_everything(tmp_path):
     rng = np.random.default_rng(1)
-    model = UmbraModel(name="roundtrip")
+    model = StegnalModel(name="roundtrip")
     feats, rewards = _fake_batch(rng)
     model.train(feats, rewards, source="acoustic", recordings=["take_000.wav"])
 
-    path = model.save(tmp_path / "model")          # no suffix -> .umbra.json
+    path = model.save(tmp_path / "model")          # no suffix -> .stegnal.json
     assert path.exists() and path.suffix == ".json"
 
-    loaded = UmbraModel.load(tmp_path / "model")
+    loaded = StegnalModel.load(tmp_path / "model")
     assert loaded.name == "roundtrip"
     assert loaded.total_samples == model.total_samples
     assert loaded.generations_trained == model.generations_trained
@@ -51,12 +51,12 @@ def test_save_load_roundtrip_preserves_everything(tmp_path):
 
 def test_load_then_continue_training(tmp_path):
     rng = np.random.default_rng(2)
-    model = UmbraModel()
+    model = StegnalModel()
     f1, r1 = _fake_batch(rng)
     model.train(f1, r1)
-    model.save(tmp_path / "ck.umbra.json")
+    model.save(tmp_path / "ck.stegnal.json")
 
-    reloaded = UmbraModel.load(tmp_path / "ck.umbra.json")
+    reloaded = StegnalModel.load(tmp_path / "ck.stegnal.json")
     samples_before = reloaded.reward_model._samples_seen
     f2, r2 = _fake_batch(rng)
     reloaded.train(f2, r2, source="acoustic")
@@ -76,7 +76,7 @@ def test_train_from_generation():
         base_seed=5, enable_waveform=False,
     )
     mgr.run_generation()
-    model = UmbraModel()
+    model = StegnalModel()
     info = model.train_from_generation(mgr, source="simulation")
     assert info["samples"] == len(mgr.generations[-1].candidates) or info["samples"] >= 0
     assert model.generations_trained == 1
@@ -100,14 +100,14 @@ def test_candidate_feature_vector_shape():
 
 def test_champion_roundtrip(tmp_path):
     rng = np.random.default_rng(0)
-    model = UmbraModel(name="champ")
+    model = StegnalModel(name="champ")
     feats, rewards = _fake_batch(rng)
     model.train(feats, rewards)
     model.champion = {
         "difficulty_cleared": 0.3, "reward": 30.5, "ssim": 0.5, "psnr": 20.0,
         "generation": 7, "genes": {"denoise_sigma": 0.4},
     }
-    loaded = UmbraModel.load(model.save(tmp_path / "c.umbra.json"))
+    loaded = StegnalModel.load(model.save(tmp_path / "c.stegnal.json"))
     assert loaded.champion["difficulty_cleared"] == 0.3
     assert loaded.champion["reward"] == 30.5
     assert "champion cleared difficulty" in loaded.summary()
@@ -120,7 +120,7 @@ def test_train_from_generation_captures_champion():
     )
     for _ in range(5):
         mgr.evolve_generation(0.1)
-    model = UmbraModel()
+    model = StegnalModel()
     model.train_from_generation(mgr, source="simulation")
     assert model.champion is not None
     assert model.champion["difficulty_cleared"] >= 0.01

@@ -1,12 +1,11 @@
-"""Tests for umbra.logging_utils — structured logging and provenance."""
+"""Tests for stegnal.logging_utils — structured logging and provenance."""
 
 from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 
-from umbra.logging_utils import JsonFormatter, configure_logging
+from stegnal.logging_utils import JsonFormatter, configure_logging
 
 
 def test_json_formatter_emits_valid_json():

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from umbra.visualization import (
+from stegnal.visualization import (
     _feature_weight_map,
     _overlap_against_constant,
     _weighted_overlap_score,

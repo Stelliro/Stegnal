@@ -1,6 +1,6 @@
 import numpy as np
 
-import umbra.predictor as predictor
+import stegnal.predictor as predictor
 
 
 def test_predictor_falls_back_without_torch(monkeypatch) -> None:
@@ -100,7 +100,7 @@ def test_predict_post_audio_image_basic():
 
 
 def test_audio_experiment_end_to_end():
-    from umbra.testing import run_audio_roundtrip_experiment
+    from stegnal.testing import run_audio_roundtrip_experiment
     rng = np.random.default_rng(7)
     img = rng.random((40, 40, 3), dtype=np.float32)
     res = run_audio_roundtrip_experiment(img)

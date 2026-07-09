@@ -1,4 +1,4 @@
-"""Desktop helper for inspecting saved Umbra models and testing conversions."""
+"""Desktop helper for inspecting saved Stegnal models and testing conversions."""
 
 from __future__ import annotations
 
@@ -13,13 +13,13 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from umbra.reconstruction import (
+from stegnal.reconstruction import (
     image_to_waveform,
     reconstruct_from_waveform,
     waveform_to_wav_bytes,
 )
-from umbra.run_helpers import runs_root
-from umbra.sound import load_waveform_from_wav
+from stegnal.run_helpers import runs_root
+from stegnal.sound import load_waveform_from_wav
 
 
 @dataclass
@@ -223,7 +223,7 @@ class ModelViewerApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Umbra Model Viewer")
+        self.root.title("Stegnal Model Viewer")
         self.root.geometry("900x540")
 
         self.score_var = tk.StringVar(value="Select a model to inspect its score.")

@@ -2,17 +2,17 @@ import itertools
 
 import pytest
 
-import umbra.ui as ui
-from umbra.metrics import (
+import stegnal.ui as ui
+from stegnal.metrics import (
     ReconstructionMetrics,
     audio_fidelity_score,
     composite_score,
     readability_score,
     team_cohesion_score,
 )
-from umbra.ui import UmbraAppState, _generate_unique_model_path, _normalize_pinterest_url
+from stegnal.ui import StegnalAppState, _generate_unique_model_path, _normalize_pinterest_url
 
-pytestmark = pytest.mark.skip(reason="Legacy UmbraAppState / Pinterest tests — UI was rewritten for audio experiment focus")
+pytestmark = pytest.mark.skip(reason="Legacy StegnalAppState / Pinterest tests — UI was rewritten for audio experiment focus")
 
 
 def test_compute_composite_score_increases_with_metrics() -> None:
@@ -38,7 +38,7 @@ def test_readability_score_tracks_metrics() -> None:
 
 
 def test_app_state_records_generations() -> None:
-    state = UmbraAppState()
+    state = StegnalAppState()
     metrics = ReconstructionMetrics(psnr=42.0, ssim=0.92)
 
     sound_metrics = ReconstructionMetrics(psnr=28.0, ssim=0.66)

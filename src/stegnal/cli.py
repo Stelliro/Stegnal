@@ -1,6 +1,6 @@
 # cli.py
 
-"""Command-line interface for Project Umbra's test build."""
+"""Command-line interface for Stegnal's test build."""
 
 from __future__ import annotations
 
@@ -135,7 +135,7 @@ def command_ui(_args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Project Umbra toy pipeline CLI")
+    parser = argparse.ArgumentParser(description="Stegnal toy pipeline CLI")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
 

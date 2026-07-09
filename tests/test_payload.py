@@ -1,11 +1,11 @@
-"""Tests for umbra.payload — DataPayloadCodec encode/decode."""
+"""Tests for stegnal.payload — DataPayloadCodec encode/decode."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from umbra.payload import DataPayloadCodec
+from stegnal.payload import DataPayloadCodec
 
 
 @pytest.fixture()
@@ -14,7 +14,7 @@ def codec():
 
 
 def test_round_trip_recovers_data(codec):
-    original = b"Hello, Umbra!"
+    original = b"Hello, Stegnal!"
     encoded = codec.encode_file(original, shape=(256, 256))
     recovered = codec.decode_image(encoded)
     assert recovered == original

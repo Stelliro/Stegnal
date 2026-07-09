@@ -1,6 +1,6 @@
 # demo_packager.py
 
-"""Utilities for bundling shareable Umbra demo archives and executables."""
+"""Utilities for bundling shareable Stegnal demo archives and executables."""
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ from PIL import Image
 
 from .codec import encode_image_to_wav_bytes
 
-PACKAGE_NAME = "umbra_demo.pyz"
+PACKAGE_NAME = "stegnal_demo.pyz"
 
 _DEMO_MAIN = textwrap.dedent(
     """
-    \"\"\"Command-line entry point for the Umbra codec demo.\"\"\"
+    \"\"\"Command-line entry point for the Stegnal codec demo.\"\"\"
 
     from __future__ import annotations
 
@@ -34,7 +34,7 @@ _DEMO_MAIN = textwrap.dedent(
     import numpy as np
     from PIL import Image
 
-    from umbra.codec import (
+    from stegnal.codec import (
         decode_wav_bytes_to_image,
         encode_image_to_wav_bytes,
     )
@@ -65,7 +65,7 @@ _DEMO_MAIN = textwrap.dedent(
 
 
     def main(argv: list[str] | None = None) -> int:
-        parser = argparse.ArgumentParser(description="Umbra codec demo")
+        parser = argparse.ArgumentParser(description="Stegnal codec demo")
         subparsers = parser.add_subparsers(dest="command", required=True)
 
         encode_parser = subparsers.add_parser("encode", help="Encode an image to WAV")
@@ -110,7 +110,7 @@ _DEMO_MAIN = textwrap.dedent(
 _DEMO_GUI_TEMPLATE = Template(
     textwrap.dedent(
         """
-        \"\"\"Standalone Tkinter GUI demo for the Umbra codec.\"\"\"
+        \"\"\"Standalone Tkinter GUI demo for the Stegnal codec.\"\"\"
 
         import base64
         import io
@@ -121,16 +121,16 @@ _DEMO_GUI_TEMPLATE = Template(
 
         import numpy as np
 
-        from umbra.codec import decode_wav_bytes_to_image
+        from stegnal.codec import decode_wav_bytes_to_image
 
         IMAGE_B64 = "$IMAGE_B64"
         WAV_B64 = "$WAV_B64"
         METADATA = $METADATA
 
-        class UmbraDemoApp:
+        class StegnalDemoApp:
             def __init__(self, root: tk.Tk) -> None:
                 self.root = root
-                self.root.title("Umbra Demo")
+                self.root.title("Stegnal Demo")
                 self.root.geometry("800x600")
 
                 self.label = tk.Label(root, text=METADATA["label"])
@@ -167,7 +167,7 @@ _DEMO_GUI_TEMPLATE = Template(
 
         if __name__ == "__main__":
             root = tk.Tk()
-            UmbraDemoApp(root)
+            StegnalDemoApp(root)
             root.mainloop()
         """
     )
@@ -187,7 +187,7 @@ def build_demo_package(
     sample_rate: int = 48000,
     segments: int = 1,
     marker_duration: float = 0.05,
-    label: str = "Umbra Demo",
+    label: str = "Stegnal Demo",
     metadata: dict[str, Any] | None = None,
     output_dir: str | Path | None = None,
 ) -> Path:
@@ -224,17 +224,17 @@ def build_demo_package(
 
     module_root = Path(__file__).resolve().parent
     if not module_root.exists():
-        raise FileNotFoundError(f"Unable to locate Umbra sources at {module_root}")
+        raise FileNotFoundError(f"Unable to locate Stegnal sources at {module_root}")
 
     output_directory = Path(output_dir or Path.cwd() / "dist")
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="umbra_demo_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="stegnal_demo_") as tmp_dir:
         staging_root = Path(tmp_dir)
         app_root = staging_root / "app"
         app_root.mkdir(parents=True, exist_ok=True)
 
-        shutil.copytree(module_root, app_root / "umbra", dirs_exist_ok=True)
+        shutil.copytree(module_root, app_root / "stegnal", dirs_exist_ok=True)
         (app_root / "__main__.py").write_text(script, encoding="utf-8")
 
         pyz_path = output_directory / PACKAGE_NAME
@@ -248,7 +248,7 @@ def build_demo_executable(
     sample_rate: int = 48000,
     segments: int = 1,
     marker_duration: float = 0.05,
-    label: str = "Umbra Demo",
+    label: str = "Stegnal Demo",
     metadata: dict[str, Any] | None = None,
     output_dir: str | Path | None = None,
 ) -> Path:
@@ -286,23 +286,23 @@ def build_demo_executable(
 
     module_root = Path(__file__).resolve().parent
     if not module_root.exists():
-        raise FileNotFoundError(f"Unable to locate Umbra sources at {module_root}")
+        raise FileNotFoundError(f"Unable to locate Stegnal sources at {module_root}")
 
     output_directory = Path(output_dir or Path.cwd() / "dist")
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="umbra_demo_exe_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="stegnal_demo_exe_") as tmp_dir:
         staging_root = Path(tmp_dir)
         app_root = staging_root / "app"
         app_root.mkdir(parents=True, exist_ok=True)
 
-        shutil.copytree(module_root, app_root / "umbra", dirs_exist_ok=True)
+        shutil.copytree(module_root, app_root / "stegnal", dirs_exist_ok=True)
         (app_root / "__main__.py").write_text(script, encoding="utf-8")
 
-        pyz_path = staging_root / "umbra_demo.pyz"
+        pyz_path = staging_root / "stegnal_demo.pyz"
         zipapp.create_archive(app_root, target=pyz_path, interpreter="/usr/bin/env python3")
 
-        exe_path = output_directory / "umbra_demo.exe"
+        exe_path = output_directory / "stegnal_demo.exe"
         shutil.copyfile(pyz_path, exe_path)
         return exe_path
 

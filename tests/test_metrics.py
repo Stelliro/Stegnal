@@ -1,11 +1,11 @@
-"""Tests for umbra.metrics — edge cases and validation."""
+"""Tests for stegnal.metrics — edge cases and validation."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from umbra.metrics import compute_fft_score, compute_edge_score, compute_metrics
+from stegnal.metrics import compute_edge_score, compute_fft_score, compute_metrics
 
 
 def test_compute_metrics_identical_images():

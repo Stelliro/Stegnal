@@ -1,4 +1,4 @@
-# Project Umbra
+# Stegnal
 
 Experimental system for transmitting images or text over audio channels (including high-frequency/ultrasonic options for stealth), with AI-assisted prediction of the post-channel result, real over-air testing, and derivation of secure key material from the combination of AI reconstruction and physical channel characteristics.
 
@@ -37,7 +37,7 @@ See code for carrier_freq support. Real results will vary wildly by hardware, di
 
 Use the launchers (they bootstrap a Python 3.12 venv on first run):
 
-- `launch_umbra_ui.bat` — launches the focused Tkinter UI for experiments, real device selection, play/capture, and channel adaptation (`python -m umbra ui`).
+- `launch_stegnal_ui.bat` — launches the focused Tkinter UI for experiments, real device selection, play/capture, and channel adaptation (`python -m stegnal ui`).
 - `launch_terminal.bat` — the customtkinter terminal (`app.py`).
 
 ### Manual
@@ -62,7 +62,7 @@ Requires Python 3.12+ preferred. `sounddevice` for real audio I/O.
 
 ### UI (recommended for experiments)
 
-`python -m umbra ui` or via launcher.
+`python -m stegnal ui` or via launcher.
 
 - Load image or enter text.
 - Set resolution and carrier frequency (high values for ultrasonic-ish).
@@ -77,7 +77,7 @@ Supports both image and text payloads.
 
 ### CLI
 
-Basic encode/decode still supported for waveform generation (see `umbra --help`).
+Basic encode/decode still supported for waveform generation (see `stegnal --help`).
 
 For real over-air and key work, the UI is the primary interface.
 
@@ -107,7 +107,7 @@ Run tests: `pytest`
 
 Lint: `ruff check .`
 
-The UI is the main focus (`src/umbra/ui.py`); keep changes focused on real acoustic + AI prediction + key derivation.
+The UI is the main focus (`src/stegnal/ui.py`); keep changes focused on real acoustic + AI prediction + key derivation.
 
 ## License
 

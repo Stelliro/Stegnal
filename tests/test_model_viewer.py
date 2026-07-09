@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from umbra.tools.model_viewer import compute_total_score, load_model_stats
+from stegnal.tools.model_viewer import compute_total_score, load_model_stats
 
 
 def test_compute_total_score_with_metrics() -> None:

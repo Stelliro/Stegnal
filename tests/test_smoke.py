@@ -1,4 +1,4 @@
-from umbra.testing import run_smoke_test
+from stegnal.testing import run_smoke_test
 
 
 def test_smoke_test_runs_and_varies():

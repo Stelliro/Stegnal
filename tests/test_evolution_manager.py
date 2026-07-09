@@ -2,10 +2,10 @@ import importlib
 
 import numpy as np
 
-from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
-from umbra.evolution import EvolutionLimitReached, EvolutionManager
-from umbra.neural import NeuralRewardModel
+from stegnal.decoding import NoiseStreamDecoder
+from stegnal.encoding import NoiseStreamEncoder
+from stegnal.evolution import EvolutionLimitReached, EvolutionManager
+from stegnal.neural import NeuralRewardModel
 
 
 def test_evolution_manager_runs_multiple_generations() -> None:
@@ -129,7 +129,7 @@ def test_reward_is_competence_led_and_escalates() -> None:
 
 
 def test_heritage_child_inherits_stronger_competence() -> None:
-    from umbra.evolution import Heritage
+    from stegnal.evolution import Heritage
 
     a = Heritage(competence=0.3, depth=2)
     b = Heritage(competence=0.5, depth=1)
@@ -304,8 +304,8 @@ def test_difficulty_respects_overlap_improvement() -> None:
 
 
 def test_hyper_mode_profile_adapts(monkeypatch) -> None:
-    monkeypatch.setenv("UMBRA_HYPER_MODE", "1")
-    import umbra.evolution as evolution
+    monkeypatch.setenv("STEGNAL_HYPER_MODE", "1")
+    import stegnal.evolution as evolution
 
     evolution = importlib.reload(evolution)
 
@@ -338,7 +338,7 @@ def test_hyper_mode_profile_adapts(monkeypatch) -> None:
         >= profile.batch_size * profile.dwell_generations
     )
 
-    monkeypatch.delenv("UMBRA_HYPER_MODE", raising=False)
+    monkeypatch.delenv("STEGNAL_HYPER_MODE", raising=False)
     importlib.reload(evolution)
 
 
@@ -368,8 +368,8 @@ def test_decoder_falls_back_after_cupy_oom(monkeypatch) -> None:
         def asnumpy(array):  # type: ignore[no-untyped-def]
             return np.asarray(array)
 
-    monkeypatch.setattr("umbra.decoding.cp", FakeCuPy())
-    monkeypatch.setattr("umbra.decoding.cupy_gaussian_filter", None)
+    monkeypatch.setattr("stegnal.decoding.cp", FakeCuPy())
+    monkeypatch.setattr("stegnal.decoding.cupy_gaussian_filter", None)
 
     result = decoder.decode(packet, seed, allow_cpu_fallback=True)
     np.testing.assert_allclose(result, baseline)

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from umbra.metrics import (
+from stegnal.metrics import (
     audio_fidelity_score,
     compute_ms_ssim,
     dct_band_correlation,

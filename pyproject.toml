@@ -3,11 +3,11 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "project-umbra"
+name = "stegnal"
 version = "0.2.0"
 description = "Real acoustic (ultrasonic/high-freq) image/text to audio transmission with AI post-channel prediction, secure key derivation from AI recon + physical channel fingerprint, over-air testing and adaptation."
 readme = "README.md"
-authors = [{ name = "Umbra Team" }]
+authors = [{ name = "Stegnal Team" }]
 license = { text = "PolyForm-Noncommercial-1.0.0" }
 requires-python = ">=3.9"
 dependencies = [
@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Desktop UIs: the Tkinter explorer (`umbra ui`) needs sounddevice via
-# umbra.audio_mixer; the standalone app.py "Terminal" needs customtkinter.
+# Desktop UIs: the Tkinter explorer (`stegnal ui`) needs sounddevice via
+# stegnal.audio_mixer; the standalone app.py "Terminal" needs customtkinter.
 ui = [
     "customtkinter>=5.2",
     "sounddevice>=0.4",
@@ -38,10 +38,10 @@ gpu = [
 ]
 
 [project.scripts]
-umbra = "umbra.cli:main"
+stegnal = "stegnal.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/umbra"]
+packages = ["src/stegnal"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/umbra", "README.md", "pyproject.toml"]
+include = ["src/stegnal", "README.md", "pyproject.toml"]

@@ -2,7 +2,7 @@ import zipfile
 
 import numpy as np
 
-from umbra.demo_packager import build_demo_executable
+from stegnal.demo_packager import build_demo_executable
 
 
 def test_build_demo_executable_creates_archive(tmp_path):
@@ -24,5 +24,5 @@ def test_build_demo_executable_creates_archive(tmp_path):
     with zipfile.ZipFile(output) as archive:
         names = set(archive.namelist())
         assert "__main__.py" in names
-        assert any(name.startswith("umbra/") for name in names)
+        assert any(name.startswith("stegnal/") for name in names)
 

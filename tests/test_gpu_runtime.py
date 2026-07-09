@@ -7,7 +7,7 @@ import sys
 import types
 from pathlib import Path
 
-import umbra.gpu_runtime as gpu_runtime
+import stegnal.gpu_runtime as gpu_runtime
 
 
 def test_recommend_command_uses_detected_distribution(monkeypatch):
@@ -120,7 +120,7 @@ def test_iter_candidate_directories_respects_hint(monkeypatch, tmp_path):
     hint_file = tmp_path / "nvrtc64_118_0.dll"
     hint_file.write_bytes(b"")
 
-    monkeypatch.setenv("UMBRA_NVRTC_PATH_HINTS", str(hint_file))
+    monkeypatch.setenv("STEGNAL_NVRTC_PATH_HINTS", str(hint_file))
     for env_var in ("CUPY_CUDA_PATH", "CUDA_PATH", "CUDA_HOME", "PATH"):
         monkeypatch.delenv(env_var, raising=False)
     monkeypatch.setattr(importlib_util, "find_spec", lambda name: None, raising=False)

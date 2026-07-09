@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import umbra.chart_export as chart_export
+import stegnal.chart_export as chart_export
 
 
 def test_export_chart_png_strips_params(tmp_path, monkeypatch):

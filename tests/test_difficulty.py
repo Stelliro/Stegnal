@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from umbra.difficulty import DifficultyController
+from stegnal.difficulty import DifficultyController
 
 
 def test_eases_when_below_target():

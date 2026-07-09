@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoisePacket, NoiseStreamEncoder
-from umbra.metrics import compute_metrics
+from stegnal.decoding import NoiseStreamDecoder
+from stegnal.encoding import NoisePacket, NoiseStreamEncoder
+from stegnal.metrics import compute_metrics
 
 
 def create_test_image(size: int = 64) -> np.ndarray:
@@ -41,21 +41,21 @@ def test_encode_requires_gpu_when_fallback_disabled(monkeypatch: pytest.MonkeyPa
     image = np.zeros((8, 8), dtype=np.float32)
     encoder = NoiseStreamEncoder(sigma=0.1)
 
-    import umbra.encoding as encoding
+    import stegnal.encoding as encoding
 
     monkeypatch.setattr(encoding, "cp", None, raising=False)
 
-    from umbra.reconstruction import GPUAccelerationRequiredError
+    from stegnal.reconstruction import GPUAccelerationRequiredError
 
     with pytest.raises(GPUAccelerationRequiredError):
         encoder.encode(image, seed=7, allow_cpu_fallback=False)
 
 
 def test_simulate_uwb_channel_gpu_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    import umbra.encoding as encoding
+    import stegnal.encoding as encoding
 
     class _FailingCuPyStub:
-        _umbra_skip_nvrtc_check = True
+        _stegnal_skip_nvrtc_check = True
         float32 = np.float32
 
         @staticmethod
@@ -64,7 +64,7 @@ def test_simulate_uwb_channel_gpu_failure(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(encoding, "cp", _FailingCuPyStub, raising=False)
 
-    from umbra.reconstruction import GPUAccelerationRequiredError
+    from stegnal.reconstruction import GPUAccelerationRequiredError
 
     with pytest.raises(GPUAccelerationRequiredError):
         encoding._simulate_uwb_channel(
@@ -76,7 +76,7 @@ def test_simulate_uwb_channel_gpu_failure(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_simulate_uwb_channel_hybrid_memory(monkeypatch: pytest.MonkeyPatch) -> None:
-    import umbra.encoding as encoding
+    import stegnal.encoding as encoding
 
     cp_stub = encoding.cp
 
@@ -114,12 +114,12 @@ def test_ensure_gpu_available_missing_nvrtc(monkeypatch: pytest.MonkeyPatch) -> 
     import sys
     import types
 
-    import umbra.encoding as encoding
+    import stegnal.encoding as encoding
 
-    stub = types.SimpleNamespace(_umbra_skip_nvrtc_check=False, cuda=types.SimpleNamespace())
+    stub = types.SimpleNamespace(_stegnal_skip_nvrtc_check=False, cuda=types.SimpleNamespace())
     monkeypatch.setattr(encoding, "cp", stub, raising=False)
 
-    import umbra.gpu_runtime as gpu_runtime
+    import stegnal.gpu_runtime as gpu_runtime
 
     monkeypatch.setattr(gpu_runtime, "cp", stub, raising=False)
     monkeypatch.setattr(gpu_runtime, "_NVRTC_CHECKED", False, raising=False)
@@ -148,7 +148,7 @@ def test_ensure_gpu_available_missing_nvrtc(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setitem(sys.modules, "cupy_backends.cuda.libs", libs_module)
     monkeypatch.setitem(sys.modules, "cupy_backends.cuda.libs.nvrtc", nvrtc_module)
 
-    from umbra.reconstruction import GPUAccelerationRequiredError
+    from stegnal.reconstruction import GPUAccelerationRequiredError
 
     with pytest.raises(GPUAccelerationRequiredError):
         encoding._ensure_gpu_available("validation")

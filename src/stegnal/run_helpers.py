@@ -1,6 +1,6 @@
 # run_helpers.py
 
-"""Filesystem helpers for organising Umbra evolution runs."""
+"""Filesystem helpers for organising Stegnal evolution runs."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class RunPaths:
     charts: Path
 
 
-_DEFAULT_RUNS_ROOT = Path(os.getenv("UMBRA_RUNS_ROOT", "runs"))
+_DEFAULT_RUNS_ROOT = Path(os.getenv("STEGNAL_RUNS_ROOT", "runs"))
 
 
 def runs_root(base: str | Path | None = None) -> Path:

@@ -1,6 +1,6 @@
 import numpy as np
 
-from umbra.sound import generate_sound_art, guess_shapes
+from stegnal.sound import generate_sound_art, guess_shapes
 
 
 def test_generate_sound_art_deterministic_seed():

@@ -163,7 +163,7 @@ def encode_text_to_image(
     """Encode ``text`` into an RGB image suitable for sonic transmission."""
 
     if not text:
-        text = "Hello, Umbra!"
+        text = "Hello, Stegnal!"
 
     payload_bytes = len(text.encode("utf-8"))
 

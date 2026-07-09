@@ -11,8 +11,6 @@ import numpy as np
 
 from .reconstruction import (
     reconstruct_from_waveform,
-    suggest_sample_rate,
-    suggest_transmission_profile,
 )
 
 try:  # pragma: no cover - import guard

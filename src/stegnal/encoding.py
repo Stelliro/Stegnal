@@ -21,7 +21,7 @@ try:
 except ImportError:
     cp = None  # type: ignore[assignment]
 
-logger = logging.getLogger("umbra.encoding")
+logger = logging.getLogger("stegnal.encoding")
 
 
 @dataclass

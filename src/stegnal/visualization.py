@@ -1,6 +1,6 @@
 # visualization.py
 
-"""Visualization helpers for the Project Umbra UI."""
+"""Visualization helpers for the Stegnal UI."""
 
 from __future__ import annotations
 

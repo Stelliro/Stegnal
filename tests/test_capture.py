@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from umbra.capture import (
+from stegnal.capture import (
     average_recordings,
     load_recording,
     record_batch,
     score_recordings,
 )
-from umbra.encoding import NoiseStreamEncoder
+from stegnal.encoding import NoiseStreamEncoder
 
 
 class StubAudioEngine:

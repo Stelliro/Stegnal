@@ -5,10 +5,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from umbra import decoding
-from umbra.decoding import NoiseStreamDecoder
-from umbra.encoding import NoiseStreamEncoder
-from umbra.evolution import (
+from stegnal import decoding
+from stegnal.decoding import NoiseStreamDecoder
+from stegnal.encoding import NoiseStreamEncoder
+from stegnal.evolution import (
     EvolutionManager,
     _env_compute_mode,
     _env_gpu_fraction,
@@ -81,7 +81,7 @@ def test_run_generation_all_modes_build_full_population(mode):
 
 def test_hybrid_matches_cpu_when_no_gpu(monkeypatch):
     """Without a GPU, hybrid mode must equal pure-CPU results exactly."""
-    monkeypatch.setattr("umbra.evolution._cupy_available", lambda: False)
+    monkeypatch.setattr("stegnal.evolution._cupy_available", lambda: False)
 
     def build(mode):
         return EvolutionManager(
@@ -108,9 +108,9 @@ def test_update_settings_changes_compute_mode():
 
 
 def test_env_helpers(monkeypatch):
-    monkeypatch.setenv("UMBRA_COMPUTE_MODE", "HYBRID")
-    monkeypatch.setenv("UMBRA_GPU_FRACTION", "0.3")
+    monkeypatch.setenv("STEGNAL_COMPUTE_MODE", "HYBRID")
+    monkeypatch.setenv("STEGNAL_GPU_FRACTION", "0.3")
     assert _env_compute_mode() == "hybrid"
     assert _env_gpu_fraction() == pytest.approx(0.3)
-    monkeypatch.setenv("UMBRA_COMPUTE_MODE", "nonsense")
+    monkeypatch.setenv("STEGNAL_COMPUTE_MODE", "nonsense")
     assert _env_compute_mode() == "cpu"

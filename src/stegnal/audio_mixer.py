@@ -6,7 +6,7 @@ import numpy as np
 import sounddevice as sd
 from scipy.signal import butter, lfilter
 
-logger = logging.getLogger("Umbra")
+logger = logging.getLogger("Stegnal")
 
 def highpass_filter(data, cutoff=300, fs=48000, order=5):
     """Kills low-end room rumble and fan noise."""

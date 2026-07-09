@@ -1,4 +1,4 @@
-"""Centralised logging configuration helpers for Project Umbra."""
+"""Centralised logging configuration helpers for Stegnal."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from logging.config import dictConfig
 from pathlib import Path
 from typing import Any
 
-DEFAULT_LOG_DIR = Path.home() / ".umbra" / "logs"
+DEFAULT_LOG_DIR = Path.home() / ".stegnal" / "logs"
 """Default directory that stores the application's log files."""
 
 _LOGGING_CONFIGURED = False
@@ -94,37 +94,37 @@ def configure_logging(
             "metrics_file": {**_handler_config(directory / "metrics.log"), "formatter": "json"},
         },
         "loggers": {
-            "umbra": {
+            "stegnal": {
                 "handlers": ["console"],
                 "level": logging.getLevelName(console_level),
                 "propagate": False,
             },
-            "umbra.ui": {
+            "stegnal.ui": {
                 "handlers": ["console", "ui_file"],
                 "level": "DEBUG",
                 "propagate": False,
             },
-            "umbra.evolution": {
+            "stegnal.evolution": {
                 "handlers": ["console", "evolution_file"],
                 "level": "INFO",
                 "propagate": False,
             },
-            "umbra.sound": {
+            "stegnal.sound": {
                 "handlers": ["console", "audio_file"],
                 "level": "INFO",
                 "propagate": False,
             },
-            "umbra.pipeline": {
+            "stegnal.pipeline": {
                 "handlers": ["console", "pipeline_file"],
                 "level": "INFO",
                 "propagate": False,
             },
-            "umbra.metrics": {
+            "stegnal.metrics": {
                 "handlers": ["console", "metrics_file"],
                 "level": "INFO",
                 "propagate": False,
             },
-            "umbra.adversarial": {
+            "stegnal.adversarial": {
                 "handlers": ["console", "evolution_file"],
                 "level": "INFO",
                 "propagate": False,

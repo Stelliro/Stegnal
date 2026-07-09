@@ -1,10 +1,10 @@
 @echo off
 cd /d "%~dp0"
-title Project Umbra // Desktop Explorer
+title Stegnal // Desktop Explorer
 color 0b
 
 echo ========================================================
-echo        PROJECT UMBRA // DESKTOP EXPLORER (umbra ui)
+echo        STEGNAL // DESKTOP EXPLORER (stegnal ui)
 echo ========================================================
 echo.
 
@@ -18,7 +18,7 @@ if errorlevel 1 (
 
 echo [SYSTEM] Launching Desktop Explorer...
 echo ========================================================
-"%~dp0.venv\Scripts\python.exe" -m umbra ui
+"%~dp0.venv\Scripts\python.exe" -m stegnal ui
 
 if errorlevel 1 (
     echo.

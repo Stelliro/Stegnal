@@ -3,8 +3,8 @@ import logging
 import numpy as np
 import pytest
 
-import umbra.encoding as encoding
-from umbra.encoding import NoiseStreamEncoder
+import stegnal.encoding as encoding
+from stegnal.encoding import NoiseStreamEncoder
 
 
 class _FakeCuPyOOMError(RuntimeError):
@@ -26,7 +26,7 @@ def test_encode_gpu_oom_fallback(monkeypatch, caplog):
         lambda exc: isinstance(exc, _FakeCuPyOOMError),
     )
 
-    caplog.set_level(logging.DEBUG, logger="umbra.encoding")
+    caplog.set_level(logging.DEBUG, logger="stegnal.encoding")
     encoder = NoiseStreamEncoder(sigma=0.05)
     image = np.full((4, 4), 0.5, dtype=np.float32)
 

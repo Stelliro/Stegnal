@@ -1,8 +1,8 @@
 # checkpoint.py
 
-"""Persistent, metadata-rich model checkpoints for Project Umbra.
+"""Persistent, metadata-rich model checkpoints for Stegnal.
 
-An :class:`UmbraModel` bundles a trainable :class:`~umbra.neural.NeuralRewardModel`
+An :class:`StegnalModel` bundles a trainable :class:`~stegnal.neural.NeuralRewardModel`
 with the context needed to *resume* training later instead of starting cold:
 
 * **who its peers were** — the best candidate seeds/rewards it has seen (lineage),
@@ -10,7 +10,7 @@ with the context needed to *resume* training later instead of starting cold:
 * **where its data came from** — training sessions, including acoustic
   speaker->mic batches and the recording files behind them.
 
-Everything serialises to a single self-describing JSON file (``*.umbra.json``) so
+Everything serialises to a single self-describing JSON file (``*.stegnal.json``) so
 the metadata always travels with the weights. Load a checkpoint to train further
 (the optimiser momentum and feature normalisation are preserved) or just to use
 it for inference, then save again.
@@ -92,11 +92,11 @@ def candidate_feature_vector(candidate, difficulty: float,
     return [values.get(name, 0.0) for name in feature_names]
 
 
-class UmbraModel:
+class StegnalModel:
     """A trainable reward model plus the metadata needed to resume training."""
 
     def __init__(self, reward_model: NeuralRewardModel | None = None, *,
-                 name: str = "umbra-model", feature_names=DEFAULT_FEATURE_NAMES):
+                 name: str = "stegnal-model", feature_names=DEFAULT_FEATURE_NAMES):
         self.feature_names = tuple(feature_names)
         self.reward_model = reward_model or NeuralRewardModel(input_dim=len(self.feature_names))
         self.name = name
@@ -217,11 +217,11 @@ class UmbraModel:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> UmbraModel:
+    def from_dict(cls, data: dict) -> StegnalModel:
         feature_names = tuple(data.get("feature_names", DEFAULT_FEATURE_NAMES))
         model = cls(
             reward_model=NeuralRewardModel.from_state(data["reward_model"]),
-            name=data.get("name", "umbra-model"),
+            name=data.get("name", "stegnal-model"),
             feature_names=feature_names,
         )
         model.created_at = data.get("created_at", model.created_at)
@@ -236,20 +236,20 @@ class UmbraModel:
         return model
 
     def save(self, path: str | Path) -> Path:
-        """Write the checkpoint to ``path`` (``.umbra.json`` if no suffix given)."""
+        """Write the checkpoint to ``path`` (``.stegnal.json`` if no suffix given)."""
         path = Path(path)
         if path.suffix == "":
-            path = path.with_suffix(".umbra.json")
+            path = path.with_suffix(".stegnal.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
-        logger.info("Saved Umbra model checkpoint to %s", path)
+        logger.info("Saved Stegnal model checkpoint to %s", path)
         return path
 
     @classmethod
-    def load(cls, path: str | Path) -> UmbraModel:
+    def load(cls, path: str | Path) -> StegnalModel:
         path = Path(path)
         if not path.exists() and path.suffix == "":
-            path = path.with_suffix(".umbra.json")
+            path = path.with_suffix(".stegnal.json")
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     def summary(self) -> str:
@@ -267,5 +267,5 @@ class UmbraModel:
         )
 
 
-__all__ = ["UmbraModel", "TrainingSession", "PeerRecord", "candidate_feature_vector",
+__all__ = ["StegnalModel", "TrainingSession", "PeerRecord", "candidate_feature_vector",
            "DEFAULT_FEATURE_NAMES"]
